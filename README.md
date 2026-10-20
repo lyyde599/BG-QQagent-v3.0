@@ -58,7 +58,7 @@ tar xzf grail.tar.gz -C plugins/
 - 装卸即生效：卸载后它注册的路由/工具/页签一并摘除
 - 数据分离：代码在 `plugins/<id>/`，运行数据在 `data/plugins/<id>/`
 
-详见 `PLUGIN-ARCH.md`。
+详见 `PLUGIN-ARCH.md`（架构）与 `插件制作规范.md`（手把手写插件：manifest 字段、ctx 能力、钩子语义、自检清单）。
 
 ## 必须自己配的
 
