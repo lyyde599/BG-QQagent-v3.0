@@ -39,10 +39,26 @@ const state = {
 };
 
 // ── 工具函数 ──
+/**
+ * HTTP 请求封装。
+ *
+ * 🔴 options.body 传**对象**时自动 JSON.stringify（2026-10-21 修）。
+ *   起因：广告列表的「删除」按钮点了没反应。查出来是调用方写
+ *   `body: { adInject: {...} }` 但没 stringify，fetch 把对象转成
+ *   字符串 "[object Object]" 发出去，服务端 JSON.parse 报 500：
+ *     [http] 处理出错: "[object Object]" is not valid JSON
+ *   同类调用当时有 9 处（圣杯战争的操作按钮全中），逐个改容易漏，
+ *   所以在这一层统一兜住：字符串原样传，对象自动序列化。
+ */
 async function api(path, options = {}) {
+  const opts = { ...options };
+  if (opts.body !== undefined && opts.body !== null && typeof opts.body === 'object'
+      && !(opts.body instanceof FormData) && !(opts.body instanceof Blob)) {
+    opts.body = JSON.stringify(opts.body);
+  }
   const res = await fetch(path, {
     headers: { 'content-type': 'application/json' },
-    ...options
+    ...opts
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
