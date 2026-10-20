@@ -638,15 +638,36 @@ export function createApp({ log = console.log } = {}) {
     res.end(JSON.stringify(data));
   }
 
-  async function readBody(req) {
+  /**
+   * 读请求体。
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.limitMB] 体积上限（MB），默认 2。
+   *   🔴 插件导入必须放宽到 32MB：base64 会让体积膨胀 33%，
+   *      像「学习模式与知识库」这种带题库的包（2.7MB → base64 3.6MB）
+   *      会直接撞上限，报出一个**误导性**的「缺少 base64 数据」。
+   *   （2026-10-21 实测踩到：命令行还叠加了 Argument list too long，双重陷阱）
+   * @param {boolean} [opts.raw] true = 返回原始文本不解析 JSON
+   */
+  async function readBody(req, opts = {}) {
+    const limitBytes = (Number(opts.limitMB) || 2) * 1024 * 1024;
     const chunks = [];
     let size = 0;
     for await (const chunk of req) {
       size += chunk.length;
-      if (size > 2 * 1024 * 1024) throw new Error('请求体过大');
+      if (size > limitBytes) {
+        const err = new Error(
+          `请求体过大（上限 ${Math.round(limitBytes / 1024 / 1024)}MB）。` +
+          `当前端点支持的最大体积见接口说明。`
+        );
+        err.code = 'BODY_TOO_LARGE';
+        err.sizeBytes = size;
+        throw err;
+      }
       chunks.push(chunk);
     }
     const text = Buffer.concat(chunks).toString('utf8');
+    if (opts.raw) return text;
     return text ? JSON.parse(text) : {};
   }
 
@@ -853,7 +874,25 @@ export function createApp({ log = console.log } = {}) {
       const pluginRoute = pluginHost.routes.find((r) => r.method === method && r.path === pathname);
       if (pluginRoute) {
         try {
-          const body = method === 'POST' ? await readBody(req).catch(() => ({})) : null;
+          // 插件路由：放宽体积上限到 32MB（插件导入要传 base64）
+          // 并且**不能**把 readBody 的错误吞成空对象 —— 那会让"包太大"
+          // 显示成"缺少数据"，排查方向完全跑偏（实测踩过）。
+          let body = null;
+          if (method === 'POST') {
+            try {
+              body = await readBody(req, { limitMB: 32 });
+            } catch (error) {
+              if (error?.code === 'BODY_TOO_LARGE') {
+                return json(res, 413, {
+                  ok: false,
+                  error: `请求体过大：${(error.sizeBytes / 1024 / 1024).toFixed(1)}MB，`
+                    + `上限 32MB。请检查插件包是否异常（正常插件包应小于 20MB）。`
+                });
+              }
+              log(`[插件路由] ${pluginRoute.id} ${pathname} 读请求体失败:`, error?.message ?? error);
+              return json(res, 400, { ok: false, error: String(error?.message ?? error) });
+            }
+          }
           const out = await pluginRoute.handler(req, body, url);
           // raw 响应：插件自己要控制 Content-Type / 下载头（如插件包导出）
           if (out && out.__raw === true && out.buffer) {
