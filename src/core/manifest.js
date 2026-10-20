@@ -65,7 +65,11 @@ export function normalizeManifest(raw, { dirName = '' } = {}) {
     const tabId = asString(raw.uiTab.id).trim();
     const label = asString(raw.uiTab.label).trim();
     // tab id 会成为 DOM id 的一部分，只允许字母数字与连字符
-    if (tabId && /^[a-z0-9-]+$/.test(tabId) && label) uiTab = { id: tabId, label };
+    // inline=true 表示"面板内嵌在插件页"，不占顶栏页签
+    if (tabId && /^[a-z0-9-]+$/.test(tabId) && label) {
+      uiTab = { id: tabId, label };
+      if (raw.uiTab.inline === true) uiTab.inline = true;
+    }
   }
 
   const scopes = Array.isArray(raw.scopes) ? raw.scopes.map(String).filter(Boolean) : ['all'];

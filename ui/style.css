@@ -841,3 +841,24 @@ tbody tr:hover { background: var(--raised); color: var(--on-raised); }
 }
 .gr-log { font-size: 12.5px; line-height: 1.9; color: var(--fg2); max-height: 260px; overflow-y: auto; }
 .gr-sim-result { font-size: 13px; line-height: 1.8; padding: 10px 12px; background: var(--sunken); border-radius: var(--r-sm); }
+
+/* ── 插件配置面板（2026-10-21）───────────────────────────── */
+.pl-panel-card { border-left: 3px solid var(--acc); }
+.pl-panel-body { margin-top: 14px; }
+.pl-panel-body table.table { font-size: 13px; }
+.pl-panel-body input[type="text"],
+.pl-panel-body input[type="number"],
+.pl-panel-body textarea,
+.pl-panel-body select {
+  padding: 6px 10px; border: 1px solid var(--line2); border-radius: var(--r-sm);
+  background: var(--panel); color: var(--fg); font-size: var(--fs-sm);
+  font-family: inherit;
+}
+.pl-panel-body textarea { resize: vertical; line-height: 1.7; }
+.pl-level-desc { padding: 10px 12px; background: var(--sunken); border-radius: var(--r-sm); }
+.mem-preview {
+  background: var(--inverse); color: var(--on-inverse);
+  padding: 12px 14px; border-radius: var(--r-sm); font-size: 12px;
+  font-family: var(--mono); white-space: pre-wrap; max-height: 260px; overflow-y: auto;
+}
+.switch-row { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); }

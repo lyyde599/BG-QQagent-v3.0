@@ -214,7 +214,8 @@ export class PluginHost {
         label: manifest.uiTab.label,
         pluginId: id,
         file: manifest.ui || '',
-        dir
+        dir,
+        inline: manifest.uiTab.inline === true   // true = 内嵌在插件页，不占顶栏
       });
     }
     pluginLog('已启用', manifest.version);
@@ -561,6 +562,7 @@ export class PluginHost {
         hooks: r.manifest?.hooks || [],
         tools: (this.toolDefs.filter((t) => t.id === r.id).map((t) => t.def.name)),
         uiTab: r.manifest?.uiTab || null,
+        uiTabInline: r.manifest?.uiTab?.inline === true,
         config: r.config ? r.config.get() : null,
         loadedAt: r.loadedAt || null
       }))

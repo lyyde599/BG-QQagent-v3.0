@@ -146,10 +146,13 @@ function reportBan() {
   ].join('\n');
 }
 
-function qqSceneRules() {
+function qqSceneRules(hasTool = () => true) {
   const cfg = getConfig();
-  const vision = cfg.api?.vision !== false;
-  const search = cfg.webSearch?.enabled !== false;
+  // 🔴 双重判定：配置允许 **且** 工具本轮真的挂载了。
+  //    只看配置会出现"提示词教它用 get_message_images，但 vision 插件没装"
+  //    —— 模型会调用一个不存在的工具（2026-10-21 用户实测反馈）。
+  const vision = cfg.api?.vision !== false && hasTool('get_message_images');
+  const search = cfg.webSearch?.enabled !== false && hasTool('web_search');
   const lines = [
     '【QQ 场景规则】',
     '- 回复保持简短，符合群友语感；不要使用 Markdown 格式（**、#、代码块在 QQ 上会显示成乱码）。',
@@ -187,8 +190,24 @@ function qqSceneRules() {
  * @param {object} [opts.persona]
  * @param {string[]} [opts.extraSections] 插件贡献的提示词段（本函数不感知来源，只负责拼接）
  */
-export function buildSystemPrompt({ persona, extraSections = [] } = {}) {
+/**
+ * 拼系统提示词。
+ *
+ * @param {object} opts
+ * @param {object} [opts.persona]
+ * @param {string[]} [opts.extraSections] 插件贡献的段落
+ * @param {Set<string>|string[]} [opts.availableTools]
+ *   本轮**实际挂载**的工具名。用来裁剪"提到某工具"的段落 ——
+ *   否则纯内核版会告诉模型"用 memory_append 记一下"，
+ *   而那个工具根本没装（2026-10-21 用户反馈的真实问题）。
+ *   不传 = 不裁剪（保持旧行为，兼容测试与直接调用）。
+ */
+export function buildSystemPrompt({ persona, extraSections = [], availableTools = null } = {}) {
   const cfg = persona ?? getConfig().persona;
+  // 工具可用性判断：没传就不设限，传了就严格按它裁剪
+  const hasTool = (name) => !availableTools || (availableTools instanceof Set
+    ? availableTools.has(name)
+    : Array.isArray(availableTools) && availableTools.includes(name));
   const parts = [
     `你是「${cfg.botName}」，一个混在 QQ 群里的群友/角色。你的具体人设（自称、口吻、性格）以【角色设定】为准。你的所有行为都通过工具完成，发言要自然像真人。`,
     '',
@@ -210,11 +229,11 @@ export function buildSystemPrompt({ persona, extraSections = [] } = {}) {
     '',
     quoteAndAt(),
     '',
-    memoryRules(),
-    '',
+    // 记忆段落提到 memory_append/memory_query/memory_remove —— 插件没装就别讲
+    ...(hasTool('memory_append') ? [memoryRules(), ''] : []),
     stickerRules(),
     '',
-    qqSceneRules(),
+    qqSceneRules(hasTool),
     '',
     reportBan()
   ];
@@ -327,6 +346,11 @@ export function buildTriggerBlock(triggerEntries, ctx) {
  */
 export function buildUserPrompt(ctx) {
   const cfg = getConfig();
+  // 本轮真实挂载的工具名（由 orchestrator 注入）；不传则不裁剪（向后兼容）
+  const avail = ctx?.availableTools;
+  const hasTool = (name) => !avail || (avail instanceof Set
+    ? avail.has(name)
+    : Array.isArray(avail) && avail.includes(name));
   // 身份人设：优先用调用方解析好的（按会话隔离），回退全局默认
   const persona = ctx.persona || cfg.persona;
   const now = Date.now();
@@ -483,18 +507,30 @@ export function buildUserPrompt(ctx) {
     '- 扫一眼【过去状态】和【本次唤醒】，判断：有没有人在找你？有没有你能接的话题？值不值得说话？',
     '- 想说话：调用 send_message（要分条就传数组）。想引用就带 replyToMessageId：id 见【本次唤醒】每条前的 #数字、历史里带图消息的 #数字，或用 get_recent_messages 查，不要自己编。',
     '- 不想说话：直接结束或调用 finish（一句话说明原因）。不回是正常选项，不是失职。',
-    '- 记得：你的普通文本输出不会发到 QQ，只有工具调用会。',
-    '',
-    '【课表查询 · 用原生工具秒回，别派 DSH】',
-    '主人问课表（明天上什么课/今天有课吗/这周课表/有哪些课）时，**直接用 schedule_query 工具**：',
-    '  · 明天 → schedule_query(when="tomorrow")',
-    '  · 今天 → schedule_query(when="today")',
-    '  · 本周 → schedule_query(when="week")',
-    '  · 全部课程 → schedule_query(when="courses")',
-    '  · 指定日期 → schedule_query(when="date", date="2026-09-20")',
-    '它是本地直读课表数据，**毫秒级返回**；派 dsh_task 要等几十秒还可能排队超时。',
-    '只有涉及「重新解析课表 / 改播报逻辑 / 部署」这类要动代码或重算数据的活，才用 dsh_task。'
+    '- 记得：你的普通文本输出不会发到 QQ，只有工具调用会。'
   ].join('\n'));
+
+  // ── 课表查询引导（2026-10-21 改为按工具存在与否裁剪）──
+  // 这段是 schedule 插件的专属知识。纯内核版没有 schedule_query 工具，
+  // 还教模型去用它 = 让它调用不存在的工具。
+  if (hasTool('schedule_query')) {
+    const dshLine = hasTool('dsh_task')
+      ? '只有涉及「重新解析课表 / 改播报逻辑 / 部署」这类要动代码或重算数据的活，才用 dsh_task。'
+      : '';
+    parts.push([
+      '【课表查询 · 用原生工具秒回】',
+      '主人问课表（明天上什么课/今天有课吗/这周课表/有哪些课）时，**直接用 schedule_query 工具**：',
+      '  · 明天 → schedule_query(when="tomorrow")',
+      '  · 今天 → schedule_query(when="today")',
+      '  · 本周 → schedule_query(when="week")',
+      '  · 全部课程 → schedule_query(when="courses")',
+      '  · 指定日期 → schedule_query(when="date", date="2026-09-20")',
+      hasTool('dsh_task')
+        ? '它是本地直读课表数据，**毫秒级返回**；派 dsh_task 要等几十秒还可能排队超时。'
+        : '它是本地直读课表数据，**毫秒级返回**。',
+      dshLine
+    ].filter(Boolean).join('\n'));
+  }
 
   // 文件消息专项引导：主人发来文件时，必须"意识到 + 主动取回"
   const fileMsgs = [];

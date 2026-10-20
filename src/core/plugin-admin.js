@@ -153,7 +153,8 @@ export function registerPluginAdmin(host, { getConfig, log }) {
         data: { exists: d.exists, fileCount: d.files.length, bytes: d.totalBytes, sizeText: humanSize(d.totalBytes) }
       };
     }),
-    tabs: host.uiTabs.map((t) => ({ id: t.id, label: t.label, pluginId: t.pluginId }))
+    // inline=true 的页签内嵌在插件页渲染，不占顶栏
+    tabs: host.uiTabs.map((t) => ({ id: t.id, label: t.label, pluginId: t.pluginId, inline: t.inline === true }))
   }));
 
   // ── 启停 ──
@@ -460,6 +461,17 @@ export function registerPluginAdmin(host, { getConfig, log }) {
     }
 
     const reloaded = await host.enable(norm.manifest);
+
+    // 🔴 把 enabled 落进配置（2026-10-21 修）
+    // 之前只在内存里 enable 了，配置里没有 enabled 字段 →
+    // 重启后回落到 manifest.defaultEnabled（多为 false），
+    // 表现为「导入时是启用的，重启后自己关掉了」，非常困惑。
+    // 导入是用户的明确动作，就当作"我要用它"，直接置为启用。
+    if (reloaded?.status === 'enabled') {
+      try { host.records.get(id)?.config?.set({ enabled: true }); }
+      catch (e) { log(`[plugins] ${id} 写入 enabled 失败（不影响本次运行）:`, e?.message ?? e); }
+    }
+
     log(`[plugins] 已导入 ${id}（状态：${reloaded?.status}，数据：${hasData ? '含 ' + (dataRestore?.written || 0) + ' 文件' : '不含'}）`);
 
     return {

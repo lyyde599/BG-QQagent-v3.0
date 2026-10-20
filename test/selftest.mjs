@@ -180,6 +180,20 @@ function pass(name, extra = '') {
   console.log(`  ✓ ${name}${extra ? ` —— ${extra}` : ''}`);
 }
 
+/**
+ * 跳过：这项能力依赖插件，而当前仓库没装。
+ *
+ * ⚠️ 为什么需要它（2026-10-21 用户反馈）：
+ *   纯内核版 `plugins/` 是空的，像 memory_append / web_search 这些工具
+ *   **由插件注册**，内核里根本没有。断言它们必然失败 —— 那不是 bug，
+ *   是测试与运行时的能力假设不一致。
+ *   正确处理是"没装就跳过并说明"，不是删掉断言（装了插件的仓库仍要验）。
+ */
+function skip(name, why) {
+  results.push({ name, ok: true, skipped: true, extra: why });
+  console.log(`  ○ ${name} —— 跳过：${why}`);
+}
+
 async function main() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-agent-test-'));
   process.env.QQ_AGENT_DATA_DIR = dataDir;
@@ -259,13 +273,39 @@ refs:
     proactive: { enabled: false },
     sticker: { enabled: true, collectEnabled: true },
     store: { maxMessagesPerChat: 0, pastStateLimit: 80, pastStateMaxChars: 6000, keepSessionFiles: 100 },
-    server: { port: await freePort(), token: '' }
+    server: { port: await freePort(), token: '' },
+    // 显式启用本测试要验证的插件。
+    // 插件默认 defaultEnabled:false（干净版原则），不写就等于全关 ——
+    // 那样记忆/搜索/识图场景会全部跳过，等于没测。
+    plugins: {
+      'memory': { enabled: true },
+      'websearch': { enabled: true },
+      'vision': { enabled: true },
+      'sticker': { enabled: true }
+    }
   };
   fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify(cfg));
 
   const { createApp } = await import('../src/app.js');
   const app = createApp({ log: () => {} });
   await app.start();
+
+  // ── 插件能力探测（2026-10-21）──
+  // 本项目是插件化的：记忆/搜索/识图等工具由插件注册，内核里没有。
+  // 纯内核版（plugins/ 为空）跑这些断言必然失败 —— 那不是 bug，
+  // 是测试假设与运行时能力不符。这里先探明"到底装了什么"，
+  // 依赖插件的场景按需跳过（装了插件的仓库仍然全跑）。
+  const mountedTools = new Set();
+  {
+    try {
+      const core = (await import('../src/tools.js')).buildToolDefs().map((d) => d.name);
+      core.forEach((n) => mountedTools.add(n));
+      const ph = app.pluginHost;
+      if (ph) for (const t of ph.allToolDefs()) mountedTools.add(t.name);
+    } catch { /* 探测失败就当空集 */ }
+  }
+  const hasTool = (name) => mountedTools.has(name);
+  if (!mountedTools.size) console.log('  ⚠ 工具集探测为空，可能启动异常');
 
   // 同步原语
   const waitSessionDone = async (triggerSubstring, timeout = 9000) => {
@@ -395,6 +435,10 @@ refs:
   pass('引用解析与 reply 段发送正确');
 
   // ── 场景 5：记忆跨运行持久（无状态但记忆保留） ──
+  // 记忆工具由 memory 插件提供；纯内核版没有 → 跳过而不是失败
+  if (!hasTool('memory_append')) {
+    skip('轻量记忆跨运行持久化', 'memory 插件未安装（纯内核版）');
+  } else {
   llm.state.script.push(
     { toolCalls: [{ name: 'memory_append', args: { category: 'activeTopic', content: '今晚吃什么' } }, { name: 'send_message', args: { messages: ['记下了'] } }] },
     { content: 'ok' }
@@ -409,9 +453,10 @@ refs:
   pushGroupMsg(112, '李四', '随便说说', 9005);
   await waitFor(() => llm.state.requests.length >= reqs5b + 1, 5000, '带记忆的后续运行开始');
   const memPrompt = llm.state.requests.at(-1).messages[1].content;
-  assert.ok(memPrompt.includes('今晚吃什么'), '【记忆】跨运行出现在新会话的提示词里');
+  assert.ok(memPrompt.includes('今晚吃什么'), '【记忆】跨运行出现现在新会话的提示词里');
   await waitSessionDone('随便说说');
   pass('轻量记忆跨运行持久化');
+  }
 
   // ── 场景 6：表情包同步 + SSRF 拦截 + 发表情机制 ──
   const stickers = await app.stickers.sync(true);
@@ -555,7 +600,12 @@ refs:
   assert.ok(!recentTool?.toolCall?.isError && String(recentTool.toolCall.result).includes('messageId'), 'get_recent_messages 返回真实消息 id');
   pass('消息 id 引导：报错带可用 id + send_poke 校验 + recent 带 messageId');
 
-  // ── 场景 12：联网搜索 ──
+  // ── 场景 12/13：联网搜索与 SSRF 防护 ──
+  // 工具由 websearch 插件提供；纯内核版没有 → 跳过
+  if (!hasTool('web_search')) {
+    skip('联网搜索：web_search 结果回传模型', 'websearch 插件未安装（纯内核版）');
+    skip('web_fetch SSRF 防护：内网地址被拒绝', 'websearch 插件未安装（纯内核版）');
+  } else {
   llm.state.script.push(
     { toolCalls: [{ name: 'web_search', args: { query: '审计梗 是什么' } }] },
     { content: '（搜到了，不用回）' }
@@ -577,8 +627,14 @@ refs:
   const fetchSession = await waitSessionDone('帮我抓内网页面');
   assert.ok(fetchSession.messages.some((m) => m.toolCall?.isError && String(m.toolCall.result).includes('内网')), 'web_fetch 拒绝内网地址');
   pass('web_fetch SSRF 防护：内网地址被拒绝');
+  }
 
   // ── 场景 14：图片输入链路（vision） ──
+  // get_message_images 由 vision 插件提供；纯内核版没有 → 跳过整个场景
+  if (!hasTool('get_message_images')) {
+    skip('图片输入：tool 文本 + user 消息 image_url 补发', 'vision 插件未安装（纯内核版）');
+    skip('vision=false 时移除看图工具、保留搜索工具', 'vision 插件未安装（纯内核版）');
+  } else {
   // 14a. 图片作为图像输入到达模型：tool 消息带文本，图片以 user 消息(image_url)补发
   await fetch(`http://127.0.0.1:${cfg.server.port}/api/config`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -626,6 +682,7 @@ refs:
     body: JSON.stringify({ api: { vision: true }, security: { allowPrivateImageHosts: false } })
   });
   pass('vision 开关：关闭后移除看图工具，提示词同步变化');
+  }   // ← 场景14 的插件探测闭合
 
   // ── 场景 15：群/好友列表 + 手动测试消息 ──
   const groupsRes = await (await fetch(`http://127.0.0.1:${cfg.server.port}/api/onebot/groups`)).json();
@@ -813,17 +870,21 @@ refs:
   const noVisionReq = llm.state.requests.at(-1);
   assert.ok(!noVisionReq.tools?.some((t) => t.function?.name === 'get_message_images'), 'no-vision 模型不带看图工具');
 
-  // 切到视觉模型：看图工具恢复
-  await fetch(`http://127.0.0.1:${cfg.server.port}/api/config`, {
-    method: 'POST',
-    body: JSON.stringify({ api: { provider: visionProv.id, model: 'vision-ok-model' } })
-  });
-  llm.state.script.push({ content: '（安静2）' });
-  pushGroupMsg(120, '阿十', '看看有视觉模型', 9030);
-  await waitSessionDone('看看有视觉模型');
-  const visionReq = llm.state.requests.at(-1);
-  assert.ok(visionReq.tools?.some((t) => t.function?.name === 'get_message_images'), 'vision 模型带看图工具');
-  pass('模型图片输入探测 + 按模型门控看图工具');
+  // 切到视觉模型：看图工具恢复（依赖 vision 插件提供该工具）
+  if (hasTool('get_message_images')) {
+    await fetch(`http://127.0.0.1:${cfg.server.port}/api/config`, {
+      method: 'POST',
+      body: JSON.stringify({ api: { provider: visionProv.id, model: 'vision-ok-model' } })
+    });
+    llm.state.script.push({ content: '（安静2）' });
+    pushGroupMsg(120, '阿十', '看看有视觉模型', 9030);
+    await waitSessionDone('看看有视觉模型');
+    const visionReq = llm.state.requests.at(-1);
+    assert.ok(visionReq.tools?.some((t) => t.function?.name === 'get_message_images'), 'vision 模型带看图工具');
+    pass('模型图片输入探测 + 按模型门控看图工具');
+  } else {
+    skip('模型图片输入探测 + 按模型门控看图工具', 'vision 插件未安装（纯内核版）');
+  }
 
   // ── 收尾 ──
   await app.stop();

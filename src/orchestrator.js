@@ -404,10 +404,6 @@ export class Orchestrator {
       }
     }
 
-    // 组装提示词（无 LLM 历史）
-    // 插件提示词段现取：面板装卸插件后下一次运行即生效。
-    const pluginSections = this.pluginHost ? this.pluginHost.buildPromptBlocks({ chatKey, kind, chatId }) : [];
-    const systemPrompt = buildSystemPrompt({ persona, extraSections: pluginSections });
     const userPrompt = buildUserPrompt({
       chatKey, kind, chatId, chatName,
       triggerEntries,
@@ -428,20 +424,6 @@ export class Orchestrator {
       proactive
     });
 
-    session.systemPrompt = systemPrompt;
-    session.userPrompt = userPrompt;
-    session.promptChars = systemPrompt.length + userPrompt.length;
-    session.model = cfg.api.model;
-    session.chatName = chatName;
-    this.sessions.update(session.id);
-    this.emit('session-update', session.id);
-
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: proactive
-        ? `${userPrompt}\n\n【本次唤醒】（主动机会）群里已经安静了一会儿。你可以主动抛一个自然的话题（像随口说的，不要像播报），也可以判断没必要说话就安静结束。`
-        : userPrompt }
-    ];
 
     // 工具集按配置过滤：无视觉模型 → 移除看图工具；搜索关闭 → 移除联网工具
     // 视觉判定 = 全局开关 && 选中模型未被探测为"明确不支持图片"（未探测/unknown 时保持开关行为）
@@ -474,8 +456,38 @@ export class Orchestrator {
     });
     const openAiTools = toOpenAiTools(toolDefs);
 
+    // 组装提示词（无 LLM 历史）
+    // 插件提示词段现取：面板装卸插件后下一次运行即生效。
+    const pluginSections = this.pluginHost ? this.pluginHost.buildPromptBlocks({ chatKey, kind, chatId }) : [];
+    // 把本轮**实际挂载**的工具名传进提示词构造器 —— 纯内核版（0 插件）时，
+    // 提示词里不会出现 memory_append / web_search / schedule_query 这类
+    // 未安装工具的说法（2026-10-21 用户实测反馈的真实问题）。
+    const mountedToolNames = new Set(toolDefs.map((d) => d.name));
+    const systemPrompt = buildSystemPrompt({
+      persona, extraSections: pluginSections, availableTools: mountedToolNames
+    });
+    session.systemPrompt = systemPrompt;
+    session.userPrompt = userPrompt;
+    session.promptChars = systemPrompt.length + userPrompt.length;
+    session.model = cfg.api.model;
+    session.chatName = chatName;
+    this.sessions.update(session.id);
+    this.emit('session-update', session.id);
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: proactive
+        ? `${userPrompt}\n\n【本次唤醒】（主动机会）群里已经安静了一会儿。你可以主动抛一个自然的话题（像随口说的，不要像播报），也可以判断没必要说话就安静结束。`
+        : userPrompt }
+    ];
+
+
+
+
     const ctx = {
       chatKey, kind, chatId,
+      // 本轮挂载的工具集：buildUserPrompt 用它裁剪"提到某工具"的段落
+      availableTools: mountedToolNames,
       selfId: this.onebot.selfId,
       selfNickname,
       botName: persona.botName,
@@ -696,7 +708,8 @@ export class Orchestrator {
             const retryMsg = [
               { role: 'system', content: buildSystemPrompt({
                 persona: ctx.persona,
-                extraSections: this.pluginHost ? this.pluginHost.buildPromptBlocks({ chatKey: ctx.chatKey, kind: ctx.kind, chatId: ctx.chatId }) : []
+                extraSections: this.pluginHost ? this.pluginHost.buildPromptBlocks({ chatKey: ctx.chatKey, kind: ctx.kind, chatId: ctx.chatId }) : [],
+                availableTools: new Set(toolDefs.map((d) => d.name))
               }) },
               { role: 'user', content: '【系统提醒】你刚才收到主人的私聊消息，但没有给出任何回复就结束了。私聊规则：主人私聊你时必须回复，不能不吭声。请立即补上回复：如果刚才在查资料/思考，现在把结论发给主人（用 send_message）；如果没什么可说的，也至少要回一句简短的回应（比如"收到~刚在查，马上给你说"）。' }
             ];
