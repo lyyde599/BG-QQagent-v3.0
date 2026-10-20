@@ -1,0 +1,27 @@
+{
+  "name": "qq-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone QQ agent desktop app: event-driven stateless agent runs over an OpenAI-compatible API, with a session-style UI. Decoupled from DeepSeek Harness.",
+  "type": "module",
+  "main": "electron/main.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "electron .",
+    "server": "node src/server.js",
+    "lint:account": "node test/lint-account-check.mjs",
+    "test": "node test/lint-account-check.mjs && node test/selftest.mjs",
+    "test:prompt": "node test/test-prompt.mjs"
+  },
+  "dependencies": {
+    "js-yaml": "^5.4.1",
+    "qrcode": "^1.5.4",
+    "undici": "^6.28.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+data/
+plugins/*/.venv/
+plugins/*/node_modules/
+__pycache__/
+*.pyc
+*.so
+*.log
+.env
+.env.*
+!README*

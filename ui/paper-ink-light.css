@@ -1,0 +1,111 @@
+/* ==========================================================================
+   纸墨灰 · 浅色（Paper Ink Light）—— 本服务器网页项目统一 UI 风格 · 唯一令牌源
+   --------------------------------------------------------------------------
+   规范文档：/home/lyy/记忆系统/33-UI风格规范.md
+   来源基线：SoLab 控制台 palette=monochrome / mode=light（外观配置实测）
+              + 元宝中转站 static/index.html 的落地手改值
+
+   三条铁律（违反任意一条即视为偏离规范）：
+     ① 只用语义变量。页面里**不得出现硬编码颜色**（#xxx / rgb() / 具名色）。
+        每个 --X 背景必须配一个同源的 --on-X 前景。
+     ② 组件 CSS 不感知明暗。换主题只换本文件的变量，不改任何组件规则。
+     ③ 对比度可判定。14 组「背景/前景」必须全部 ≥ 4.5:1（WCAG AA），
+        用 check-ui.mjs 落成数字，不靠肉眼。
+
+   命名约定：--X 是背景，--on-X 是其上可读的前景。
+   ========================================================================== */
+
+:root{
+  /* ── 页面级 ─────────────────────────────────────────────── */
+  --bg:#F7F7F7;              /* surface（SoLab monochrome.light） */
+  --bg2:#F4F4F4;             /* secondaryContainer（SoLab 编译值） */
+  --bg3:#F4F4F4;             /* 同上，供需要第三层的场景 */
+  --fg:#202020;              /* onSurface */
+  --fg2:#646464;             /* onSurfaceVariant（次要文字，5.52:1 AA） */
+  --fg3:#646464;             /* 弱化文字：monochrome 调色板下与 fg2 同值。
+                                需要更弱的层级请用 --line2 做装饰线，不要用来写字。 */
+  --line:#E4E4E4;            /* 描边（元宝手改：outline 原值是纯黑，做边框过重） */
+  --line2:#CFCFCF;           /* 强描边 / 输入框边 */
+
+  /* ── 面板 / 浮起 / 下沉（各带自己的前景）──────────────────── */
+  --panel:#FFFFFF;           /* 卡片：比 --bg 更亮，形成层次（元宝手改） */
+  --on-panel:#202020;
+  --raised:#F4F4F4;          /* 浮起层：hover、表头、次级块 */
+  --on-raised:#202020;
+  --raised2:#EFEFEF;         /* 浅强调块：头像底、胶囊标签底、步骤序号底 */
+  --sunken:#FAFAFA;          /* 下沉层：代码块外的浅凹区、统计格 */
+  --on-sunken:#202020;
+  --sunken-fg2:#646464;
+
+  /* ── 强调（主按钮、选中项）───────────────────────────────── */
+  --acc:#000000;             /* primary：纸墨灰的主色就是黑 */
+  --on-acc:#FFFFFF;
+  --acc-soft:#EFEFEF;        /* primaryContainer：选中态的底 */
+  --on-acc-soft:#000000;
+  --acc-hover:#1A1A1A;       /* ⚠️ 深色，前景仍是 --on-acc（白字）。
+                                SoLab 编译值是 #EFEFEF（浅），
+                                若照抄值却不换前景 → 白字压浅灰，对比度 1.15，字消失。 */
+
+  /* ── 语义色（纸墨灰是灰阶体系，语义靠形态与文案区分，不靠色相）── */
+  --ok:#2E2E2E;      --on-ok:#FFFFFF;      --ok-soft:#F0F0F0;    --on-ok-soft:#1A1A1A;
+  --warn:#3A3A3A;    --on-warn:#FFFFFF;    --warn-soft:#F4F4F4;  --on-warn-soft:#1A1A1A;
+  --err:#000000;     --on-err:#FFFFFF;     --err-soft:#EAEAEA;   --on-err-soft:#000000;
+  --info:#1A1A1A;    --on-info:#FFFFFF;    --info-soft:#F4F4F4;  --on-info-soft:#1A1A1A;
+
+  /* ── 反色区（代码块、工具输出、终端的独立色域）────────────── */
+  --inverse:#121213;         /* inverseSurface */
+  --on-inverse:#F9F9F9;
+  --inverse-line:#4A4E58;    /* 反色区里的分隔线 */
+
+  /* ── 遮罩（模态框 / 灯箱的背幕）─────────────────────────────
+     遮罩是**唯一**合法的半透明色：它不承载文字、不参与 4.5:1 判定，
+     且必须透过背景。原先各项目各自硬编码 rgba(...) → 触发 check-ui 违规。
+     收成令牌后，"零硬编码色"这条才真正可落地（2026-09-26 立）。 */
+  --overlay:rgba(30,28,26,.42);   /* 模态框背幕 */
+  --overlay-strong:rgba(18,18,19,.95);  /* 灯箱背幕（更重，聚焦单图） */
+
+  /* ── 投影 ─────────────────────────────────────────────────
+     投影与遮罩同理：必须半透明，且不承载文字。收成令牌后
+     组件里写 `box-shadow:var(--shadow)` 即可满足"零硬编码色"。 */
+  --shadow:0 12px 40px rgba(0,0,0,.18);
+
+  /* ── 滚动条 ─────────────────────────────────────────────── */
+  /* 注：SoLab 在 monochrome 下调出来的 scroll 是纯黑（outline 实色），
+     做滚动条过重；此处取 theme.js 的浅色默认值。滚动条不承载文字，
+     不参与 4.5:1 判定。 */
+  --scroll:#D2D5DE;
+  --scroll-hover:#B4B8C4;
+
+  /* ── 度量 ───────────────────────────────────────────────── */
+  --r:10px;                  /* 卡片、面板 */
+  --r-sm:7px;                /* 按钮、输入框、小控件 */
+  --r-pill:20px;             /* 胶囊标签 */
+  --sp:16px;                 /* 基础间距单位 */
+  --fs:14px;                 /* 基准字号；密集工作台可降为 13px */
+  --fs-sm:12px;
+  --fs-xs:11px;
+
+  --sans:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+
+  /* ── 动效（三档 + 统一缓动）─────────────────────────────────
+     原则：① 只动 transform / opacity（合成器单独处理，不触发重排）；
+          ② 统一缓动 cubic-bezier(.2,.8,.2,1)（先快后缓）；
+          ③ 入场用「轻微上移 + 淡入」，不用缩放（缩放会让文字发虚）。 */
+  --t-fast:120ms;            /* 交互反馈：hover、active、focus */
+  --t-mid:220ms;             /* 元素入场：消息、卡片 */
+  --t-slow:320ms;            /* 面板展开 */
+  --ease:cubic-bezier(.2,.8,.2,1);
+
+  /* ── 时区无关声明 ───────────────────────────────────────── */
+  /* 前端如需展示时间，一律按北京时间渲染并在文案里标注（铁律 0.5）。 */
+}
+
+/* 尊重系统「减少动效」设置 */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{
+    animation-duration:.01ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+  }
+}
