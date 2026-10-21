@@ -3340,24 +3340,16 @@ function renderPlugins(el, data) {
 // 理由：15 个插件各占一个顶栏页签会把导航挤爆；而用户的操作路径本来就是
 // "打开插件页 → 找到那个插件 → 调它的设置"，内嵌正好顺路。
 //
-// 每个面板 = 独立的 async 渲染函数，签名统一：
-//   render<XxxPanel>(box, ctx)  —— box 是要填充的容器
-// 只有 grail / ad-inject 还保留顶栏 tab（它们体量大、是主功能）。
+// 🔴 架构约束（2026-10-21）：**面板代码全部在插件自己的 ui.js 里**。
+//    内核不保留任何插件映射，openPluginPanel() 按 manifest.ui 动态加载。
+//    加/改插件面板只动 plugins/<id>/ui.js，内核零改动。
+//
+// 插件侧签名：export async function mountPanel(box, ctx)
 
-const PANEL_RENDERERS = {
-  'blacklist': renderBlacklistPanel,
-  'anti-ad': renderAntiAdPanel,
-  'group-manager': renderGroupManagerPanel,
-  'websearch': renderWebsearchPanel,
-  'voice': renderVoicePanel,
-  'vision': renderVisionPanel,
-  'memory': renderMemoryPanel,
-  'schedule': renderSchedulePanel,
-  'sticker': renderStickerPanel,
-  'study': renderStudyPanel,
-  'teacher': renderTeacherPanel,
-  'master-tools': renderMasterToolsPanel
-};
+// 插件配置面板已**全部迁到各自的 plugins/<id>/ui.js**（mountPanel）。
+// 这个映射保留为空对象，仅为兼容 openPluginPanel 与 hasPanel 的判定逻辑。
+// 新增插件面板请写 plugins/<id>/ui.js，不要往这里加。
+const PANEL_RENDERERS = {};
 
 /** 打开某个插件的配置面板（在插件页内展开） */
 async function openPluginPanel(id) {
@@ -3375,9 +3367,17 @@ async function openPluginPanel(id) {
     const entry = tab?.file || '';
     if (entry) {
       const mod = await loadPluginUi(id, entry);
+      // ① 有 mountPanel 就用它（配置面板形态）
       if (mod && typeof mod.mountPanel === 'function') {
         box.innerHTML = '';
         await mod.mountPanel(box, { ...pluginUiContext(id), openPluginPanel });
+        return;
+      }
+      // ② 只有 mount（顶栏页签形态，如 grail / ad-inject）—— 也允许在插件页内展开，
+      //    这样用户在插件页也能直接调它的设置，不必切页签。
+      if (mod && typeof mod.mount === 'function') {
+        box.innerHTML = '<div id="pl-inline-mount"></div>';
+        await mod.mount($('#pl-inline-mount'), { ...pluginUiContext(id), openPluginPanel });
         return;
       }
     }
@@ -3439,423 +3439,30 @@ async function savePluginConfig(id, patch) {
 }
 
 // ── 群友黑名单 ────────────────────────────────────────────────
-async function renderBlacklistPanel(box, ctx) {
-  const d = await api('/api/blacklist');
-  const levels = d.levels || [];
-  const rows = (d.entries || []).map((e) => `
-    <tr>
-      <td><code>${esc(e.userId)}</code></td>
-      <td>${esc(e.levelLabel || e.level)}</td>
-      <td class="muted" style="font-size:12px">${e.groupId ? '群 ' + esc(e.groupId) : '全群'}</td>
-      <td class="muted" style="font-size:12px">${esc(e.note || '')}</td>
-      <td><button class="btn tiny" data-bl-del="${esc(e.userId)}" data-bl-gid="${esc(e.groupId || '')}">移除</button></td>
-    </tr>`).join('');
-
-  box.innerHTML = panelShell('blacklist', '群友黑名单', `
-    <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:12px">
-      <input id="bl-uid" placeholder="QQ 号" style="width:140px" />
-      <select id="bl-level" class="gr-select" style="min-width:120px">
-        ${levels.map((l) => `<option value="${esc(l.id)}" title="${esc(l.desc)}">${esc(l.label)}</option>`).join('')}
-      </select>
-      <input id="bl-gid" placeholder="群号（留空=全群）" style="width:160px" />
-      <input id="bl-note" placeholder="备注原因" style="width:180px" />
-      <button class="btn primary" id="bl-add">加入</button>
-    </div>
-    <div class="pl-level-desc muted" style="font-size:12px;line-height:1.8;margin-bottom:10px">
-      ${levels.map((l) => `· <b>${esc(l.label)}</b>：${esc(l.desc)}`).join('<br>')}
-    </div>
-    <table class="table">
-      <thead><tr><th>QQ</th><th>级别</th><th>范围</th><th>备注</th><th></th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="5" class="muted">名单为空</td></tr>'}</tbody>
-    </table>`, '三级语义：静默=不回复 / 屏蔽=连线都不收 / 驱逐=自动踢出群');
-
-  bindPanelClose(box);
-  $('#bl-add')?.addEventListener('click', async () => {
-    const userId = $('#bl-uid').value.trim();
-    if (!/^\d{4,}$/.test(userId)) return alert('QQ 号必须是数字');
-    try {
-      await api('/api/blacklist/entry', {
-        method: 'POST',
-        body: JSON.stringify({
-          userId,
-          level: $('#bl-level').value,
-          groupId: $('#bl-gid').value.trim(),
-          note: $('#bl-note').value.trim()
-        })
-      });
-      openPluginPanel('blacklist');
-    } catch (e) { alert(e.message); }
-  });
-  box.querySelectorAll('[data-bl-del]').forEach((b) => b.addEventListener('click', async () => {
-    if (!confirm(`把 ${b.dataset.blDel} 移出黑名单？`)) return;
-    try {
-      await api('/api/blacklist/remove', {
-        method: 'POST',
-        body: JSON.stringify({ userId: b.dataset.blDel, groupId: b.dataset.blGid })
-      });
-      openPluginPanel('blacklist');
-    } catch (e) { alert(e.message); }
-  }));
-}
 
 // ── 广告自动禁言 ──────────────────────────────────────────────
-async function renderAntiAdPanel(box, ctx) {
-  const d = await api('/api/anti-ad');
-  const recent = (d.recent || []).slice(0, 8).map((r) =>
-    `<li>· ${new Date(r.at).toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' })} ${esc(r.type)} ${esc(r.reason || r.groupId || '')}</li>`
-  ).join('');
-
-  box.innerHTML = panelShell('anti-ad', '广告自动禁言', `
-    <div class="row" style="gap:16px;flex-wrap:wrap">
-      <label class="switch-row"><input type="checkbox" id="aa-dry" ${d.dryRun ? 'checked' : ''} />
-        <span>演练模式（只记录不处罚）</span></label>
-      <label>禁言时长（秒）<input type="number" id="aa-sec" value="${d.muteSeconds || 600}" style="width:100px" /></label>
-      <label>同一人冷却（分钟）<input type="number" id="aa-cool" value="${Math.round((d.cooldownMs || 1800000) / 60000)}" style="width:90px" /></label>
-      <button class="btn primary" id="aa-save">保存</button>
-    </div>
-    <div class="row" style="gap:24px;margin-top:14px;font-size:13px">
-      <span>扫描 <b>${d.stats?.scanned ?? 0}</b></span>
-      <span>候选 <b>${d.stats?.candidates ?? 0}</b></span>
-      <span>已禁言 <b>${d.stats?.muted ?? 0}</b></span>
-      <span>保护跳过 <b>${d.stats?.skippedProtected ?? 0}</b></span>
-    </div>
-    <div style="margin-top:12px;font-size:12px" class="muted">
-      <b>最近记录</b><br>${recent || '暂无'}</div>`,
-    '关键词预筛 → 模型复核 → 代码执行禁言。模型只判断"是不是广告"，处罚始终由代码按规则执行。');
-
-  bindPanelClose(box);
-  $('#aa-save')?.addEventListener('click', async () => {
-    try {
-      await api('/api/anti-ad/config', {
-        method: 'POST',
-        body: JSON.stringify({
-          dryRun: $('#aa-dry').checked,
-          muteSeconds: Number($('#aa-sec').value),
-          cooldownMs: Number($('#aa-cool').value) * 60000
-        })
-      });
-      openPluginPanel('anti-ad');
-      alert('已保存');
-    } catch (e) { alert(e.message); }
-  });
-}
 
 // ── 群友福利发放 ──────────────────────────────────────────────
 
 // ── 群管理 ────────────────────────────────────────────────────
-async function renderGroupManagerPanel(box, ctx) {
-  const cfg = await pluginConfigOf('group-manager');
-  box.innerHTML = panelShell('group-manager', '群管理', `
-    <div class="row" style="gap:16px;flex-wrap:wrap">
-      <label class="switch-row"><input type="checkbox" id="gm-welcome" ${cfg.welcomeEnabled !== false ? 'checked' : ''} />
-        <span>新人入群自动迎新</span></label>
-      <label class="switch-row"><input type="checkbox" id="gm-friend" ${cfg.autoApproveFriend ? 'checked' : ''} />
-        <span>自动同意好友申请</span></label>
-      <label class="switch-row"><input type="checkbox" id="gm-group" ${cfg.autoApproveGroup ? 'checked' : ''} />
-        <span>自动同意入群申请</span></label>
-    </div>
-    <div style="margin-top:12px">
-      <label class="muted" style="font-size:12px">迎新文案（{userId} 会被替换成 @对方，{nickname} 是机器人昵称）</label>
-      <textarea id="gm-tpl" rows="5" style="width:100%;margin-top:4px">${esc(cfg.welcomeTemplate || '')}</textarea>
-    </div>
-    <div class="row" style="gap:8px;margin-top:8px">
-      <label class="muted" style="font-size:12px">拒绝名单（QQ 号，逗号分隔）</label>
-    </div>
-    <input id="gm-deny" value="${esc((cfg.denyUsers || []).join(','))}" style="width:100%" />
-    <button class="btn primary" id="gm-save" style="margin-top:12px">保存</button>`,
-    '自动同意默认关闭 —— 开启前请确认你知道会放进来什么人');
-
-  bindPanelClose(box);
-  $('#gm-save')?.addEventListener('click', async () => {
-    try {
-      await savePluginConfig('group-manager', {
-        welcomeEnabled: $('#gm-welcome').checked,
-        autoApproveFriend: $('#gm-friend').checked,
-        autoApproveGroup: $('#gm-group').checked,
-        welcomeTemplate: $('#gm-tpl').value,
-        denyUsers: $('#gm-deny').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean)
-      });
-      alert('已保存');
-    } catch (e) { alert(e.message); }
-  });
-}
 
 // ── 联网搜索 ──────────────────────────────────────────────────
-async function renderWebsearchPanel(box, ctx) {
-  const d = await api('/api/websearch/status');
-  box.innerHTML = panelShell('websearch', '联网搜索', `
-    <div class="row" style="gap:16px;flex-wrap:wrap">
-      <label class="switch-row"><input type="checkbox" id="ws-on" ${d.enabled ? 'checked' : ''} />
-        <span>启用 web_search / web_fetch</span></label>
-    </div>
-    <div class="row" style="gap:12px;margin-top:12px;flex-wrap:wrap">
-      <label>搜索引擎
-        <select id="ws-provider" class="gr-select" style="min-width:200px">
-          <option value="auto" ${d.provider === 'auto' ? 'selected' : ''}>自动（优先 AnySearch，失败回退 Bing）</option>
-          <option value="anysearch" ${d.provider === 'anysearch' ? 'selected' : ''}>只用 AnySearch</option>
-          <option value="bing" ${d.provider === 'bing' ? 'selected' : ''}>只用 Bing 抓取</option>
-        </select>
-      </label>
-      <label>结果条数 <input type="number" id="ws-max" value="${d.maxResults || 8}" style="width:80px" /></label>
-      <button class="btn primary" id="ws-save">保存</button>
-    </div>
-    <div style="margin-top:14px;font-size:13px">
-      <b>AnySearch Key</b>：${d.keyCount > 0
-        ? `${d.keyCount} 个已配置（${d.keyTails.map(esc).join('、')}）`
-        : (d.envAvailable ? '通过环境变量提供' : '<span class="error">未配置（会回退 Bing）</span>')}
-    </div>
-    <p class="muted" style="font-size:12px;margin-top:8px">
-      Key 原文不在面板显示，也不写回配置 —— 需要更换请直接编辑 data/config.json 或环境变量。</p>`,
-    'Key 只显示尾号；这是密钥零披露纪律');
-
-  bindPanelClose(box);
-  $('#ws-save')?.addEventListener('click', async () => {
-    try {
-      await savePluginConfig('websearch', {
-        provider: $('#ws-provider').value,
-        maxResults: Number($('#ws-max').value) || 8
-      });
-      // enabled 在内核 config.webSearch 上（不是插件配置）
-      const cfg = await api('/api/config');
-      await api('/api/config', {
-        method: 'POST',
-        body: JSON.stringify({ webSearch: { ...(cfg.webSearch || {}), enabled: $('#ws-on').checked } })
-      });
-      alert('已保存');
-    } catch (e) { alert(e.message); }
-  });
-}
 
 // ── 语音说与听 ────────────────────────────────────────────────
-async function renderVoicePanel(box, ctx) {
-  const d = await api('/api/voice/status');
-  const c = d.config || {};
-  const env = d.env || {};
-  const okEnv = env.ffmpeg;
-  box.innerHTML = panelShell('voice', '语音（说 / 听）', `
-    <div class="row" style="gap:12px;flex-wrap:wrap;font-size:13px;margin-bottom:12px">
-      <span>Python：<code>${esc(env.python || '?')}</code></span>
-      <span>venv：${env.hasVenv ? '✅ 已有' : '<span class="muted">未建（用系统 python3）</span>'}</span>
-      <span>ffmpeg：${okEnv ? '✅' : '<span class="error">❌ 未安装</span>'}</span>
-    </div>
-    ${!okEnv ? '<p class="error" style="font-size:13px">缺 ffmpeg，语音转码会失败。安装：<code>sudo apt install -y ffmpeg</code></p>' : ''}
-    <div class="row" style="gap:12px;flex-wrap:wrap">
-      <label>音色
-        <select id="vo-voice" class="gr-select" style="min-width:220px">
-          ${['zh-CN-XiaoxiaoNeural:女·温暖', 'zh-CN-XiaoyiNeural:女·活泼', 'zh-CN-YunxiNeural:男·阳光', 'zh-CN-YunyangNeural:男·播报'].map((o) => {
-            const [v, label] = o.split(':');
-            return `<option value="${v}" ${c.ttsVoice === v ? 'selected' : ''}>${label}（${v}）</option>`;
-          }).join('')}
-        </select>
-      </label>
-      <label>语速 <input id="vo-rate" value="${esc(c.ttsRate || '+0%')}" style="width:80px" /></label>
-      <label>识别模型
-        <select id="vo-model" class="gr-select">
-          ${['tiny', 'base', 'small', 'medium'].map((m) => `<option value="${m}" ${c.sttModel === m ? 'selected' : ''}>${m}</option>`).join('')}
-        </select>
-      </label>
-    </div>
-    <div class="row" style="gap:16px;margin-top:12px">
-      <label class="switch-row"><input type="checkbox" id="vo-auto" ${c.autoTranscribe ? 'checked' : ''} />
-        <span>自动转写群友语音</span></label>
-    </div>
-    <div class="row" style="gap:8px;margin-top:12px">
-      <button class="btn primary" id="vo-save">保存</button>
-      <button class="btn" id="vo-test">试合成一句</button>
-      <span id="vo-test-out" class="muted" style="font-size:12px"></span>
-    </div>
-    <p class="muted" style="font-size:12px;margin-top:10px">
-      依赖不随插件包分发。安装：<br>
-      <code>python3 -m venv plugins/voice/.venv &amp;&amp; plugins/voice/.venv/bin/pip install edge-tts faster-whisper "av&lt;13"</code></p>`,
-    '说：文字→语音（NapCat 自动转 silk）；听：语音→文字（本地 whisper，不出机器）');
-
-  bindPanelClose(box);
-  $('#vo-save')?.addEventListener('click', async () => {
-    try {
-      await savePluginConfig('voice', {
-        ttsVoice: $('#vo-voice').value,
-        ttsRate: $('#vo-rate').value,
-        sttModel: $('#vo-model').value,
-        autoTranscribe: $('#vo-auto').checked
-      });
-      alert('已保存');
-    } catch (e) { alert(e.message); }
-  });
-  $('#vo-test')?.addEventListener('click', async () => {
-    const out = $('#vo-test-out');
-    out.textContent = '合成中…';
-    try {
-      const r = await api('/api/voice/test', { method: 'POST', body: JSON.stringify({ text: '这是一条测试语音。' }) });
-      out.textContent = r.ok ? `✅ 成功（${r.bytes} 字节，未发送）` : `❌ ${r.error}`;
-    } catch (e) { out.textContent = '❌ ' + e.message; }
-  });
-}
 
 // ── 识图 ──────────────────────────────────────────────────────
-async function renderVisionPanel(box, ctx) {
-  const d = await api('/api/vision/status');
-  const results = d.results || {};
-  const list = Object.entries(results).slice(0, 12).map(([k, v]) =>
-    `<li>· <code>${esc(k)}</code> → ${esc(String(v?.verdict || v))}</li>`).join('');
-  box.innerHTML = panelShell('vision', '识图', `
-    <div class="row" style="gap:16px;flex-wrap:wrap;font-size:13px">
-      <span>总开关：${d.enabled ? '✅ 已启用' : '⛔ 已关闭'}</span>
-      <span>当前模型：<code>${esc(d.model || '未设置')}</code></span>
-      <span>提供商：<code>${esc(d.provider || '-')}</code></span>
-    </div>
-    <p class="muted" style="font-size:12px;margin-top:10px">
-      模型必须支持图片输入，否则工具会给出"看不到图"的提示。
-      开关在「设置 → 模型 API → 图片输入」。</p>
-    <div style="margin-top:12px;font-size:12px" class="muted">
-      <b>模型能力探测结果</b><br>${list || '还没有探测记录（在设置页点「测试连通性」会顺带探测）'}</div>`,
-    '把消息里的图片交给视觉模型查看');
-  bindPanelClose(box);
-}
 
 // ── 轻量记忆 ──────────────────────────────────────────────────
-async function renderMemoryPanel(box, ctx) {
-  const chats = (state.chats || []).slice(0, 20);
-  box.innerHTML = panelShell('memory', '轻量记忆', `
-    <p class="muted" style="font-size:13px">
-      模型用 memory_append / memory_query / memory_remove 维护三类记忆：
-      进行中的话题、想说没说的话、对群友的印象。每次运行自动注入提示词。</p>
-    <div class="row" style="gap:8px;margin-top:12px">
-      <input id="mem-chat" placeholder="会话键，如 group:123456" style="width:280px" />
-      <button class="btn primary" id="mem-view">查看</button>
-    </div>
-    <pre id="mem-out" class="mem-preview" style="margin-top:12px"></pre>`,
-    '记忆数据存 data/memory/，不随插件导出');
-  bindPanelClose(box);
-  $('#mem-view')?.addEventListener('click', async () => {
-    const chat = $('#mem-chat').value.trim();
-    const out = $('#mem-out');
-    if (!chat) { out.textContent = '请填会话键'; return; }
-    try {
-      const r = await api('/api/memory/status?chat=' + encodeURIComponent(chat));
-      out.textContent = r.ok ? (r.text || '（该会话没有记忆）') : ('错误：' + r.error);
-    } catch (e) { out.textContent = '错误：' + e.message; }
-  });
-}
 
 // ── 定时任务与课表 ────────────────────────────────────────────
-async function renderSchedulePanel(box, ctx) {
-  const d = await api('/api/schedule/status');
-  const tasks = (d.tasks || []).map((t) =>
-    `<li>· ${esc(t.when)} ${t.enabled === false ? '<span class="muted">(已停用)</span>' : ''}</li>`).join('');
-  box.innerHTML = panelShell('schedule', '定时任务与课表', `
-    <div class="row" style="gap:16px;flex-wrap:wrap">
-      <label class="switch-row"><input type="checkbox" id="sc-notify" ${d.notifyEnabled ? 'checked' : ''} />
-        <span>每晚课程播报</span></label>
-      <label>播报时间 <input id="sc-time" value="${esc(d.notifyTime || '21:00')}" style="width:90px" /></label>
-      <button class="btn primary" id="sc-save">保存</button>
-    </div>
-    <div style="margin-top:14px;font-size:13px">
-      <b>待触发任务</b>（${d.taskCount || 0} 条）
-      <ul style="margin:6px 0 0;padding-left:18px;font-size:12px">${tasks || '<li class="muted">暂无</li>'}</ul>
-    </div>
-    <p class="muted" style="font-size:12px;margin-top:10px">
-      主人在 QQ 里说「X点提醒我…」即可创建任务；课表数据放在 data/plugins/schedule/schedule.json。</p>`,
-    '播报是每晚私聊主人次日课程；课表查询是秒回工具');
-  bindPanelClose(box);
-  $('#sc-save')?.addEventListener('click', async () => {
-    try {
-      await api('/api/schedule/config', {
-        method: 'POST',
-        body: JSON.stringify({
-          notifyEnabled: $('#sc-notify').checked,
-          notifyTime: $('#sc-time').value
-        })
-      });
-      alert('已保存');
-    } catch (e) { alert(e.message); }
-  });
-}
 
 // ── 表情包 ────────────────────────────────────────────────────
-async function renderStickerPanel(box, ctx) {
-  let d = { total: 0, annotated: 0 };
-  try { d = await api('/api/stickers/stats'); } catch { /* 忽略 */ }
-  box.innerHTML = panelShell('sticker', '表情包', `
-    <div class="row" style="gap:24px;font-size:13px">
-      <span>收藏表情 <b>${d.total ?? 0}</b> 个</span>
-      <span>已标注 <b>${d.annotated ?? 0}</b> 个</span>
-    </div>
-    <p class="muted" style="font-size:12.5px;margin-top:10px">
-      模型用 list_stickers 查找、get_sticker_image 看图、sticker_note 记理解、collect_sticker 收藏。</p>
-    <p class="muted" style="font-size:12px">
-      表情库在 <code>data/stickers.json</code>（内核共享数据，不随插件导出）。</p>`,
-    '让机器人会发表情、也能理解别人发的表情');
-  bindPanelClose(box);
-}
 
 // ── 学习模式与知识库 ──────────────────────────────────────────
-async function renderStudyPanel(box, ctx) {
-  let ov = null;
-  try { ov = (await api('/api/study/progress')).overview; } catch { /* 忽略 */ }
-  const subs = (ov?.subjects || []).map((s) =>
-    `<tr><td>${esc(s.subject)}</td><td>${s.total} 题</td><td>${(s.chapters || []).length} 章</td></tr>`).join('');
-  const total = (ov?.subjects || []).reduce((a, s) => a + s.total, 0);
-  box.innerHTML = panelShell('study', '学习模式与知识库', `
-    <div class="row" style="gap:24px;font-size:13px;margin-bottom:12px">
-      <span>科目 <b>${(ov?.subjects || []).length}</b></span>
-      <span>总题量 <b>${total}</b></span>
-    </div>
-    <table class="table">
-      <thead><tr><th>科目</th><th>题量</th><th>章节</th></tr></thead>
-      <tbody>${subs || '<tr><td colspan="3" class="muted">题库未安装</td></tr>'}</tbody>
-    </table>
-    <p class="muted" style="font-size:12px;margin-top:10px">
-      题库是**资产**，随插件包分发（在 plugins/study/kb/）；
-      学习进度是运行数据（在 data/plugins/study/）。</p>`,
-    '6 个教学工具：看总览 / 取题 / 查教材 / 进度 / 档案 / 学习计划');
-  bindPanelClose(box);
-}
 
 // ── 教师模式 ──────────────────────────────────────────────────
-async function renderTeacherPanel(box, ctx) {
-  const d = await api('/api/teacher/status');
-  box.innerHTML = panelShell('teacher', '教师模式', `
-    <div class="row" style="gap:24px;font-size:13px">
-      <span>角色卡：${d.personaInstalled ? '✅ 已注入' : '⛔ 未注入'}</span>
-      <span>身份模式：${d.modeInstalled ? '✅ 已注册' : '⛔ 未注册'}</span>
-      <span>角色卡长度：<b>${d.roleTextLength ?? 0}</b> 字</span>
-    </div>
-    <div style="margin-top:12px;font-size:13px">
-      <b>切换口令</b><br>
-      <span style="font-size:12px">进入：${(d.enter || []).map((x) => `「${esc(x)}」`).join(' ')}</span><br>
-      <span style="font-size:12px">退出：${(d.exit || []).map((x) => `「${esc(x)}」`).join(' ')}</span>
-    </div>
-    <p class="muted" style="font-size:12px;margin-top:10px">
-      老师人设不内置在内核，由本插件注入；卸载插件会一并撤回。</p>`,
-    '老师角色卡 + 学习模式身份，配合「学习模式与知识库」使用');
-  bindPanelClose(box);
-}
 
 // ── 主人专属工具 ──────────────────────────────────────────────
-async function renderMasterToolsPanel(box, ctx) {
-  const d = await api('/api/master-tools/status');
-  box.innerHTML = panelShell('master-tools', '主人专属工具', `
-    <div class="row" style="gap:16px;flex-wrap:wrap">
-      <label class="switch-row"><input type="checkbox" id="mt-teacher" ${d.teacherControl ? 'checked' : ''} />
-        <span>启用 teacher_control（控制教师机器人）</span></label>
-      <button class="btn primary" id="mt-save">保存</button>
-    </div>
-    <div style="margin-top:14px;font-size:13px;line-height:1.9">
-      <div>主人 QQ：<code>${esc(d.masterQQ || '未设置')}</code></div>
-      <div>教师服务（:3211）：${d.teacherReachable ? '✅ 可达' : '<span class="muted">未运行</span>'}</div>
-      <div>DSH 转发：${d.dshEnabled ? '✅ 可用' : '⛔ 关闭'}</div>
-    </div>
-    <p class="muted" style="font-size:12px;margin-top:10px">
-      这三个工具只对主人挂载 —— 群友触发时模型根本看不到它们。</p>`,
-    'dsh_task（转发复杂任务）/ teacher_control（控制教师）/ report_feedback（反馈）');
-  bindPanelClose(box);
-  $('#mt-save')?.addEventListener('click', async () => {
-    try {
-      await savePluginConfig('master-tools', { teacherControl: $('#mt-teacher').checked });
-      alert('已保存');
-    } catch (e) { alert(e.message); }
-  });
-}
 
 
 // ── 胜者奖励配置（2026-10-21）──────────────────────────────────
