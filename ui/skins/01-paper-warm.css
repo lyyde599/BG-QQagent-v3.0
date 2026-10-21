@@ -1,0 +1,19 @@
+/* 皮肤：暖纸（Paper Warm）
+   温润的米黄纸感，降低蓝光感。适合长时间阅读会话与提示词。 */
+:root[data-skin="paper-warm"]{
+  --bg:#FAF6EF; --bg2:#F6F1E8; --bg3:#F6F1E8;
+  --fg:#2B2620; --fg2:#6B6155; --fg3:#6B6155;
+  --line:#E6DDCE; --line2:#D2C5B0;
+  --panel:#FFFCF7; --on-panel:#2B2620;
+  --raised:#F4EDE2; --on-raised:#2B2620;
+  --raised2:#EFE6D8; --sunken:#FBF7F1; --on-sunken:#2B2620; --sunken-fg2:#6B6155;
+  --acc:#8C6A3F; --on-acc:#FFFFFF; --acc-soft:#F2E8D8; --on-acc-soft:#4A3620; --acc-hover:#755734;
+  --ok:#3E5C3A; --on-ok:#FFFFFF; --ok-soft:#EAF0E6; --on-ok-soft:#22331F;
+  --warn:#7A5A18; --on-warn:#FFFFFF; --warn-soft:#F8F0DC; --on-warn-soft:#3D2C0B;
+  --err:#8C3A2E; --on-err:#FFFFFF; --err-soft:#F7E7E4; --on-err-soft:#5A241C;
+  --info:#3F5566; --on-info:#FFFFFF; --info-soft:#E9F0F4; --on-info-soft:#243340;
+  --inverse:#2E2822; --on-inverse:#FAF6EF; --inverse-line:#6B5F52;
+  --overlay:rgba(43,38,32,.44); --overlay-strong:rgba(30,26,22,.95);
+  --shadow:0 12px 40px rgba(60,48,32,.16);
+  --scroll:#DDD2C0; --scroll-hover:#C4B69E;
+}

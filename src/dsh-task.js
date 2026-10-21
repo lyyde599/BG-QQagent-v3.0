@@ -5,7 +5,7 @@ import path from 'node:path';
 import { ROOT } from './config.js';
 
 const DSH_BASE = process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
-// 部署目录不固定，跟着项目根走，换机器/换路径都不用改代码。
+// 部署目录不固定（历史上是 /root/qq-agent-v2），跟着项目根走，换机器/换路径都不用改代码。
 const WORK_ROOT = process.env.QQ_AGENT_WORK_ROOT || path.join(ROOT, 'dsh-work');
 const WORKSPACE_DIR = path.join(ROOT, 'workspace');
 

@@ -188,6 +188,94 @@ async function mountPluginUi(tabId, root, entryFile) {
   }
 }
 
+
+// ══════════════════════════════════════════════════════════════
+//  外观：皮肤 + 自定义背景（2026-10-21）
+// ══════════════════════════════════════════════════════════════
+//
+// 设计：皮肤 = 一组令牌覆盖（ui/skins/*.css），靠 :root[data-skin="x"] 生效。
+//       背景 = 一张图，通过 CSS 变量注入，透明度用「面板不透明度」表达。
+//
+//   🔴 不透明度的实现要点：
+//      不能直接给 body 加 opacity（会让整个界面连文字一起变淡）。
+//      做法是给 body 铺一层背景图，再让面板/卡片用半透明底色 ——
+//      这样只有"纸"变透，字始终清晰（对比度不受影响）。
+
+const SKINS = [
+  { id: 'default',    label: '纸墨灰', desc: '原色 · 白纸墨字' },
+  { id: 'paper-warm', label: '暖纸',   desc: '米黄纸感 · 长时间阅读' },
+  { id: 'midnight',   label: '深墨',   desc: '深色底 · 夜间护眼' },
+  { id: 'forest',      label: '青苔',   desc: '低饱和绿灰 · 冷静' },
+  { id: 'sakura',     label: '樱灰',   desc: '淡粉灰 · 柔和' },
+  { id: 'ocean',      label: '深海',   desc: '冷蓝灰 · 数据看板' }
+];
+
+let appearanceState = null;
+
+/** 读取外观配置（带缓存，避免每次渲染都请求） */
+async function loadAppearance(force = false) {
+  if (appearanceState && !force) return appearanceState;
+  try {
+    const c = await api('/api/config');
+    appearanceState = c?.appearance || { skin: 'default', background: {} };
+  } catch {
+    appearanceState = { skin: 'default', background: {} };
+  }
+  return appearanceState;
+}
+
+/** 应用外观到 DOM（皮肤 attr + 背景图 + 面板透明度） */
+function applyAppearance(app) {
+  const skin = app?.skin || 'default';
+  const bg = app?.background || {};
+  const root = document.documentElement;
+
+  // ① 皮肤
+  if (skin === 'default') root.removeAttribute('data-skin');
+  else root.setAttribute('data-skin', skin);
+
+  // ② 背景图
+  const hasBg = !!(bg.dataUrl && bg.dataUrl.startsWith('data:image/'));
+  root.style.setProperty('--user-bg-image', hasBg ? `url("${bg.dataUrl}")` : 'none');
+  root.style.setProperty('--user-bg-blur', `${Number(bg.blur) || 0}px`);
+  root.style.setProperty('--user-bg-mode', bg.mode === 'contain' ? 'contain'
+    : bg.mode === 'repeat' ? 'repeat' : 'cover');
+  // 面板不透明度：0.3~1.0，值越小背景越透
+  const op = hasBg ? Math.min(1, Math.max(0.3, Number(bg.opacity) || 0.92)) : 1;
+  root.style.setProperty('--user-panel-alpha', String(op));
+  root.classList.toggle('has-user-bg', hasBg);
+}
+
+/** 保存外观并立即生效 */
+async function saveAppearance(patch) {
+  const cur = await loadAppearance(true);
+  const next = {
+    ...cur,
+    ...patch,
+    background: { ...(cur.background || {}), ...(patch.background || {}) }
+  };
+  const r = await api('/api/config', { method: 'POST', body: { appearance: next } });
+  if (r && r.ok === false) throw new Error(r.error || '保存失败');
+  appearanceState = next;
+  applyAppearance(next);
+  return next;
+}
+
+/** 把文件读成 dataURL（限制 2MB，太大塞进 config 不合适） */
+function readImageAsDataUrl(file, maxMB = 2) {
+  return new Promise((resolve, reject) => {
+    if (!file) return reject(new Error('没有文件'));
+    if (!/^image\//.test(file.type)) return reject(new Error('请选择图片文件'));
+    if (file.size > maxMB * 1024 * 1024) {
+      return reject(new Error(`图片过大（${(file.size / 1024 / 1024).toFixed(1)}MB），上限 ${maxMB}MB`));
+    }
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result || ''));
+    fr.onerror = () => reject(new Error('读取失败'));
+    fr.readAsDataURL(file);
+  });
+}
+
 async function api(path, options = {}) {
   const opts = { ...options };
   if (opts.body !== undefined && opts.body !== null && typeof opts.body === 'object'
@@ -1641,6 +1729,152 @@ function dispatchTabLoad(name) {
   if (root) return mountPluginUi(name, root);
 }
 
+
+// ── 外观设置面板 ────────────────────────────────────────────
+function renderAppearanceSection(c) {
+  const app = (c && c.appearance) || { skin: 'default', background: {} };
+  const bg = app.background || {};
+  const cur = app.skin || 'default';
+
+  // 每套皮肤的小色板（用该皮肤自己的值，肉眼可辨）
+  const SWATCH = {
+    'default':    ['#F7F7F7', '#202020', '#000000'],
+    'paper-warm': ['#FAF6EF', '#2B2620', '#8C6A3F'],
+    'midnight':   ['#17181A', '#E8E9EB', '#EDEFF2'],
+    'forest':     ['#F2F5F2', '#1E2A22', '#2F6B4A'],
+    'sakura':     ['#FBF7F8', '#2B2427', '#8A4A5E'],
+    'ocean':      ['#F3F6F9', '#1B2530', '#1F5A85']
+  };
+
+  const cards = SKINS.map((s) => {
+    const sw = (SWATCH[s.id] || []).map((col) => `<i style="background:${col}"></i>`).join('');
+    return `
+      <div class="skin-card ${s.id === cur ? 'active' : ''}" data-skin-pick="${esc(s.id)}">
+        <div class="sc-name">${esc(s.label)}</div>
+        <div class="sc-desc">${esc(s.desc)}</div>
+        <div class="skin-swatch">${sw}</div>
+      </div>`;
+  }).join('');
+
+  const hasBg = !!(bg.dataUrl || '').startsWith('data:image/');
+  const alpha = Number(bg.opacity) || 0.92;
+
+  return `
+    <h3>皮肤</h3>
+    <p class="muted" style="font-size:13px;margin:4px 0 0">
+      换皮肤只换配色令牌，不改任何布局。所有皮肤都通过 WCAG AA 对比度校验。
+    </p>
+    <div class="skin-grid">${cards}</div>
+
+    <h3 style="margin-top:26px">自定义背景</h3>
+    <p class="muted" style="font-size:13px;margin:4px 0 0">
+      上传一张图做背景。下面的<b>透明度</b>控制"纸有多透"——调低能看到背景，文字始终清晰。
+    </p>
+
+    <div class="bg-preview" id="bg-preview"
+         style="${hasBg ? `background-image:url('${bg.dataUrl}')` : ''}">
+      ${hasBg ? '' : '未设置背景（点下方按钮上传）'}
+    </div>
+
+    <div class="row" style="gap:10px;flex-wrap:wrap;margin-top:12px">
+      <input type="file" id="bg-file" accept="image/*" style="display:none" />
+      <button class="btn" id="bg-upload">${hasBg ? '更换图片' : '上传图片'}</button>
+      ${hasBg ? '<button class="btn" id="bg-clear">移除背景</button>' : ''}
+    </div>
+
+    <div class="row" style="gap:16px;flex-wrap:wrap;margin-top:16px;align-items:flex-end">
+      <div class="field" style="min-width:220px">
+        <label class="muted" style="font-size:12px">
+          透明度（当前 <b id="bg-alpha-val">${Math.round(alpha * 100)}</b>%）——
+          数值越小，背景越明显
+        </label>
+        <input type="range" id="bg-alpha" min="30" max="100" step="1"
+               value="${Math.round(alpha * 100)}" style="width:100%" />
+      </div>
+      <div class="field" style="min-width:160px">
+        <label class="muted" style="font-size:12px">背景模糊</label>
+        <input type="range" id="bg-blur" min="0" max="20" step="1"
+               value="${Number(bg.blur) || 0}" style="width:100%" />
+      </div>
+      <div class="field" style="min-width:140px">
+        <label class="muted" style="font-size:12px">显示方式</label>
+        <select id="bg-mode" style="width:100%">
+          <option value="cover" ${bg.mode === 'cover' || !bg.mode ? 'selected' : ''}>铺满（裁剪）</option>
+          <option value="contain" ${bg.mode === 'contain' ? 'selected' : ''}>完整显示</option>
+          <option value="repeat" ${bg.mode === 'repeat' ? 'selected' : ''}>平铺</option>
+        </select>
+      </div>
+    </div>
+    <p class="muted" style="font-size:12px;margin-top:10px">
+      图片以 dataURL 存进 <code>data/config.json</code>，上限 2MB。<br>
+      背景图只存在本机，不会随插件包导出。
+    </p>`;
+}
+
+/** 外观面板的事件绑定（由 bindSettingsEvents 调用） */
+function bindAppearanceEvents() {
+  if (state.settingsSection !== 'appearance') return;
+
+  $$('[data-skin-pick]').forEach((el) => el.addEventListener('click', async () => {
+    try {
+      await saveAppearance({ skin: el.dataset.skinPick });
+      $$('[data-skin-pick]').forEach((x) => x.classList.remove('active'));
+      el.classList.add('active');
+      toast('已切换皮肤');
+    } catch (e) { toast('切换失败：' + e.message); }
+  }));
+
+  const file = $('#bg-file');
+  $('#bg-upload')?.addEventListener('click', () => file?.click());
+
+  file?.addEventListener('change', async () => {
+    const f = file.files?.[0];
+    if (!f) return;
+    try {
+      const dataUrl = await readImageAsDataUrl(f);
+      await saveAppearance({ background: { dataUrl } });
+      toast('背景已设置');
+      renderSettings();
+    } catch (e) { toast('设置失败：' + e.message); }
+  });
+
+  $('#bg-clear')?.addEventListener('click', async () => {
+    try {
+      await saveAppearance({ background: { dataUrl: '' } });
+      toast('背景已移除');
+      renderSettings();
+    } catch (e) { toast('移除失败：' + e.message); }
+  });
+
+  // 透明度 / 模糊：拖动即时预览，松手才保存
+  const alphaEl = $('#bg-alpha');
+  alphaEl?.addEventListener('input', () => {
+    const v = Number(alphaEl.value) / 100;
+    document.documentElement.style.setProperty('--user-panel-alpha', String(v));
+    const lab = $('#bg-alpha-val');
+    if (lab) lab.textContent = String(Math.round(v * 100));
+  });
+  alphaEl?.addEventListener('change', async () => {
+    try { await saveAppearance({ background: { opacity: Number(alphaEl.value) / 100 } }); }
+    catch (e) { toast('保存失败：' + e.message); }
+  });
+
+  const blurEl = $('#bg-blur');
+  blurEl?.addEventListener('input', () => {
+    document.documentElement.style.setProperty('--user-bg-blur', `${Number(blurEl.value)}px`);
+  });
+  blurEl?.addEventListener('change', async () => {
+    try { await saveAppearance({ background: { blur: Number(blurEl.value) } }); }
+    catch (e) { toast('保存失败：' + e.message); }
+  });
+
+  $('#bg-mode')?.addEventListener('change', async (ev) => {
+    try { await saveAppearance({ background: { mode: ev.target.value } }); }
+    catch (e) { toast('保存失败：' + e.message); }
+  });
+}
+
+
 function renderSettingsSidebar() {
   const s = state.status;
   const sidebar = $('#settings-sidebar');
@@ -1650,6 +1884,7 @@ function renderSettingsSidebar() {
     ['persona', '人设'],
     ['allow', '聊天白名单'],
     ['chat', '聊天设置'],
+    ['appearance', '外观'],
     ['desktop', '桌面端'],
     ['onebot', 'OneBot（SnowLuma）']
   ];
@@ -1689,7 +1924,8 @@ function renderSettingsSection(c) {
     allow: () => renderAllowSection(c),
     chat: () => renderChatSection(c),
     desktop: () => renderDesktopSection(c),
-    onebot: () => renderOnebotSection(c)
+    onebot: () => renderOnebotSection(c),
+    appearance: () => renderAppearanceSection(c)
   };
   const render = sections[sec] || sections.api;
   const saveBar = `
@@ -2278,6 +2514,9 @@ function bindWelfareEvents() {
 }
 
 function bindSettingsEvents(c) {
+  // 外观面板（皮肤 / 背景）—— 它有自己的绑定函数
+  bindAppearanceEvents();
+
   // API Key 显示/隐藏（默认遮蔽：密钥不在屏幕上明文暴露 —— 记忆 00 的密钥纪律）
   const toggleKey = $('#toggle-apikey');
   if (toggleKey) toggleKey.addEventListener('click', () => {
@@ -3100,6 +3339,8 @@ $$('.tab').forEach((tab) => {
       connectSSE();
       refreshStatus();
       setInterval(refreshStatus, 15000);
+      // 🔴 外观必须在这一支里也应用（首启没配模型会走这里并 return）
+      loadAppearance().then(applyAppearance).catch(() => {});
       syncPluginTabs();
       setInterval(syncPluginTabs, 20000);
       return;
@@ -3108,6 +3349,8 @@ $$('.tab').forEach((tab) => {
   refreshStatus();
   setInterval(refreshStatus, 15000);
   connectSSE();
+  // 启动即应用外观（皮肤 + 背景），避免先闪一下默认色
+  loadAppearance().then(applyAppearance).catch(() => {});
   syncPluginTabs();                    // 按已装载插件渲染页签
   setInterval(syncPluginTabs, 20000);  // 装卸插件后页签跟着变
   loadSessions();

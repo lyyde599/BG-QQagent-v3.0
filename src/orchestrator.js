@@ -557,11 +557,21 @@ export class Orchestrator {
       }
 
       if (!toolCalls.length) {
-        // 兜底（仅私聊）：模型把回复写在 content 里没调 send_message 时自动发出（清理 XML 残留）。
-        // 群聊不兜底——模型看到消息后若决定回复会主动调 send_message；不调 = 自主选择不回复（正常），
-        // 若把它的内心独白/决策文本兜底发出去，就会变成"每条都回/自言自语刷屏"。
+        // 兜底策略（2026-10-21 用户要求改为**群聊逻辑**）：
+        //
+        // 🔴 旧行为：群聊不兜底、私聊兜底。
+        //    结果是私聊里大量"思维链"被当回复发出去，且正常回复又常被
+        //    looksSpokenToUser 的严苛判定拦掉（实测 7 条正常回复拦了 6 条）——
+        //    两个方向都错：该发的没发，不该发的发了。
+        //
+        // 新行为：**私聊也用群聊逻辑 —— 一律不兜底**。
+        //    模型要说话就调 send_message；没调 = 它选择不说话，这是正常选项。
+        //    这样彻底消除"思维链泄漏"，也消除"回复被误拦"。
+        //
+        //    为保证私聊仍有回复，下面的「私聊必回重试」负责兜住：
+        //    一旦整轮没发出任何消息，会再催一次让它调 send_message。
         const isPrivateChat = String(ctx.chatKey || '').startsWith('private:');
-        const directText = isPrivateChat ? (typeof msg?.content === 'string' ? msg.content : '').trim() : '';
+        const directText = '';   // 两处都不再从 content 兜底
         const monoA = directText ? looksLikeMonologue(directText, { hasSendMessage: false }) : { think: false };
         if (monoA.think) this.emit('log', { text: '[独白拦截/A] ' + directText.slice(0, 50) });
         if (!monoA.think && directText && directText.length <= 2000 && !/^[\[\]{}()<>\s]+$/.test(directText)) {
@@ -607,23 +617,9 @@ export class Orchestrator {
         if (monoC.think || (roundText && !spokenOk)) {
           this.emit('log', { text: '[独白拦截/C] ' + roundText.slice(0, 50) });
         }
-        if (spokenOk && !monoC.think && privateChat && roundText && roundText.length <= 2000) {
-          const cleanedRound = roundText
-            .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
-            .replace(/<\/?parameter>|<\/?invoke>|<\/?function_calls>/gi, ' ')
-            .replace(/\s+/g, ' ')
-            .trim();
-          if (cleanedRound && cleanedRound.length >= 1 && !/^<\/?/.test(cleanedRound)
-              && !alreadySent(ctx.session, cleanedRound)) {
-            try {
-              const rRound = await ctx.sender.sendTextBatch(ctx.chatKey, cleanedRound, {});
-              ctx.session.sent.push(...rRound.sent.map((x) => ({ type: 'text', text: x.text })));
-              this.emit('log', { text: '[工具前兜底] content 已发出: ' + cleanedRound.slice(0, 50) });
-            } catch (e) {
-              this.emit('log', { text: '[工具前兜底失败] ' + (e?.message || e) });
-            }
-          }
-        }
+        // 2026-10-21：私聊不再兜底（与群聊一致）。理由见 A 处注释。
+        // 保留判定与拦截日志，便于排查"模型说了什么但没发"的情况。
+        // （原「工具前 content 兜底」已移除：私聊改为与群聊一致的"不兜底"策略）
       }
 
       const toolResults = [];
@@ -699,8 +695,8 @@ export class Orchestrator {
     // 私聊且模型本轮思考了却什么都没发（没调 send_message、content 也空）：
     // 再给一次机会强制让它回复，避免"私聊了却不回复"。最多重试 2 次。
     if (!session.error && status === 'noreply' && String(ctx.chatKey || '').startsWith('private:')) {
-      const MASTER_QQ = String(getConfig().persona?.masterQQ || '');
-      if (String(ctx.chatId || '') === MASTER_QQ) {
+      // 私聊必回：不限 masterQQ —— 任何人私聊都该有回复
+      {
         let retried = 0;
         while (retried < 2 && session.sent.length === 0 && !this.aborted && !this.paused) {
           retried++;
@@ -714,16 +710,25 @@ export class Orchestrator {
               { role: 'user', content: '【系统提醒】你刚才收到主人的私聊消息，但没有给出任何回复就结束了。私聊规则：主人私聊你时必须回复，不能不吭声。请立即补上回复：如果刚才在查资料/思考，现在把结论发给主人（用 send_message）；如果没什么可说的，也至少要回一句简短的回应（比如"收到~刚在查，马上给你说"）。' }
             ];
             const { chatCompletion } = await import('./llm.js');
-            const resp = await chatCompletion({ messages: retryMsg, temperature: 0.6 });
-            const retryText = String(resp?.message?.content || '').trim();
-            if (retryText) {
-              const cleaned = retryText.replace(/<\/?[a-zA-Z][^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-              if (cleaned && cleaned.length >= 1 && cleaned.length <= 2000) {
-                const r2 = await ctx.sender.sendTextBatch(ctx.chatKey, cleaned, {});
-                ctx.session.sent.push(...r2.sent.map((x) => ({ type: 'text', text: x.text })));
+            // 🔴 重试必须**带工具**，并要求模型调 send_message（2026-10-21）
+            //    旧实现直接发 resp.content —— 那和"从 content 兜底"是同一类错误，
+            //    思维链照样会漏。现在只接受工具调用产生的发送。
+            const resp = await chatCompletion({
+              messages: retryMsg,
+              temperature: 0.6,
+              tools: openAiTools,
+              tool_choice: 'auto'
+            });
+            const retryToolCalls = resp?.message?.tool_calls || [];
+            const sendCall = retryToolCalls.find((c) => (c?.function?.name || '') === 'send_message');
+            if (sendCall) {
+              const result = await executeTool(toolDefs, ctx, 'send_message', sendCall?.function?.arguments ?? '{}');
+              if (!result?.isError) {
                 status = 'done';
-                this.emit('log', { text: '[必回重试] 已补发回复: ' + cleaned.slice(0, 60) });
+                this.emit('log', { text: '[必回重试] 模型已通过 send_message 补发' });
               }
+            } else {
+              this.emit('log', { text: '[必回重试] 模型仍未调 send_message，放弃补发' });
             }
           } catch (e) {
             console.error('[必回重试] 出错:', e?.message || e);

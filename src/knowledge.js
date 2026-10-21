@@ -36,7 +36,7 @@ export { progressRoot };
 const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
 const writeJson = (p, d) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(d, null, 1), 'utf8'); };
 
-// chapter-index.json 的 file 字段历史上被写成绝对路径，
+// chapter-index.json 的 file 字段历史上被写成绝对路径（如 /root/qq-agent-v2/...），
 // 一旦换机器或换部署目录就静默读不到：真题之外的分桶题库全部取不到，题量被卡死在真题条数。
 // 统一在此解析：相对路径按 KB_ROOT 拼；绝对路径不存在时，用「bank/ 之后的部分」回退到当前 KB_ROOT。
 // 这样旧数据也能自愈，不再依赖部署路径。

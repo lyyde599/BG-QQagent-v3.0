@@ -129,6 +129,22 @@ export const DEFAULT_CONFIG = {
     autoStart: false,         // 开机自启（仅 Electron 桌面端生效）
     closeToTray: true         // 点关闭 = 最小化到托盘
   },
+  // 外观（2026-10-21）：皮肤 + 自定义背景
+  //
+  // skin 取值：default（纸墨灰原色）| paper-warm | midnight | forest | sakura | ocean
+  // 皮肤只是**覆盖令牌**，不改任何组件规则 —— 见 ui/skins/*.css
+  //
+  // background：自定义背景图。dataUrl 存 base64（避免额外静态目录与权限问题），
+  // opacity 控制"背景透过面板的程度"：0 = 完全看不见背景，1 = 面板不透明（同默认）。
+  appearance: {
+    skin: 'default',
+    background: {
+      dataUrl: '',      // 空 = 不启用背景图
+      opacity: 0.92,    // 面板不透明度（0.30~1.00）；越小背景越透
+      blur: 0,          // 背景模糊 px（0~20）
+      mode: 'cover'     // cover | contain | repeat
+    }
+  },
   // 预算保险丝：今日估算成本达到上限（元）自动暂停；0 = 不限制
   budget: {
     dailyCostYuan: 0

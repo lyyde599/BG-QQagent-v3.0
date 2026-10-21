@@ -1,0 +1,19 @@
+/* 皮肤：深海（Ocean）
+   冷蓝灰，清晰冷静。适合数据看板。 */
+:root[data-skin="ocean"]{
+  --bg:#F3F6F9; --bg2:#EDF2F7; --bg3:#EDF2F7;
+  --fg:#1B2530; --fg2:#566472; --fg3:#566472;
+  --line:#DDE5ED; --line2:#C2CFDB;
+  --panel:#FBFDFF; --on-panel:#1B2530;
+  --raised:#E9F0F6; --on-raised:#1B2530;
+  --raised2:#E2EBF3; --sunken:#F6F9FC; --on-sunken:#1B2530; --sunken-fg2:#566472;
+  --acc:#1F5A85; --on-acc:#FFFFFF; --acc-soft:#E2EEF6; --on-acc-soft:#0F2E45; --acc-hover:#184868;
+  --ok:#2E6B54; --on-ok:#FFFFFF; --ok-soft:#E4EFEA; --on-ok-soft:#17382C;
+  --warn:#6E5A12; --on-warn:#FFFFFF; --warn-soft:#F3EFDC; --on-warn-soft:#38300B;
+  --err:#8A3226; --on-err:#FFFFFF; --err-soft:#F6E7E4; --on-err-soft:#4F1C14;
+  --info:#1F5A85; --on-info:#FFFFFF; --info-soft:#E2EEF6; --on-info-soft:#0F2E45;
+  --inverse:#18222C; --on-inverse:#F3F6F9; --inverse-line:#4E5F70;
+  --overlay:rgba(18,28,38,.44); --overlay-strong:rgba(12,19,26,.95);
+  --shadow:0 12px 40px rgba(20,36,52,.15);
+  --scroll:#CDD9E4; --scroll-hover:#B2C3D2;
+}

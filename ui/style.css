@@ -958,6 +958,20 @@ tbody tr:hover { background: var(--raised); color: var(--on-raised); }
   }
   #tabs::-webkit-scrollbar { display: none; }
   #tabs .tab { flex: 0 0 auto; padding: 10px 12px; font-size: 13px; }
+  /* 右侧渐隐：提示"还能往右滑"（否则用户不知道后面还有页签） */
+  /* 右侧渐隐提示：用伪元素盖一层"背景色→透明"的渐变，
+     提示用户还能往右滑。用 --bg2（页签栏底色）而非裸色值。 */
+  #tabs::after {
+    content: '';
+    position: sticky;
+    right: 0;
+    flex: 0 0 22px;
+    align-self: stretch;
+    pointer-events: none;
+    background: linear-gradient(to right,
+      color-mix(in srgb, var(--bg2) 0%, transparent),
+      var(--bg2));
+  }
 
   /* 主布局：左右分栏在手机上必须改成上下堆叠 */
   #layout { flex-direction: column; }
@@ -985,20 +999,31 @@ tbody tr:hover { background: var(--raised); color: var(--on-raised); }
     max-height: none;
     padding: 8px 10px;
   }
+  /* 手机端设置菜单（2026-10-21 修）
+     🔴 原来是横向滚动条，但每项被撑到 370px（width:100% 继承桌面规则），
+        7 项总宽 2626px —— 用户根本不知道右边还有内容，
+        表现为「外观等设置项显示不出来」（实测：外观在 1514px 处）。
+     改为**自动换行的网格**：一行 2~3 项，一眼看全，不用滑。 */
   .settings-menu {
-    display: flex;
-    flex-direction: row;
-    overflow-x: auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
     gap: 6px;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
+    overflow: visible;
   }
-  .settings-menu::-webkit-scrollbar { display: none; }
   .settings-menu-item {
-    flex: 0 0 auto;
+    width: auto;            /* 关键：覆盖桌面的 width:100% */
+    flex: none;
     white-space: nowrap;
-    padding: 7px 12px;
-    font-size: 13px;
+    padding: 9px 8px;
+    font-size: 12.5px;
+    text-align: center;
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+  }
+  .settings-menu-item.active {
+    border-color: var(--acc);
+    background: var(--acc-soft);
+    color: var(--on-acc-soft);
   }
   .settings-pane { padding: 14px 12px 32px; }
 
@@ -1097,3 +1122,106 @@ tbody tr:hover { background: var(--raised); color: var(--on-raised); }
   line-height: 1.7;
 }
 .ad-msg-line + .ad-msg-line { margin-top: 4px; padding-top: 4px; border-top: 1px dashed var(--line); }
+
+/* ══════════════════════════════════════════════════════════
+   自定义背景 + 面板透明（2026-10-21）
+   ══════════════════════════════════════════════════════════
+   🔴 关键：不透明度作用在**面板底色**上，不是 body opacity。
+     给 body 加 opacity 会让文字一起变淡、对比度失效。
+     正确做法：body 铺背景图，面板用 color-mix 把底色变半透明 ——
+     字始终踩在"面板色 + 背景"的混合层上，仍由令牌保证对比度。
+
+   --user-panel-alpha 取值 0.30~1.00（1.00 = 不透明，等同默认外观）
+   ══════════════════════════════════════════════════════════ */
+
+/* 背景图层：固定定位铺满，不参与滚动捕获 */
+html.has-user-bg body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image: var(--user-bg-image, none);
+  background-size: var(--user-bg-mode, cover);
+  background-position: center;
+  background-repeat: var(--user-bg-mode, cover) == repeat ? repeat : no-repeat;
+  background-repeat: no-repeat;
+  filter: blur(var(--user-bg-blur, 0px));
+  /* 模糊时边缘会露出白边，放大一点点盖住 */
+  transform: scale(1.04);
+  pointer-events: none;
+}
+
+/* repeat 模式下不放大、不加 blur 之外的变换 */
+html.has-user-bg body[data-bg-repeat="1"]::before { transform: none; background-repeat: repeat; background-size: auto; }
+
+/* 面板变半透明：只影响"纸"，不影响字 */
+html.has-user-bg .card,
+html.has-user-bg .list-pane,
+html.has-user-bg .settings-sidebar,
+html.has-user-bg .settings-pane,
+html.has-user-bg .snowluma-pane,
+html.has-user-bg .detail-pane,
+html.has-user-bg .modal-card,
+html.has-user-bg .collapsible,
+html.has-user-bg .pl-panel-card,
+html.has-user-bg .tool-card,
+html.has-user-bg .session-item,
+html.has-user-bg .bubble {
+  background-color: color-mix(in srgb,
+    var(--panel) calc(var(--user-panel-alpha, 0.92) * 100%),
+    transparent);
+  backdrop-filter: blur(calc(var(--user-bg-blur, 0px) / 2));
+}
+
+/* 顶栏与页签也跟纸走，但要比内容区更实一点，免得文字压在花背景上 */
+html.has-user-bg #topbar,
+html.has-user-bg #tabs {
+  background-color: color-mix(in srgb,
+    var(--bg2) calc(min(1, var(--user-panel-alpha, 0.92) + 0.06) * 100%),
+    transparent);
+  backdrop-filter: blur(8px);
+}
+
+/* 输入框保持更实，否则打字时看不清光标 */
+html.has-user-bg input,
+html.has-user-bg textarea,
+html.has-user-bg select {
+  background-color: color-mix(in srgb,
+    var(--panel) calc(min(1, var(--user-panel-alpha, 0.92) + 0.08) * 100%),
+    transparent);
+}
+
+/* ── 外观设置面板 ─────────────────────────────────────── */
+.skin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+.skin-card {
+  border: 1px solid var(--line2);
+  border-radius: var(--r-sm);
+  padding: 10px 12px;
+  cursor: pointer;
+  background: var(--panel);
+  transition: border-color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
+}
+.skin-card:hover { border-color: var(--fg2); transform: translateY(-1px); }
+.skin-card.active { border-color: var(--acc); box-shadow: 0 0 0 2px var(--acc-soft) inset; }
+.skin-card .sc-name { font-weight: 600; font-size: var(--fs-sm); }
+.skin-card .sc-desc { color: var(--fg2); font-size: var(--fs-xs); margin-top: 2px; }
+.skin-swatch {
+  display: flex; gap: 4px; margin-top: 8px;
+}
+.skin-swatch i {
+  width: 18px; height: 18px; border-radius: var(--r-pill);
+  border: 1px solid var(--line2);
+}
+.bg-preview {
+  width: 100%; height: 120px; border-radius: var(--r-sm);
+  border: 1px solid var(--line2); margin-top: 10px;
+  background-size: cover; background-position: center;
+  background-color: var(--sunken);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--fg2); font-size: var(--fs-sm);
+}

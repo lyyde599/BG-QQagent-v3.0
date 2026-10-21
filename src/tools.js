@@ -10,7 +10,7 @@ import { formatStickerList } from './stickers.js';
 import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
 
 // 本工具允许读发的本地目录：项目内的 workspace/ 与 dsh-work/，外加系统临时目录。
-// 不写死部署路径，换机器/换目录自动跟着走。
+// 不写死部署路径（历史上是 /root/qq-agent-v2/...），换机器/换目录自动跟着走。
 const WORKSPACE_DIR = path.join(ROOT, 'workspace');
 const DSH_WORK_DIR = path.join(ROOT, 'dsh-work');
 const TEMP_DIRS = ['/tmp', ...(process.env.TMPDIR ? [process.env.TMPDIR] : [])];

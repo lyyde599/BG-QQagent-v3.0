@@ -1,0 +1,19 @@
+/* 皮肤：青苔（Forest）
+   低饱和绿灰，冷调但柔和。适合长时间盯盘/盯日志。 */
+:root[data-skin="forest"]{
+  --bg:#F2F5F2; --bg2:#EDF1ED; --bg3:#EDF1ED;
+  --fg:#1E2A22; --fg2:#5A6B60; --fg3:#5A6B60;
+  --line:#DCE3DC; --line2:#C3CFC5;
+  --panel:#FBFDFB; --on-panel:#1E2A22;
+  --raised:#E9EFE9; --on-raised:#1E2A22;
+  --raised2:#E3EBE4; --sunken:#F6F9F6; --on-sunken:#1E2A22; --sunken-fg2:#5A6B60;
+  --acc:#2F6B4A; --on-acc:#FFFFFF; --acc-soft:#E2EFE7; --on-acc-soft:#17351F; --acc-hover:#26573D;
+  --ok:#2F6B4A; --on-ok:#FFFFFF; --ok-soft:#E2EFE7; --on-ok-soft:#17351F;
+  --warn:#6E5A12; --on-warn:#FFFFFF; --warn-soft:#F3EFDC; --on-warn-soft:#38300B;
+  --err:#8A3226; --on-err:#FFFFFF; --err-soft:#F6E7E4; --on-err-soft:#4F1C14;
+  --info:#3A5A72; --on-info:#FFFFFF; --info-soft:#E7EFF5; --on-info-soft:#22374A;
+  --inverse:#1C2620; --on-inverse:#F2F5F2; --inverse-line:#55655C;
+  --overlay:rgba(20,30,24,.44); --overlay-strong:rgba(14,22,17,.95);
+  --shadow:0 12px 40px rgba(24,42,30,.15);
+  --scroll:#CBD6CD; --scroll-hover:#B0C0B4;
+}

@@ -1,0 +1,19 @@
+/* 皮肤：樱灰（Sakura）
+   极淡的暖粉灰，柔和但不甜腻。 */
+:root[data-skin="sakura"]{
+  --bg:#FBF7F8; --bg2:#F7F1F3; --bg3:#F7F1F3;
+  --fg:#2B2427; --fg2:#6B5D62; --fg3:#6B5D62;
+  --line:#EDE1E5; --line2:#DAC8CE;
+  --panel:#FFFDFD; --on-panel:#2B2427;
+  --raised:#F6EEF0; --on-raised:#2B2427;
+  --raised2:#F1E7EA; --sunken:#FCF8F9; --on-sunken:#2B2427; --sunken-fg2:#6B5D62;
+  --acc:#8A4A5E; --on-acc:#FFFFFF; --acc-soft:#F5E8EC; --on-acc-soft:#451F2B; --acc-hover:#733D4E;
+  --ok:#3F6B50; --on-ok:#FFFFFF; --ok-soft:#E7F0EA; --on-ok-soft:#21382A;
+  --warn:#7A5A18; --on-warn:#FFFFFF; --warn-soft:#F8F0DC; --on-warn-soft:#3D2C0B;
+  --err:#8C3A2E; --on-err:#FFFFFF; --err-soft:#F7E7E4; --on-err-soft:#5A241C;
+  --info:#42566B; --on-info:#FFFFFF; --info-soft:#EAF0F5; --on-info-soft:#25313D;
+  --inverse:#2E2629; --on-inverse:#FBF7F8; --inverse-line:#6B5C61;
+  --overlay:rgba(43,36,39,.44); --overlay-strong:rgba(30,25,27,.95);
+  --shadow:0 12px 40px rgba(60,42,48,.15);
+  --scroll:#E3D3D8; --scroll-hover:#CBB6BD;
+}

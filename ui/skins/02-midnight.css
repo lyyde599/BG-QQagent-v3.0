@@ -1,0 +1,19 @@
+/* 皮肤：深墨（Midnight）
+   深色底 + 柔白字，夜间使用不刺眼。 */
+:root[data-skin="midnight"]{
+  --bg:#17181A; --bg2:#1C1E21; --bg3:#1C1E21;
+  --fg:#E8E9EB; --fg2:#9FA4AB; --fg3:#9FA4AB;
+  --line:#2B2E33; --line2:#3A3E45;
+  --panel:#1F2124; --on-panel:#E8E9EB;
+  --raised:#26292D; --on-raised:#E8E9EB;
+  --raised2:#2C3035; --sunken:#1A1C1F; --on-sunken:#E8E9EB; --sunken-fg2:#9FA4AB;
+  --acc:#EDEFF2; --on-acc:#17181A; --acc-soft:#2E3238; --on-acc-soft:#E8E9EB; --acc-hover:#FFFFFF;
+  --ok:#7FBF87; --on-ok:#12210F; --ok-soft:#223026; --on-ok-soft:#A9D8AE;
+  --warn:#D9B25C; --on-warn:#2A1F08; --warn-soft:#332B1A; --on-warn-soft:#E8CC8A;
+  --err:#E08578; --on-err:#2A0F0B; --err-soft:#3A2220; --on-err-soft:#F0AEA4;
+  --info:#7FAECF; --on-info:#0C1C27; --info-soft:#1E2C36; --on-info-soft:#A6CBE4;
+  --inverse:#F2F3F5; --on-inverse:#17181A; --inverse-line:#B9BEC6;
+  --overlay:rgba(0,0,0,.62); --overlay-strong:rgba(0,0,0,.94);
+  --shadow:0 12px 40px rgba(0,0,0,.55);
+  --scroll:#3A3E45; --scroll-hover:#4C525A;
+}
