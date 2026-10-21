@@ -136,6 +136,18 @@ export const EXPORT_MODES = {
  * @param {import('./plugin-host.js').PluginHost} host
  * @param {object} deps { getConfig, log }
  */
+/**
+ * 插件前端文件的 mtime 指纹。
+ * 浏览器对 ES module 缓存很激进，前端据此加 ?v= 后缀强制拉新版。
+ * 拿不到返回 ''（前端退化为普通加载）。
+ */
+function uiFileStamp(pluginId, file) {
+  if (!pluginId || !file) return '';
+  try {
+    return Math.floor(fs.statSync(path.join(PLUGINS_DIR, pluginId, file)).mtimeMs).toString(36);
+  } catch { return ''; }
+}
+
 export function registerPluginAdmin(host, { getConfig, log }) {
   const add = (method, p, handler, raw = false) => host.routes.push({
     id: '__admin__', method, path: p, handler, raw, pluginId: null
@@ -158,7 +170,10 @@ export function registerPluginAdmin(host, { getConfig, log }) {
     // /plugin-ui/<pluginId>/<file>
     tabs: host.uiTabs.map((t) => ({
       id: t.id, label: t.label, pluginId: t.pluginId,
-      inline: t.inline === true, file: t.file || ''
+      inline: t.inline === true, file: t.file || '',
+      // fileStamp = ui.js 的 mtime：前端据此加 ?v= 后缀，
+      // 避免浏览器对 ES module 的激进缓存导致"改了插件没生效"
+      fileStamp: uiFileStamp(t.pluginId, t.file)
     }))
   }));
 

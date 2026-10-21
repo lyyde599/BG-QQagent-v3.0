@@ -102,18 +102,33 @@ function toast(msg, ms = 2600) {
 
 const pluginUiCache = new Map();
 
-async function loadPluginUi(pluginId, entryFile) {
+/**
+ * 加载插件前端模块。
+ *
+ * 🔴 两个必须注意的点（2026-10-21 实测踩到）：
+ *
+ * ① **不缓存失败结果**。原来失败时 `set(pluginId, null)`，
+ *    于是插件文件修好后再也不会重试，必须刷新整个页面 ——
+ *    用户看到的就是"一直报没有导出 mount()"。
+ *
+ * ② **URL 带 mtime 版本号**。浏览器对 ES module 的缓存很激进，
+ *    插件 ui.js 更新后仍可能加载旧内容。加 ?v=<mtime> 强制拉新的。
+ *    （内核不缓存 mtime，每次现取；代价是一次 API 调用，可接受）
+ */
+async function loadPluginUi(pluginId, entryFile, stamp) {
   if (!entryFile) return null;
-  if (pluginUiCache.has(pluginId)) return pluginUiCache.get(pluginId);
+  const key = `${pluginId}@${stamp || ''}`;
+  if (pluginUiCache.has(key)) return pluginUiCache.get(key);
   try {
-    const url = `/plugin-ui/${encodeURIComponent(pluginId)}/${entryFile}`;
+    const q = stamp ? `?v=${encodeURIComponent(stamp)}` : '';
+    const url = `/plugin-ui/${encodeURIComponent(pluginId)}/${entryFile}${q}`;
     const mod = await import(/* @vite-ignore */ url);
-    pluginUiCache.set(pluginId, mod);
+    pluginUiCache.set(key, mod);
     return mod;
   } catch (e) {
     console.error(`[plugin-ui] ${pluginId} 加载失败:`, e);
     toast(`插件「${pluginId}」界面加载失败：${e.message}`);
-    pluginUiCache.set(pluginId, null);
+    // 注意：**不写缓存**，下次调用会重试
     return null;
   }
 }
@@ -144,11 +159,12 @@ async function mountPluginUi(tabId, root, entryFile) {
   //    路径必须用 **pluginId**（/plugin-ui/<pluginId>/<file>），不能用 tabId。
   let pluginId = tabId;
   let entry = entryFile;
+  let stamp = '';
   if (!entry) {
     try {
       const d = await api('/api/plugins');
       const tab = (d.tabs || []).find((x) => x.id === tabId);
-      if (tab) { pluginId = tab.pluginId || tabId; entry = tab.file || ''; }
+      if (tab) { pluginId = tab.pluginId || tabId; entry = tab.file || ''; stamp = tab.fileStamp || ''; }
     } catch { /* ignore */ }
   }
   if (!entry) {
@@ -156,7 +172,7 @@ async function mountPluginUi(tabId, root, entryFile) {
     return false;
   }
 
-  const mod = await loadPluginUi(pluginId, entry);
+  const mod = await loadPluginUi(pluginId, entry, stamp);
   if (!mod || typeof mod.mount !== 'function') {
     root.innerHTML = `<div class="error" style="padding:16px">插件「${esc(pluginId)}」的界面文件没有导出 mount()。</div>`;
     return false;
