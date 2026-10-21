@@ -583,11 +583,19 @@ export function createApp({ log = console.log } = {}) {
       const targetName = isGroup ? (await resolveAtName(id, targetId)) || targetId : targetId;
       text = operatorId === targetId ? `[拍一拍] ${operatorName} 拍了拍自己` : `[拍一拍] ${operatorName} 拍了拍 ${targetName}`;
     }
+    // senderName 必须是**真实昵称**（2026-10-21 修）：
+    // 原来写死成 '（拍一拍事件）'，导致活跃度排行里出现一个
+    // 叫"（拍一拍事件）"的"人"—— 其实是某个真实群友，
+    // 只是名字被覆盖了，管理员根本认不出该不该邀请他。
+    let operatorName = '';
+    try {
+      operatorName = (isGroup ? (await resolveAtName(id, operatorId)) : '') || '';
+    } catch { /* 拿不到就留空 */ }
     store.appendIncoming(`${isGroup ? 'group' : 'private'}:${id}`, {
       mid: null,
       ts: event.time ? Math.round(Number(event.time) * 1000) : Date.now(),
       senderId: operatorId,
-      senderName: '（拍一拍事件）',
+      senderName: operatorName || String(operatorId),
       text,
       media: []
     });

@@ -58,10 +58,24 @@ export class GroupManager {
     const userId = String(e.user_id ?? '');
     if (!groupId || !userId) return false;
 
-    // 只对白名单群生效（allow.groups 为空时表示不限制）
+    // 只对白名单群生效（2026-10-21 修）
+    //
+    // 🔴 旧逻辑是 `if (allow.length && !allow.includes(groupId)) return false`
+    //    —— 白名单为空时 `allow.length` 为 0，条件直接不成立 → **等于全部放行**。
+    //    实测事故：本机 allow.groups=[] 且 allowAllWhenEmpty=false，
+    //    机器人却给 1127063335、743533339 等群发了迎新语。
+    //
+    //    注释当时写的是「为空时表示不限制」，与内核 allowed() 的语义**相反**：
+    //    内核是「白名单为空 → 走 allowAllWhenEmpty（默认 false → 一律不放行）」。
+    //
+    // 现在与内核对齐：白名单为空 → 看 allowAllWhenEmpty；非空 → 必须在名单里。
     const cfg = this.#cfg();
-    const allow = (cfg.allow?.groups || []).map(String);
-    if (allow.length && !allow.includes(groupId)) return false;
+    const allow = (cfg.allow?.groups || []).map(String).filter(Boolean);
+    if (!allow.length) {
+      if (cfg.allowAllWhenEmpty !== true) return false;
+    } else if (!allow.includes(groupId)) {
+      return false;
+    }
 
     // 机器人自己被拉进群（user_id == self）→ 发"入驻引导"而非欢迎新人
     const selfJoin = userId === String(this.onebot.selfId ?? '');

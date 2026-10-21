@@ -177,19 +177,43 @@ export class ChatStore {
   }
 
   /** 最近 senderId 出现过的活跃成员（带最后发言时间）。 */
-  activeMembers(chatKey, limit = 10) {
+  /**
+   * 活跃成员排行。
+   *
+   * @param {string} chatKey
+   * @param {number} limit
+   * @param {{sortBy?: 'count'|'recent'}} [opts]
+   *   count  = 按**发言条数**排（判断"谁最活跃"用这个）
+   *   recent = 按最后发言时间排（默认，保持旧行为）
+   *
+   * 🔴 修一个计数 bug（2026-10-21）：
+   *   旧实现 `if (!prev || prev.lastTs < m.ts)` 分支里 count 只取 prev.count+1，
+   *   但**新消息时间总是更大** → 几乎总走这个分支 → count 永远等于 1，
+   *   实际是按"最后时间"排序而已，根本拿不到发言量。
+   */
+  activeMembers(chatKey, limit = 10, opts = {}) {
     const st = this.#state(chatKey);
     const map = new Map();
     for (const m of st.messages) {
-      if (m.self) continue;
+      if (m.self || !m.senderId) continue;
+      // 拍一拍不算"发言"：它没有真实内容，只是互动动作。
+      // 计入会让"爱拍一拍的人"被误判为活跃（2026-10-21）。
+      if (String(m.text || '').startsWith('[拍一拍]')) continue;
       const prev = map.get(m.senderId);
-      if (!prev || prev.lastTs < m.ts) {
-        map.set(m.senderId, { userId: m.senderId, name: m.senderName, lastTs: m.ts, count: (prev?.count || 0) + 1 });
+      if (!prev) {
+        map.set(m.senderId, { userId: m.senderId, name: m.senderName, lastTs: m.ts, count: 1 });
       } else {
-        prev.count += 1;
+        prev.count += 1;                                  // 计数独立累加
+        if (m.ts > prev.lastTs) { prev.lastTs = m.ts; prev.name = m.senderName || prev.name; }
       }
     }
-    return [...map.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, Math.max(1, limit));
+    const list = [...map.values()];
+    if (opts.sortBy === 'count') {
+      list.sort((a, b) => (b.count - a.count) || (b.lastTs - a.lastTs));
+    } else {
+      list.sort((a, b) => b.lastTs - a.lastTs);
+    }
+    return list.slice(0, Math.max(1, limit));
   }
 
   #trim(st) {
