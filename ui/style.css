@@ -1059,3 +1059,41 @@ tbody tr:hover { background: var(--raised); color: var(--on-raised); }
   .pl-switch-knob { width: 18px; height: 18px; }
   .pl-switch input:checked + .pl-switch-track .pl-switch-knob { transform: translateX(18px); }
 }
+
+/* ── 圣杯战争 · 候选名单（2026-10-21）──────────────────────── */
+.cand-table-wrap { max-height: 420px; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.cand-table { margin: 0; font-size: 13px; }
+.cand-table thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.cand-table tr.cand-disabled td { color: var(--fg2); opacity: .72; }
+.cand-t, .cand-s {
+  display: inline-block; padding: 1px 8px; border-radius: var(--r-pill);
+  font-size: 11.5px; border: 1px solid var(--line2); white-space: nowrap;
+}
+.cand-t.hot { border-color: var(--acc); font-weight: 600; }
+.cand-t.manual { border-style: dashed; }
+.cand-s.available { color: var(--ok); border-color: var(--ok); }
+.cand-s.accepted { color: var(--ok); }
+.cand-s.declined, .cand-s.expired { color: var(--fg2); text-decoration: line-through; }
+.cand-s.playing { font-weight: 600; }
+
+/* ── 圣杯战争 · 自动招募提示条（2026-10-21）────────────── */
+.gr-auto-bar {
+  margin-top: 12px; padding: 10px 14px;
+  border-left: 3px solid var(--acc);
+  background: var(--sunken); border-radius: var(--r-sm);
+  line-height: 1.7;
+}
+
+/* ── 广告回复内容列（2026-10-21）────────────────────────────
+   原来前端用 .slice(0, 60) 硬截断，内容被砍还没提示。
+   改成完整显示后，需要这一列会折行、且不把表格撑爆。 */
+.ad-msg-cell {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  max-width: 520px;
+  color: var(--fg2);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+.ad-msg-line + .ad-msg-line { margin-top: 4px; padding-top: 4px; border-top: 1px dashed var(--line); }

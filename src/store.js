@@ -194,11 +194,20 @@ export class ChatStore {
   activeMembers(chatKey, limit = 10, opts = {}) {
     const st = this.#state(chatKey);
     const map = new Map();
+    // ⏱ 时间窗口（2026-10-21 加）
+    // 原来统计的是**全部存档**，不分时间。存档上限 2000 条，
+    // 群聊冷的时候能覆盖好几天，于是"三周前发了 50 条的人"会被算成活跃。
+    // 现在按 sinceTs（毫秒）或 windowHours（小时）过滤。
+    const since = Number(opts.sinceTs)
+      || (Number(opts.windowHours) > 0 ? Date.now() - Number(opts.windowHours) * 3600 * 1000 : 0);
+
     for (const m of st.messages) {
       if (m.self || !m.senderId) continue;
       // 拍一拍不算"发言"：它没有真实内容，只是互动动作。
       // 计入会让"爱拍一拍的人"被误判为活跃（2026-10-21）。
       if (String(m.text || '').startsWith('[拍一拍]')) continue;
+      // 时间窗口外的不计入
+      if (since > 0 && Number(m.ts || 0) < since) continue;
       const prev = map.get(m.senderId);
       if (!prev) {
         map.set(m.senderId, { userId: m.senderId, name: m.senderName, lastTs: m.ts, count: 1 });

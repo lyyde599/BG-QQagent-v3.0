@@ -86,6 +86,92 @@ function toast(msg, ms = 2600) {
   el._t = setTimeout(() => el.classList.remove('show'), ms);
 }
 
+// ══════════════════════════════════════════════════════════════
+//  插件前端加载器（2026-10-21）
+// ══════════════════════════════════════════════════════════════
+//
+// 架构约束：**插件功能的前端代码必须放在插件自己的目录里**。
+// 内核 ui/app.js 只提供公共能力，不写任何插件界面。
+//
+// 插件侧（plugins/<id>/ui.js）:
+//   export async function mount(root, ctx) { ... }
+//   export async function unmount(root) { ... }   ← 可选
+//
+// ctx = { pluginId, api, toast, esc, state, $, $$, fmtTime, getConfig }
+// 插件完全不需要 import 内核模块。
+
+const pluginUiCache = new Map();
+
+async function loadPluginUi(pluginId, entryFile) {
+  if (!entryFile) return null;
+  if (pluginUiCache.has(pluginId)) return pluginUiCache.get(pluginId);
+  try {
+    const url = `/plugin-ui/${encodeURIComponent(pluginId)}/${entryFile}`;
+    const mod = await import(/* @vite-ignore */ url);
+    pluginUiCache.set(pluginId, mod);
+    return mod;
+  } catch (e) {
+    console.error(`[plugin-ui] ${pluginId} 加载失败:`, e);
+    toast(`插件「${pluginId}」界面加载失败：${e.message}`);
+    pluginUiCache.set(pluginId, null);
+    return null;
+  }
+}
+
+function pluginUiContext(pluginId) {
+  return {
+    pluginId, api, toast, esc, state,
+    $: (s) => document.querySelector(s),
+    $$: (s) => [...document.querySelectorAll(s)],
+    fmtTime,
+    getConfig: async () => (await api('/api/config')) || {},
+    // 插件页的**公共组件**（内核提供，插件直接用，不必各自实现一遍）
+    panelShell, bindPanelClose, savePluginConfig, pluginConfigOf
+  };
+}
+
+/**
+ * 挂载插件面板。
+ * @param {string} pluginId
+ * @param {HTMLElement} root 容器
+ * @param {string} [entryFile] 未传则从 /api/plugins 的 tabs 里查
+ */
+async function mountPluginUi(tabId, root, entryFile) {
+  if (!root) return false;
+  root.innerHTML = '<div class="muted" style="padding:16px">加载插件界面…</div>';
+
+  // 🔴 tabId ≠ pluginId（页签 id 是 ad，插件 id 是 ad-inject）。
+  //    路径必须用 **pluginId**（/plugin-ui/<pluginId>/<file>），不能用 tabId。
+  let pluginId = tabId;
+  let entry = entryFile;
+  if (!entry) {
+    try {
+      const d = await api('/api/plugins');
+      const tab = (d.tabs || []).find((x) => x.id === tabId);
+      if (tab) { pluginId = tab.pluginId || tabId; entry = tab.file || ''; }
+    } catch { /* ignore */ }
+  }
+  if (!entry) {
+    root.innerHTML = `<div class="muted" style="padding:16px">插件「${esc(pluginId)}」没有提供界面文件（manifest.ui 为空）。</div>`;
+    return false;
+  }
+
+  const mod = await loadPluginUi(pluginId, entry);
+  if (!mod || typeof mod.mount !== 'function') {
+    root.innerHTML = `<div class="error" style="padding:16px">插件「${esc(pluginId)}」的界面文件没有导出 mount()。</div>`;
+    return false;
+  }
+  try {
+    root.innerHTML = '';
+    await mod.mount(root, pluginUiContext(pluginId));
+    return true;
+  } catch (e) {
+    console.error(`[plugin-ui] ${pluginId} 渲染失败:`, e);
+    root.innerHTML = `<div class="error" style="padding:16px">插件界面渲染失败：${esc(e.message)}</div>`;
+    return false;
+  }
+}
+
 async function api(path, options = {}) {
   const opts = { ...options };
   if (opts.body !== undefined && opts.body !== null && typeof opts.body === 'object'
@@ -1487,11 +1573,16 @@ async function syncPluginTabs() {
   // 视图容器：有页签才有，卸掉时一并删除
   const main = $('#layout');
   for (const t of tabs) {
+    // 容器内层 id 必须是 plugin-view-<id>（内核只认这个命名）。
+    // 老版本建的是 <id>-page，这里做一次性纠正，避免升级后子页面空白。
+    const exist = $(`#view-${t.id}`);
+    if (exist && !$(`#plugin-view-${t.id}`)) exist.remove();
     if (!$(`#view-${t.id}`)) {
       const sec = document.createElement('section');
       sec.id = `view-${t.id}`;
       sec.className = 'view';
-      sec.innerHTML = `<div id="${esc(t.id)}-page" class="snowluma-pane"></div>`;
+      // 容器 id 用 plugin-view-<tabId>：内核只认这个命名，不认具体插件
+      sec.innerHTML = `<div id="plugin-view-${esc(t.id)}" class="snowluma-pane"></div>`;
       main.appendChild(sec);
     }
   }
@@ -1519,13 +1610,19 @@ async function syncPluginTabs() {
 
 /** 统一的页签加载分发（新增页签只改这里） */
 function dispatchTabLoad(name) {
-  if (name === 'sessions') loadSessions();
-  if (name === 'chats') loadChats();
-  if (name === 'snowluma') loadSnowlumaPage();
-  if (name === 'settings') loadSettings();
-  if (name === 'grail') loadGrailPage();
-  if (name === 'ad') loadAdPage();
-  if (name === 'plugins') loadPluginsPage();
+  // ── 内核自带的页签 ──
+  if (name === 'sessions') return loadSessions();
+  if (name === 'chats') return loadChats();
+  if (name === 'snowluma') return loadSnowlumaPage();
+  if (name === 'settings') return loadSettings();
+  if (name === 'plugins') return loadPluginsPage();
+
+  // ── 插件页签（2026-10-21）──
+  // 内核**不再认识任何具体插件**。页签内容由插件自己的 ui.js 提供，
+  // 通过 mountPluginUi() 动态 import。
+  // 新增/修改插件界面只动 plugins/<id>/ui.js，内核零改动。
+  const root = $(`#plugin-view-${name}`);
+  if (root) return mountPluginUi(name, root);
 }
 
 function renderSettingsSidebar() {
@@ -1576,12 +1673,10 @@ function renderSettingsSection(c) {
     allow: () => renderAllowSection(c),
     chat: () => renderChatSection(c),
     desktop: () => renderDesktopSection(c),
-    onebot: () => renderOnebotSection(c),
-    welfare: () => renderWelfareSection(c)
+    onebot: () => renderOnebotSection(c)
   };
   const render = sections[sec] || sections.api;
-  // 福利区块的活动有自己的保存按钮（走 /api/welfare/campaign），不显示通用「保存设置」
-  const saveBar = sec === 'welfare' ? '' : `
+  const saveBar = `
     <div class="save-bar">
       <button class="btn btn-primary" id="save-cfg-btn">保存设置</button>
       <span id="cfg-save-result" class="muted"></span>
@@ -1911,106 +2006,8 @@ function welfareRawCampaign(id) {
   return list.find((x) => x && x.id === id) || null;
 }
 
-function renderWelfareSection(c) {
-  const w = state.welfare;
-  if (!w) {
-    return `
-      <h3 id="settings-welfare">群友福利</h3>
-      <div class="hint">${state.welfareError ? `加载失败：${esc(state.welfareError)}` : (state.welfareLoading ? '正在加载福利数据…' : '福利数据尚未加载。')}</div>
-      <div class="field" style="margin-top:10px"><button class="btn btn-small" id="wf-reload-btn">重新加载</button></div>`;
-  }
-  return `
-    <h3 id="settings-welfare">群友福利</h3>
-    <div class="hint" style="margin-bottom:12px">群友按口令领取，发放走确定性代码（每人每活动限一次、入群满 N 小时）。码在「领取明细」里只显示打码结果。</div>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
-      <button class="btn btn-small" id="wf-reload-btn">↻ 刷新数据</button>
-      <span class="muted" style="font-size:12px">共 ${w.campaignCount} 个活动 · 累计 ${w.totalClaims} 次领取</span>
-      ${state.welfareToast ? `<span class="wf-toast">${esc(state.welfareToast)}</span>` : ''}
-    </div>
-    ${renderWelfareOverview(w)}
-    ${renderWelfareCampaignList(w)}
-    ${renderWelfareEditor(w)}
-    ${renderWelfareClaims(w)}
-    ${renderWelfareNotice()}`;
-}
-
 /** 总览：总开关、活动数、累计领取、每个活动各奖励项「已发/总数」+ 进度条 */
-function renderWelfareOverview(w) {
-  const cards = (w.campaigns || []).map((cp) => {
-    const rewards = (cp.rewards || []).map((r) => {
-      const total = Number(r.total) || 0;
-      const issued = Number(r.issued) || 0;
-      const pct = total ? Math.min(100, Math.round((issued / total) * 100)) : 0;
-      return `
-        <div class="wf-stock">
-          <div class="wf-stock-head">
-            <span>${WELFARE_ICON[r.type] || '🎁'} ${esc(r.label || r.id)}</span>
-            <span class="muted">已发 ${issued}/${total}${r.left !== undefined ? ` · 余 ${r.left}` : ''}</span>
-          </div>
-          <div class="wf-bar"><i style="width:${pct}%"></i></div>
-        </div>`;
-    }).join('');
-    return `
-      <div class="wf-camp-card">
-        <div class="wf-camp-head">
-          <span class="wf-camp-title">${esc(cp.title || cp.id)}</span>
-          <span class="wf-pill ${cp.enabled ? 'on' : 'off'}">${cp.enabled ? '启用' : '停用'}</span>
-        </div>
-        <div class="muted" style="font-size:12px">${esc(cp.id)} · 已领 ${cp.claimedUsers || 0} 人 · 入群满 ${esc(cp.minJoinHours)} 小时</div>
-        <div style="margin-top:8px">${rewards || '<span class="muted">（未配置奖励项）</span>'}</div>
-      </div>`;
-  }).join('');
-  return `
-    <div class="cap-grid">
-      <div class="cap-card">
-        <div class="cap-card-title">📊 总览</div>
-        <div class="cap-card-body">
-          总开关：${w.enabled ? '<span class="cap-ok">✅ 已启用</span>' : '<span class="cap-off">已停用（没有启用的活动）</span>'}<br>
-          活动数：<b>${w.campaignCount || 0}</b> · 累计领取：<b>${w.totalClaims || 0}</b> 次<br>
-          本次运行统计：发放 ${w.stats?.claims || 0} · 拒绝 ${w.stats?.rejected || 0} · 出错 ${w.stats?.errors || 0}
-        </div>
-      </div>
-      ${cards || '<div class="cap-card"><div class="cap-card-body">还没有活动，用下方「新建活动」创建第一个。</div></div>'}
-    </div>`;
-}
-
 /** 活动列表：每个活动的关键配置 + 启停开关 + 编辑/删除 */
-function renderWelfareCampaignList(w) {
-  const rows = (w.campaigns || []).map((cp) => {
-    const hasRaw = !!welfareRawCampaign(cp.id);
-    const toggle = `
-      <label class="wf-mini-switch" title="${hasRaw ? '点击即保存启停状态' : '原始活动未在本地配置中读到，请点「编辑」后保存'}">
-        <input type="checkbox" data-wf-toggle="${esc(cp.id)}" ${cp.enabled ? 'checked' : ''} ${hasRaw ? '' : 'disabled'} />
-        <span>启用</span>
-      </label>`;
-    const rewardLine = (cp.rewards || []).map((r) =>
-      `${WELFARE_ICON[r.type] || '🎁'} ${esc(r.label || r.id)} <span class="muted">${r.issued}/${r.total}</span>`
-    ).join('　') || '<span class="muted">无</span>';
-    return `
-      <div class="wf-camp-card">
-        <div class="wf-camp-head">
-          <span class="wf-camp-title">${esc(cp.title || cp.id)}</span>
-          ${toggle}
-        </div>
-        <table class="archive-table" style="margin-top:6px">
-          <tr><td class="t">活动 ID</td><td>${esc(cp.id)}</td></tr>
-          <tr><td class="t">来源群</td><td>${(cp.sourceGroups || []).map(esc).join('、') || '<span class="muted">不限</span>'}</td></tr>
-          <tr><td class="t">入群满</td><td>${esc(cp.minJoinHours)} 小时${cp.graceExisting ? ' <span class="muted">（老成员豁免）</span>' : ''}</td></tr>
-          <tr><td class="t">豁免名单</td><td>${(cp.exemptUsers || []).map(esc).join('、') || '<span class="muted">无</span>'}</td></tr>
-          <tr><td class="t">领取口令</td><td>${(cp.claimWords || []).map((x) => `<code>${esc(x)}</code>`).join(' ') || '<span class="muted">未设（按活动标题识别）</span>'}</td></tr>
-          <tr><td class="t">奖励项</td><td>${rewardLine}</td></tr>
-        </table>
-        <div style="display:flex;gap:8px;margin-top:8px">
-          <button class="btn btn-small" data-wf-edit="${esc(cp.id)}">编辑</button>
-          <button class="btn btn-small btn-danger" data-wf-del="${esc(cp.id)}">删除</button>
-        </div>
-      </div>`;
-  }).join('');
-  return `
-    <h3>活动列表</h3>
-    ${rows || '<div class="hint">暂无活动。</div>'}`;
-}
-
 /** 组装编辑器的初始草稿：优先用正在编辑的草稿，其次原始配置，最后快照 */
 function welfareEditorDraft(w) {
   if (state.welfareDraft) return state.welfareDraft;
@@ -2046,97 +2043,7 @@ function welfareEditorDraft(w) {
   };
 }
 
-function renderWelfareRewardRow(r, idx) {
-  const typeOpts = WELFARE_REWARD_TYPES.map(([v, l]) =>
-    `<option value="${v}" ${(r.type || 'key') === v ? 'selected' : ''}>${l}</option>`).join('');
-  const info = r.info || {};
-  return `
-    <div class="wf-reward" data-wf-reward="${idx}" data-wf-reward-id="${esc(r.id || '')}">
-      <div class="wf-reward-head">
-        <span>奖励项 #${idx + 1}${r.id ? ` <span class="muted" style="font-size:11px">${esc(r.id)}</span>` : ''}</span>
-        <button class="btn btn-small btn-danger" type="button" data-wf-remove-reward="${idx}">移除</button>
-      </div>
-      <div class="field-row">
-        <div class="field"><label>名称</label><input type="text" data-wf-r-label="${idx}" value="${esc(r.label || '')}" placeholder="如：API 额度" /></div>
-        <div class="field"><label>类型</label><select data-wf-r-type="${idx}">${typeOpts}</select></div>
-        <div class="field" style="max-width:130px"><label>每人限领</label><input type="number" min="1" data-wf-r-peruser="${idx}" value="${esc(r.perUser ?? 1)}" /></div>
-      </div>
-      <div class="field"><label>码列表（一行一个，当前 ${(r.items || []).length} 个）</label>
-        <textarea data-wf-r-items="${idx}" rows="4" placeholder="sk-xxxxxxxx&#10;sk-yyyyyyyy">${esc((r.items || []).join('\n'))}</textarea></div>
-      <div class="field"><label>识别关键词（逗号分隔，留空按类型默认）</label>
-        <input type="text" data-wf-r-keywords="${idx}" value="${esc((r.keywords || []).join(','))}" placeholder="如：token,额度,key" /></div>
-      <details class="wf-info">
-        <summary>附加信息（随码一起发给领取者：接口地址 / 模型 / 额度 / 购买地址 / 备注 / 使用方法）</summary>
-        <div class="field-row">
-          <div class="field"><label>接口地址 Base URL</label><input type="text" data-wf-r-baseurl="${idx}" value="${esc(info.baseUrl || '')}" /></div>
-          <div class="field"><label>模型名称</label><input type="text" data-wf-r-model="${idx}" value="${esc(info.model || '')}" /></div>
-        </div>
-        <div class="field-row">
-          <div class="field"><label>额度（token 数，仅本地记账）</label><input type="number" data-wf-r-quota="${idx}" value="${esc(info.quota ?? '')}" /></div>
-          <div class="field"><label>购买地址</label><input type="text" data-wf-r-shopurl="${idx}" value="${esc(info.shopUrl || '')}" /></div>
-        </div>
-        <div class="field"><label>备注</label><textarea data-wf-r-note="${idx}" rows="2">${esc(info.note || '')}</textarea></div>
-        <div class="field"><label>使用方法</label><textarea data-wf-r-howto="${idx}" rows="3">${esc(info.howto || '')}</textarea></div>
-      </details>
-    </div>`;
-}
-
 /** 新建/编辑活动的表单；奖励项数量不限 */
-function renderWelfareEditor(w) {
-  const editingId = state.welfareEditing || '';
-  const isEdit = !!editingId;
-  const d = welfareEditorDraft(w) || {
-    id: '', title: '', enabled: true, sourceGroups: [], minJoinHours: 24,
-    graceExisting: true, exemptUsers: [], claimWords: [], rewards: []
-  };
-  const rewards = d.rewards && d.rewards.length ? d.rewards : [];
-  const rewardBox = rewards.length
-    ? rewards.map((r, i) => renderWelfareRewardRow(r, i)).join('')
-    : '<div class="hint">还没有奖励项，点下方「＋ 添加奖励项」。每个活动可挂任意多个奖励项。</div>';
-  return `
-    <div id="wf-editor">
-      <h3>${isEdit ? '编辑活动' : '新建活动'}</h3>
-      ${d.rawMissing ? '<div class="hint" style="color:var(--orange)">⚠ 该活动来自旧版配置，码列表读不到，请重新粘贴后再保存（保存会写成新的活动模型）。</div>' : ''}
-      <div class="field-row">
-        <div class="field"><label>活动 ID（唯一，字母/数字/-/_；创建后不建议改）</label>
-          <input type="text" id="wf-id" value="${esc(d.id)}" placeholder="如：launch-20261004" ${isEdit ? '' : ''} /></div>
-        <div class="field"><label>标题</label><input type="text" id="wf-title" value="${esc(d.title)}" placeholder="如：群福利" /></div>
-      </div>
-      <div class="switch-group">
-        <label class="switch-row" for="wf-enabled">
-          <input type="checkbox" id="wf-enabled" ${d.enabled ? 'checked' : ''} />
-          <span class="switch-text"><strong>启用该活动</strong><span class="muted">停用后群友说口令不再发放</span></span>
-        </label>
-        <label class="switch-row" for="wf-grace">
-          <input type="checkbox" id="wf-grace" ${d.graceExisting ? 'checked' : ''} />
-          <span class="switch-text"><strong>老成员豁免入群时长</strong><span class="muted">开启后，入群时间查不到的老成员也允许领取</span></span>
-        </label>
-      </div>
-      <div class="field-row">
-        <div class="field"><label>允许领取的群号（逗号分隔，留空=不限群）</label>
-          <input type="text" id="wf-groups" value="${esc((d.sourceGroups || []).join(','))}" placeholder="如：123456789" /></div>
-        <div class="field" style="max-width:160px"><label>入群满 N 小时</label>
-          <input type="number" min="0" id="wf-hours" value="${esc(d.minJoinHours ?? 24)}" /></div>
-      </div>
-      <div class="field-row">
-        <div class="field"><label>豁免名单（QQ 号，逗号分隔）</label>
-          <input type="text" id="wf-exempt" value="${esc((d.exemptUsers || []).join(','))}" placeholder="如：123456" /></div>
-        <div class="field"><label>领取口令（逗号分隔）</label>
-          <input type="text" id="wf-words" value="${esc((d.claimWords || []).join(','))}" placeholder="如：领取福利" /></div>
-      </div>
-
-      <h3 style="margin-top:18px">奖励项</h3>
-      ${rewardBox}
-      <div style="display:flex;gap:8px;align-items:center;margin:10px 0 4px">
-        <button class="btn btn-small" type="button" id="wf-add-reward-btn">＋ 添加奖励项</button>
-        <button class="btn btn-small btn-primary" type="button" id="wf-save-campaign-btn">${isEdit ? '保存活动' : '创建活动'}</button>
-        ${isEdit ? '<button class="btn btn-small" type="button" id="wf-new-campaign-btn">改为新建</button>' : ''}
-        <span class="muted" id="wf-editor-result" style="font-size:12px"></span>
-      </div>
-      <div class="hint">提示：若奖励项是共享池（如中转站 key），「每人 N 万 token」只是本地记账的名义值，上游无法强制。</div>
-    </div>`;
-}
-
 /** 读取编辑器表单为活动对象 */
 function readWelfareForm() {
   const box = $('#wf-editor');
@@ -2177,53 +2084,7 @@ function readWelfareForm() {
 }
 
 /** 领取明细：选中的活动 → 谁在什么时间领到了哪些（码已打码） */
-function renderWelfareClaims(w) {
-  const campaigns = w.campaigns || [];
-  const selected = state.welfareClaimsCampaign || campaigns[0]?.id || '';
-  const cp = campaigns.find((x) => x.id === selected);
-  const rewards = cp?.rewards || [];
-  const claims = state.welfareClaims;
-  const rows = (claims || []).map((row) => {
-    const cells = rewards.length
-      ? rewards.map((r) => `<td><code>${esc(row.rewards?.[r.id]?.code || '-')}</code></td>`).join('')
-      : `<td>${Object.entries(row.rewards || {}).map(([rid, x]) => `<code>${esc(rid)}</code>: <code>${esc(x.code)}</code>`).join('　') || '-'}</td>`;
-    return `<tr><td class="t">${esc(row.userId)}</td><td class="t">${row.at ? esc(fmtTime(row.at)) : '-'}</td>${cells}</tr>`;
-  }).join('');
-  return `
-    <h3>领取明细</h3>
-    <div class="field-row">
-      <div class="field" style="max-width:320px"><label>选择活动</label>
-        <select id="wf-claims-campaign">
-          ${campaigns.map((x) => `<option value="${esc(x.id)}" ${x.id === selected ? 'selected' : ''}>${esc(x.title || x.id)}</option>`).join('') || '<option value="">（无活动）</option>'}
-        </select></div>
-    </div>
-    ${state.welfareClaimsError ? `<div class="hint" style="color:var(--red)">加载失败：${esc(state.welfareClaimsError)}</div>` : ''}
-    ${claims === null
-      ? '<div class="hint">正在加载…</div>'
-      : (rows
-        ? `<table class="archive-table">
-             <tr><th>QQ</th><th>时间</th>${rewards.length ? rewards.map((r) => `<th>${WELFARE_ICON[r.type] || '🎁'} ${esc(r.label || r.id)}</th>`).join('') : '<th>领取内容</th>'}</tr>
-             ${rows}
-           </table>`
-        : '<div class="hint">（暂无领取记录）</div>')}`;
-}
-
 /** 发布公告：内容 + 群号，600 字实时计数 */
-function renderWelfareNotice() {
-  return `
-    <h3>发布公告</h3>
-    <div class="hint" style="margin-bottom:8px">调用 QQ 群公告接口。QQ 群公告有 <b>${WELFARE_NOTICE_LIMIT}</b> 字硬上限，超出会被服务端拒绝。</div>
-    <div class="field"><label>目标群号（逗号分隔，可多个）</label>
-      <input type="text" id="wf-notice-groups" value="${esc(state.welfareNoticeGroups || '')}" placeholder="如：123456789,987654321" /></div>
-    <div class="field"><label>公告内容</label>
-      <textarea id="wf-notice-text" rows="6" placeholder="把活动规则、口令、奖励内容写在这里……">${esc(state.welfareNotice || '')}</textarea>
-      <div class="wf-counter" id="wf-notice-counter">0 / ${WELFARE_NOTICE_LIMIT}</div></div>
-    <div style="display:flex;gap:12px;align-items:center">
-      <button class="btn btn-primary" id="wf-notice-btn">发布公告</button>
-      <span class="muted" id="wf-notice-result" style="font-size:12px"></span>
-    </div>`;
-}
-
 function updateWelfareCounter() {
   const ta = $('#wf-notice-text');
   const el = $('#wf-notice-counter');
@@ -2233,43 +2094,6 @@ function updateWelfareCounter() {
   el.textContent = `${n} / ${WELFARE_NOTICE_LIMIT}`;
   el.className = 'wf-counter' + (n > WELFARE_NOTICE_LIMIT ? ' over' : '');
   if (btn) btn.disabled = n > WELFARE_NOTICE_LIMIT || n === 0;
-}
-
-async function loadWelfare({ withConfig = false } = {}) {
-  if (state.welfareLoading) return;
-  state.welfareLoading = true;
-  state.welfareLoadedAt = Date.now();
-  try {
-    const [wf, cfg] = await Promise.all([
-      api('/api/welfare'),
-      withConfig ? api('/api/config').catch(() => null) : Promise.resolve(null)
-    ]);
-    state.welfare = wf;
-    state.welfareError = '';
-    if (cfg) state.config = cfg;
-  } catch (e) {
-    state.welfareError = e.message || String(e);
-    state.welfare = null;
-  } finally {
-    state.welfareLoading = false;
-  }
-  if (state.settingsSection === 'welfare') renderSettings();
-}
-
-async function loadWelfareClaims(cid) {
-  state.welfareClaimsCampaign = cid || '';
-  state.welfareClaimsFor = cid || '';
-  state.welfareClaimsError = '';
-  if (!cid) { state.welfareClaims = []; return; }
-  state.welfareClaims = null;
-  try {
-    const r = await api('/api/welfare/claims?campaign=' + encodeURIComponent(cid));
-    state.welfareClaims = r.claims || [];
-  } catch (e) {
-    state.welfareClaims = null;
-    state.welfareClaimsError = e.message || String(e);
-  }
-  if (state.settingsSection === 'welfare') renderSettings();
 }
 
 /** 保存（创建或更新）一个活动；POST /api/welfare/campaign */
@@ -3281,369 +3105,20 @@ $$('.tab').forEach((tab) => {
 // 玩家在 QQ 里玩，主人在这里开局/发牌/结算。
 // 圣杯战争操作哪个群：从聊天白名单的第一个群取（不再写死群号）。
 // 换群只需改白名单，不用改代码。
-function grailGroup() {
-  const groups = state.config?.allow?.groups || [];
-  return String(groups[0] || '');
-}
-
-async function loadGrailPage() {
-  const el = $('#grail-page');
-  if (!el) return;
-  el.innerHTML = '<div class="muted">加载中…</div>';
-  try {
-    const d = await api(`/api/grail/game?group=${grailGroup()}`);
-    renderGrail(el, d.game);
-  } catch (e) {
-    el.innerHTML = `<div class="error">加载失败：${esc(e.message)}</div>`;
-  }
-}
-
-function renderGrail(el, g) {
-  // 战况/规则是"每局之外"的东西，单独缓存，避免每次渲染都重新拉
-  if (!state.grailRules) state.grailRules = null;
-
-  if (!g) {
-    el.innerHTML = `
-      <div class="card">
-        <h3>圣杯战争</h3>
-        <p class="muted">当前没有进行中的战争。</p>
-        <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
-          <button id="grail-start" class="btn primary">开始新的一局</button>
-          <button id="grail-rules-btn" class="btn">查看规则</button>
-        </div>
-      </div>
-      <div class="card" id="grail-rules-card" style="display:none"></div>`;
-    $('#grail-start')?.addEventListener('click', async () => {
-      const r = await api('/api/grail/start', { method: 'POST', body: { groupId: grailGroup() } });
-      if (r.ok) loadGrailPage(); else alert(r.error || '开局失败');
-    });
-    $('#grail-rules-btn')?.addEventListener('click', () => toggleRulebook());
-    return;
-  }
-
-  const phaseLabel = { recruit: '招募中', draft: '选牌中', running: '进行中', ended: '已结束' }[g.phase] || g.phase;
-  const players = g.players || [];
-
-  // ── 参战者表（点击行展开从者卡）──
-  const rows = players.map((p) => {
-    const hpPct = p.hpMax ? Math.max(0, Math.min(100, Math.round((p.hp / p.hpMax) * 100))) : 0;
-    const hpBar = `<div class="gr-hp"><div class="gr-hp-bar" style="width:${hpPct}%"></div></div>`;
-    const seals = '✦'.repeat(p.seals || 0) + '✧'.repeat(Math.max(0, 3 - (p.seals || 0)));
-    const status = p.eliminated ? '<span class="gr-out">出局</span>'
-      : (p.surrendered ? '<span class="gr-out">投降</span>'
-      : '<span class="gr-alive">存活</span>');
-    return `
-    <tr class="gr-row" data-gr-player="${esc(p.uid)}">
-      <td><strong>${esc(p.name || p.uid)}</strong><div class="muted" style="font-size:11px">${esc(p.uid)}</div></td>
-      <td>${status}</td>
-      <td>${p.servant ? `<b>${esc(p.servant.cls)}</b><div class="muted" style="font-size:11px">${esc(p.servant.name)}</div>` : '<span class="muted">未分配</span>'}</td>
-      <td>${p.servant ? hpBar + `<span style="font-size:11px">${p.hp ?? 0}/${p.hpMax ?? '?'}</span>` : '—'}</td>
-      <td>${seals}</td>
-      <td>${p.points ?? 0}</td>
-      <td>${p.loyalty ?? '—'} / ${p.affinity ?? '—'}</td>
-      <td>${p.spent ? p.spent + ' 时' : '0 时'}</td>
-      <td>${p.action ? esc(p.action) : '<span class="muted">未下指令</span>'}</td>
-    </tr>
-    <tr class="gr-detail" id="gr-detail-${esc(p.uid)}" style="display:none"><td colspan="9"></td></tr>`;
-  }).join('');
-
-  // ── 战报（最近若干条）──
-  const logLines = (g.log || []).slice(-20).reverse().map((e) => {
-    const t = e.type || '';
-    if (t === 'join') return `· ${e.uid || ''} 参战`;
-    if (t === 'end') return `· 战争结束，胜者 ${e.winner || '无'}`;
-    if (t === 'night') return `· 第 ${e.day ?? '?'} 夜结算`;
-    return `· ${esc(JSON.stringify(e).slice(0, 120))}`;
-  }).join('<br>') || '<span class="muted">还没有战报</span>';
-
-  el.innerHTML = `
-    <div class="card">
-      <h3>圣杯战争 <span class="badge">${phaseLabel}</span></h3>
-      <div class="muted">局号 ${esc(g.gameId)} ｜ 第 ${g.day} / ${g.maxDays} 夜 ｜ 参战 ${players.length} 人</div>
-      <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
-        <button id="g-invite" class="btn">发送邀请</button>
-        <button id="g-deal" class="btn">发候选</button>
-        <button id="g-assign" class="btn">自动分配</button>
-        <button id="g-settle" class="btn primary">结算本夜</button>
-        <button id="grail-rules-btn" class="btn">规则手册</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <h3>参战者（点击查看从者详情）</h3>
-      <table class="table">
-        <thead><tr>
-          <th>玩家</th><th>状态</th><th>职阶/从者</th><th>耐久</th><th>令咒</th><th>圣杯分</th><th>忠诚/好感</th><th>本夜耗时</th><th>行动</th>
-        </tr></thead>
-        <tbody>${rows || '<tr><td colspan="9" class="muted">还没有人</td></tr>'}</tbody>
-      </table>
-    </div>
-
-    <div class="card">
-      <h3>战斗模拟</h3>
-      <p class="muted" style="font-size:13px">在下达攻击指令前先算一卦 —— 输入两个玩家，看 3 回合推演的损耗与胜负。</p>
-      <div class="row" style="margin-top:10px;gap:8px;flex-wrap:wrap">
-        <select id="gr-sim-a" class="gr-select">${players.map((p) => `<option value="${esc(p.uid)}">${esc(p.name || p.uid)}</option>`).join('')}</select>
-        <span style="align-self:center">VS</span>
-        <select id="gr-sim-b" class="gr-select">${players.map((p) => `<option value="${esc(p.uid)}">${esc(p.name || p.uid)}</option>`).join('')}</select>
-        <button id="gr-sim-go" class="btn primary">推演</button>
-      </div>
-      <div id="gr-sim-out" style="margin-top:12px"></div>
-    </div>
-
-    <div class="card">
-      <h3>战报</h3>
-      <div class="gr-log">${logLines}</div>
-    </div>
-
-    <div class="card" id="grail-rules-card" style="display:none"></div>`;
-
-  // ── 行展开：从者卡 / 情报 ──
-  $$('[data-gr-player]').forEach((tr) => tr.addEventListener('click', () => {
-    const uid = tr.dataset.grPlayer;
-    const box = $(`#gr-detail-${uid}`);
-    if (!box) return;
-    if (box.style.display !== 'none') { box.style.display = 'none'; return; }
-    const p = players.find((x) => x.uid === uid);
-    box.style.display = '';
-    box.querySelector('td').innerHTML = renderGrailPlayerCard(p);
-  }));
-
-  // ── 战斗模拟 ──
-  $('#gr-sim-go')?.addEventListener('click', async () => {
-    const a = $('#gr-sim-a')?.value;
-    const b = $('#gr-sim-b')?.value;
-    const out = $('#gr-sim-out');
-    if (!a || !b) return;
-    if (a === b) { out.innerHTML = '<span class="muted">选两个不同的人</span>'; return; }
-    out.innerHTML = '<span class="muted">推演中…</span>';
-    try {
-      const r = await api('/api/grail/simulate', {
-        method: 'POST',
-        body: JSON.stringify({ groupId: grailGroup(), attackerUid: a, defenderUid: b })
-      });
-      if (!r.ok) { out.innerHTML = `<span class="error">${esc(r.error)}</span>`; return; }
-      const res = r.result || {};
-      const logHtml = (res.log || []).map((l) => `· ${esc(String(l))}`).join('<br>') || '<span class="muted">无过程</span>';
-      out.innerHTML = `
-        <div class="gr-sim-result">
-          <div><b>结果</b>：${esc(String(res.winner || res.outcome || '推演完成'))}</div>
-          ${res.aHp !== undefined ? `<div>A 剩余耐久：${res.aHp}</div>` : ''}
-          ${res.bHp !== undefined ? `<div>B 剩余耐久：${res.bHp}</div>` : ''}
-          <div class="muted" style="margin-top:8px;font-size:12px;line-height:1.7">${logHtml}</div>
-        </div>`;
-    } catch (e) {
-      out.innerHTML = `<span class="error">推演失败：${esc(e.message)}</span>`;
-    }
-  });
-
-  // ── 规则手册 ──
-  $('#grail-rules-btn')?.addEventListener('click', () => toggleRulebook());
-
-  // ── 原有四个操作 ──
-  const bind = (sel, fn) => $(sel)?.addEventListener('click', async (e) => {
-    e.target.disabled = true;
-    try { await fn(); } catch (err) { alert(err.message); }
-    e.target.disabled = false;
-  });
-  bind('#g-invite', async () => {
-    const r = await api('/api/grail/invite', { method: 'POST', body: { groupId: grailGroup() } });
-    alert(r.ok ? `已发送 ${r.sent}/${r.total}` : (r.error || '发送失败'));
-  });
-  bind('#g-deal', async () => {
-    const r = await api('/api/grail/deal', { method: 'POST', body: { groupId: grailGroup() } });
-    if (!r.ok) return alert(r.error || '发牌失败');
-    const sent = await api('/api/grail/draft', { method: 'POST', body: { groupId: grailGroup() } });
-    alert(`已发牌并私聊 ${sent.sent || 0} 人`);
-    loadGrailPage();
-  });
-  bind('#g-assign', async () => {
-    const r = await api('/api/grail/auto-assign', { method: 'POST', body: { groupId: grailGroup() } });
-    if (!r.ok) return alert(r.error || '分配失败');
-    alert(`已分配 ${(r.assigned || []).length} 骑`);
-    loadGrailPage();
-  });
-  bind('#g-settle', async () => {
-    if (!confirm('确定结算本夜？结算后行动不可撤销。')) return;
-    const r = await api('/api/grail/broadcast', { method: 'POST', body: { groupId: grailGroup() } });
-    if (!r.ok) return alert(r.error || '结算失败');
-    alert(`第 ${r.day} 夜已结算${r.ended ? '（本局结束）' : ''}`);
-    loadGrailPage();
-  });
-}
-
 /** 单人详情卡：从者数值、宝具、弱点、情报网 */
-function renderGrailPlayerCard(p) {
-  if (!p) return '<span class="muted">无数据</span>';
-  const s = p.servant;
-  const statRow = s && s.stats
-    ? Object.entries(s.stats).map(([k, v]) => `<span class="gr-stat"><b>${esc(k.toUpperCase())}</b> ${esc(String(v))}</span>`).join(' ')
-    : '<span class="muted">无</span>';
-  const intel = Object.entries(p.intel || {});
-  const intelHtml = intel.length
-    ? intel.map(([uid, v]) => `· 对 ${esc(uid)}：情报 ${v.level ?? 0} 级${v.weaknessKnown ? '（已知弱点）' : ''}`).join('<br>')
-    : '<span class="muted">尚未掌握任何情报</span>';
-  return `
-    <div class="gr-card">
-      <div class="row" style="gap:16px;flex-wrap:wrap">
-        <div><b>从者</b><br>${s ? `${esc(s.name)}（${esc(s.cls)} · ${esc(s.tier || '?')}）` : '<span class="muted">未分配</span>'}</div>
-        <div><b>宝具</b><br>${s && s.npName ? esc(s.npName) : '<span class="muted">—</span>'}</div>
-        <div><b>弱点</b><br>${s && s.weak ? esc(s.weak) : '<span class="muted">—</span>'}</div>
-        <div><b>综合战力</b><br>${s && s.power != null ? s.power : '<span class="muted">—</span>'}</div>
-      </div>
-      <div style="margin-top:10px"><b>属性</b>：${statRow}</div>
-      <div style="margin-top:10px"><b>情报网</b><br>${intelHtml}</div>
-    </div>`;
-}
-
 /** 规则手册：地点 / 职阶克制 / 行动耗时 */
-async function toggleRulebook() {
-  const card = $('#grail-rules-card');
-  if (!card) return;
-  if (card.style.display !== 'none') { card.style.display = 'none'; return; }
-  card.style.display = '';
-  if (state.grailRules) { renderRulebook(card, state.grailRules); return; }
-  card.innerHTML = '<div class="muted">加载规则…</div>';
-  try {
-    const r = await api('/api/grail/rules');
-    if (!r.ok) { card.innerHTML = `<div class="error">${esc(r.error)}</div>`; return; }
-    state.grailRules = r.rules;
-    renderRulebook(card, r.rules);
-  } catch (e) {
-    card.innerHTML = `<div class="error">加载失败：${esc(e.message)}</div>`;
-  }
-}
-
-function renderRulebook(card, rb) {
-  const places = (rb.places || []).map((p) =>
-    `<tr><td>${esc(p.name)}</td><td>${esc(p.zone)}</td><td>${p.ley ? (p.ley === 'strong' ? '强灵脉' : '弱灵脉') : '—'}</td><td class="muted">${esc(p.risk || '')}</td></tr>`
-  ).join('');
-  const counters = Object.entries(rb.counters || {}).map(([cls, target]) =>
-    `<tr><td><b>${esc(cls)}</b></td><td>克 ${esc(target || '—')}</td><td class="muted">被 ${esc((rb.counteredBy?.[cls] || []).join(' / ') || '—')}</td></tr>`
-  ).join('');
-  const costs = Object.entries(rb.actionCost || {}).map(([k, v]) =>
-    `<span class="gr-stat"><b>${esc(k)}</b> ${v} 时</span>`
-  ).join(' ');
-  card.innerHTML = `
-    <h3>规则手册</h3>
-    <div style="margin-top:8px"><b>行动耗时</b>（每夜 2 小时）：${costs}</div>
-    <h3 style="margin-top:18px;font-size:14px">地点（10 处）</h3>
-    <table class="table"><thead><tr><th>地点</th><th>区域</th><th>灵脉</th><th>风险</th></tr></thead><tbody>${places}</tbody></table>
-    <h3 style="margin-top:18px;font-size:14px">职阶克制</h3>
-    <table class="table"><thead><tr><th>职阶</th><th>克制</th><th>被克制</th></tr></thead><tbody>${counters}</tbody></table>`;
-}
-
 // ══════════════════════════════════════════════════════════════
 //  广告注入面板
 // ══════════════════════════════════════════════════════════════
-async function loadAdPage() {
-  const el = $('#ad-page');
-  if (!el) return;
-  el.innerHTML = '<div class="muted">加载中…</div>';
-  try {
-    const cfg = await api('/api/config');
-    renderAd(el, (cfg && cfg.adInject) || {});
-  } catch (e) {
-    el.innerHTML = `<div class="error">加载失败：${esc(e.message)}</div>`;
-  }
-}
-
-function renderAd(el, ai) {
-  const ads = Array.isArray(ai.ads) ? ai.ads : [];
-  const adRows = ads.map((a, i) => `
-    <tr>
-      <td>${esc(a.name || a.id)}</td>
-      <td><code>${esc((a.keywords || []).join(' / '))}</code></td>
-      <td class="muted">${esc((a.messages || []).join(' ⏎ ')).slice(0, 60)}</td>
-      <td>${a.enabled === false ? '停用' : '启用'}</td>
-      <td><button class="btn tiny" data-ad-del="${i}">删除</button></td>
-    </tr>`).join('');
-
-  el.innerHTML = `
-    <div class="card">
-      <h3>广告注入</h3>
-      <p class="muted">命中关键词后，机器人自动发送预设内容。
-      与「防广告禁言」相反：那个是抓群友发广告，这个是机器人主动发内容。</p>
-      <label class="row"><input type="checkbox" id="ad-enabled" ${ai.enabled ? 'checked' : ''}> 启用</label>
-      <label class="row"><input type="checkbox" id="ad-dryrun" ${ai.dryRun ? 'checked' : ''}> 演练模式（只记录不发送）</label>
-      <div class="row" style="margin-top:8px">
-        <label>冷却(秒) <input type="number" id="ad-cooldown" value="${Math.round((ai.cooldownMs || 300000) / 1000)}" style="width:80px"></label>
-        <label>单群每日上限 <input type="number" id="ad-daily" value="${ai.maxPerDayPerGroup ?? 3}" style="width:60px"></label>
-      </div>
-      <button id="ad-save" class="btn primary" style="margin-top:12px">保存</button>
-    </div>
-
-    <div class="card">
-      <h3>广告列表（${ads.length}）</h3>
-      <table class="table">
-        <thead><tr><th>名称</th><th>关键词</th><th>回复内容</th><th>状态</th><th></th></tr></thead>
-        <tbody>${adRows || '<tr><td colspan="5" class="muted">还没有广告</td></tr>'}</tbody>
-      </table>
-      <div style="margin-top:12px">
-        <input id="ad-new-name" placeholder="名称" style="width:120px">
-        <input id="ad-new-keys" placeholder="关键词，用逗号分隔" style="width:240px">
-        <input id="ad-new-msg" placeholder="回复内容（多条用 | 分隔）" style="width:300px">
-        <button id="ad-add" class="btn">添加</button>
-      </div>
-    </div>`;
-
-  $('#ad-save')?.addEventListener('click', async () => {
-    const patch = {
-      enabled: $('#ad-enabled').checked,
-      dryRun: $('#ad-dryrun').checked,
-      cooldownMs: Number($('#ad-cooldown').value) * 1000,
-      maxPerDayPerGroup: Number($('#ad-daily').value),
-    };
-    await api('/api/config', { method: 'POST', body: { adInject: patch } });
-    toast('已保存');
-  });
-
-  $('#ad-add')?.addEventListener('click', async (ev) => {
-    const btn = ev.currentTarget;
-    const name = $('#ad-new-name').value.trim();
-    const keys = $('#ad-new-keys').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
-    const msgs = $('#ad-new-msg').value.split('|').map((s) => s.trim()).filter(Boolean);
-    if (!name || !keys.length || !msgs.length) return toast('名称、关键词、回复内容都要填');
-
-    // 防连点：处理中禁用按钮，避免重复添加同一条
-    // （用户反馈"点添加没反应"，实际是加了但没反馈，于是连点 2 次）
-    if (btn.disabled) return;
-    btn.disabled = true;
-    const oldText = btn.textContent;
-    btn.textContent = '添加中…';
-    try {
-      const cfg = await api('/api/config');
-      const ads = [...((cfg.adInject && cfg.adInject.ads) || []), {
-        id: 'ad' + Date.now(), name, keywords: keys, messages: msgs,
-        matchMode: 'contains', enabled: true, priority: 10,
-      }];
-      await api('/api/config', { method: 'POST', body: { adInject: { ads } } });
-      toast(`已添加「${name}」`);
-      await loadAdPage();          // 重绘会清空输入框
-    } catch (e) {
-      toast('添加失败：' + e.message);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = oldText;
-    }
-  });
-
-  $$('[data-ad-del]').forEach((b) => b.addEventListener('click', async () => {
-    const i = Number(b.dataset.adDel);
-    try {
-      const cfg = await api('/api/config');
-      const ads = [...((cfg.adInject && cfg.adInject.ads) || [])];
-      const removed = ads[i];
-      ads.splice(i, 1);
-      await api('/api/config', { method: 'POST', body: { adInject: { ads } } });
-      toast(removed ? `已删除「${removed.name}」` : '已删除');
-      await loadAdPage();
-    } catch (e) {
-      toast('删除失败：' + e.message);
-    }
-  }));
-}
-
+/**
+ * 广告回复内容的单元格渲染（2026-10-21 修）。
+ *
+ * 原来写的是 `.slice(0, 60)` —— 直接把内容切掉，**且没有任何提示**。
+ * 用户看到"小米mimo可以领取10元token赠送金额噢，点击：https://platform.xiaomimimo.com?r"
+ * 就断了，以为是显示不全，实际是数据被前端砍了（真实 74 字符，只显示前 60）。
+ *
+ * 现在：**完整显示，不截断**。多条逐行，超长由 CSS 折行。
+ */
 // ══════════════════════════════════════════════════════════════
 //  插件管理面板（2026-10-20 插件化）
 // ══════════════════════════════════════════════════════════════
@@ -3682,7 +3157,10 @@ function renderPlugins(el, data) {
           data-pl-toggle="${esc(p.id)}" />
         <span class="pl-switch-track"><span class="pl-switch-knob"></span></span>
       </label>`;
-    const hasPanel = !!PANEL_RENDERERS[p.id];
+    // 有配置面板的插件才显示「配置」按钮：
+    //   ① 插件自己提供了 ui.js（mountPanel）—— 插件化后的标准做法
+    //   ② 或内核里仍有残留面板（尚未迁移的插件）
+    const hasPanel = !!PANEL_RENDERERS[p.id] || !!(p.ui || '');
     const ops = toggle
       + (hasPanel ? `<button class="btn tiny" data-pl-cfg="${esc(p.id)}">配置</button>` : '')
       + `<button class="btn tiny" data-pl-reload="${esc(p.id)}">重载</button>`
@@ -3869,7 +3347,6 @@ function renderPlugins(el, data) {
 const PANEL_RENDERERS = {
   'blacklist': renderBlacklistPanel,
   'anti-ad': renderAntiAdPanel,
-  'welfare': renderWelfarePanel,
   'group-manager': renderGroupManagerPanel,
   'websearch': renderWebsearchPanel,
   'voice': renderVoicePanel,
@@ -3890,6 +3367,25 @@ async function openPluginPanel(id) {
   box.innerHTML = '<div class="muted" style="padding:16px">加载中…</div>';
   box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 
+  // ① 优先用**插件自己提供的**配置面板（plugins/<id>/ui.js 的 mountPanel）
+  //    这是插件化要求：插件的界面归插件，内核不认识具体插件。
+  try {
+    const d = await api('/api/plugins');
+    const tab = (d.tabs || []).find((x) => x.pluginId === id);
+    const entry = tab?.file || '';
+    if (entry) {
+      const mod = await loadPluginUi(id, entry);
+      if (mod && typeof mod.mountPanel === 'function') {
+        box.innerHTML = '';
+        await mod.mountPanel(box, { ...pluginUiContext(id), openPluginPanel });
+        return;
+      }
+    }
+  } catch (e) {
+    console.warn(`[plugin-ui] ${id} mountPanel 失败，回退内核面板`, e);
+  }
+
+  // ② 回退：内核里仍保留的少量面板（尚未迁移的插件）
   const fn = PANEL_RENDERERS[id];
   if (!fn) {
     box.innerHTML = `<div class="card"><h3>${esc(id)}</h3>
@@ -4045,67 +3541,6 @@ async function renderAntiAdPanel(box, ctx) {
 }
 
 // ── 群友福利发放 ──────────────────────────────────────────────
-async function renderWelfarePanel(box, ctx) {
-  const d = await api('/api/welfare');
-  const camps = (d.campaigns || []).map((c) => `
-    <tr>
-      <td><b>${esc(c.title)}</b><div class="muted" style="font-size:11px">${esc(c.id)}</div></td>
-      <td>${c.enabled === false ? '停用' : '启用'}</td>
-      <td>${(c.rewards || []).length} 项</td>
-      <td>${c.claimedUsers ?? 0} 人已领</td>
-      <td><button class="btn tiny" data-wf-del="${esc(c.id)}">删除</button></td>
-    </tr>`).join('');
-
-  box.innerHTML = panelShell('welfare', '群友福利发放', `
-    <div class="row" style="gap:12px;flex-wrap:wrap;margin-bottom:12px">
-      <span>总领取 <b>${d.totalClaims ?? 0}</b> 条</span>
-      <span class="muted">|</span>
-      <span class="muted" style="font-size:12px">活动需在下方配置，或通过面板 API 创建</span>
-    </div>
-    <table class="table">
-      <thead><tr><th>活动</th><th>状态</th><th>奖励项</th><th>领取</th><th></th></tr></thead>
-      <tbody>${camps || '<tr><td colspan="5" class="muted">还没有活动（可点下方「新建活动」）</td></tr>'}</tbody>
-    </table>
-    <div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap">
-      <input id="wf-title" placeholder="活动标题" style="width:180px" />
-      <input id="wf-hours" type="number" value="24" style="width:90px" title="入群满多少小时可领" />
-      <input id="wf-items" placeholder="奖励码，逗号分隔" style="width:280px" />
-      <button class="btn primary" id="wf-new">新建活动</button>
-    </div>
-    <p class="muted" style="font-size:12px;margin-top:10px">
-      领取走确定性代码路径：一人一次、入群时长校验、先到先得 —— 不经过模型。</p>`,
-    '群友私聊发「领取福利」时由系统直接发放，模型不参与');
-
-  bindPanelClose(box);
-  $('#wf-new')?.addEventListener('click', async () => {
-    const title = $('#wf-title').value.trim();
-    if (!title) return alert('活动标题不能为空');
-    const items = $('#wf-items').value.split(/[,，\n]/).map((s) => s.trim()).filter(Boolean);
-    if (!items.length) return alert('至少填一个奖励码');
-    try {
-      await api('/api/welfare/campaign', {
-        method: 'POST',
-        body: JSON.stringify({
-          campaign: {
-            title, enabled: true,
-            minJoinHours: Number($('#wf-hours').value) || 24,
-            rewards: [{ id: 'r1', label: '奖励', type: 'code', items, perUser: 1 }]
-          }
-        })
-      });
-      openPluginPanel('welfare');
-    } catch (e) { alert(e.message); }
-  });
-  box.querySelectorAll('[data-wf-del]').forEach((b) => b.addEventListener('click', async () => {
-    if (!confirm('删除这个活动？已发放的码不会收回。')) return;
-    try {
-      await api('/api/welfare/campaign/delete', {
-        method: 'POST', body: JSON.stringify({ id: b.dataset.wfDel })
-      });
-      openPluginPanel('welfare');
-    } catch (e) { alert(e.message); }
-  }));
-}
 
 // ── 群管理 ────────────────────────────────────────────────────
 async function renderGroupManagerPanel(box, ctx) {
@@ -4422,3 +3857,23 @@ async function renderMasterToolsPanel(box, ctx) {
   });
 }
 
+
+// ── 胜者奖励配置（2026-10-21）──────────────────────────────────
+//
+// 需求：奖励不能写死，要能在面板里填【名字】和【内容】。
+//
+// 设计要点（安全）：
+//   · 名字  → 公开。会写进邀请文案和终局公告。
+//   · 内容  → 私密。**只私聊发给胜者**，不进群公告、不回显到面板。
+//     内容通常是兑换码/API key，公开等于当场作废。
+//   · 面板里内容框用 type=password，只显示"已设置/未设置"，
+//     不回显原文 —— 与密钥零披露纪律一致。
+/** 拉取当前奖励配置（内容不回显，只报有没有） */
+// ── 候选名单（2026-10-21）──────────────────────────────────────
+//
+// 需求：预选者名单要能在面板里看到，且管理员能手动指定邀请谁。
+//
+// 设计：
+//   · 表格列出群成员 + 发言数 + 活跃档 + 当前状态
+//   · 可勾选 → 「邀请选中的人」按钮（绕过活跃度算法，按管理员意志发）
+//   · 状态用中文标签，一眼看出这人能不能邀

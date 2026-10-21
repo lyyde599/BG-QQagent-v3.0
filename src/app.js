@@ -60,6 +60,9 @@ try {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UI_DIR = path.resolve(__dirname, '..', 'ui');
+// 插件目录：插件的**前端文件**（ui.js / ui.css）也放在各自插件目录下，
+// 由 /plugin-ui/<id>/<file> 提供。内核 ui/app.js 不得写入插件界面代码。
+const PLUGINS_DIR = path.resolve(__dirname, '..', 'plugins');
 
 // ── 白名单判断（移植自原版 allowed()） ───────────────────────────────────
 // ⚠️ ref 会被动态赋值（见下方 allowed 的 groupMemberCache 注入），
@@ -1556,6 +1559,41 @@ export function createApp({ log = console.log } = {}) {
       }
 
       return json(res, 404, { error: `未知 API：${method} ${pathname}` });
+    }
+
+    // ── 插件前端静态资源（2026-10-21）──
+    //
+    // 目的：**插件的前端代码必须放在插件自己的目录里**，不许写进内核 ui/app.js。
+    //
+    //   /plugin-ui/<id>/<file>  →  plugins/<id>/<file>
+    //
+    // 例：plugins/grail/ui.js → /plugin-ui/grail/ui.js
+    //
+    // 安全：只允许字母数字下划线连字符与点，且限制在 plugins/<id>/ 内，
+    //      不允许 ../ 逃逸。
+    if (req.method === 'GET' && pathname.startsWith('/plugin-ui/')) {
+      const rest = pathname.slice('/plugin-ui/'.length);
+      const m = /^([a-z0-9_-]+)\/([A-Za-z0-9_.-]+)$/.exec(rest);
+      if (!m) { res.writeHead(400); res.end('Bad plugin path'); return; }
+      const [, pid, fname] = m;
+      if (fname.includes('..')) { res.writeHead(403); res.end(); return; }
+      const full = path.join(PLUGINS_DIR, pid, fname);
+      if (!full.startsWith(path.join(PLUGINS_DIR, pid))) { res.writeHead(403); res.end(); return; }
+      try {
+        const data = fs.readFileSync(full);
+        const ext = path.extname(fname);
+        const types = { '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json; charset=utf-8' };
+        res.writeHead(200, {
+          'content-type': types[ext] ?? 'application/octet-stream',
+          'cache-control': 'no-cache'
+        });
+        res.end(data);
+        return;
+      } catch {
+        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('Plugin asset not found');
+        return;
+      }
     }
 
     // 静态 UI

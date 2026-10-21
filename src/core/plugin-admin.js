@@ -154,7 +154,12 @@ export function registerPluginAdmin(host, { getConfig, log }) {
       };
     }),
     // inline=true 的页签内嵌在插件页渲染，不占顶栏
-    tabs: host.uiTabs.map((t) => ({ id: t.id, label: t.label, pluginId: t.pluginId, inline: t.inline === true }))
+    // file: 插件前端入口（manifest.ui），前端据此动态 import
+    // /plugin-ui/<pluginId>/<file>
+    tabs: host.uiTabs.map((t) => ({
+      id: t.id, label: t.label, pluginId: t.pluginId,
+      inline: t.inline === true, file: t.file || ''
+    }))
   }));
 
   // ── 启停 ──

@@ -558,6 +558,7 @@ export class PluginHost {
         summary: r.manifest?.summary || '',
         lastError: r.lastError,
         priority: r.manifest?.priority ?? 100,
+        ui: r.manifest?.ui || '',            // 插件前端入口（plugins/<id>/<ui>）
         defaultEnabled: r.manifest?.defaultEnabled ?? false,
         hooks: r.manifest?.hooks || [],
         tools: (this.toolDefs.filter((t) => t.id === r.id).map((t) => t.def.name)),
