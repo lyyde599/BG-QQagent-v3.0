@@ -101,6 +101,12 @@ body {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+/* 插件页签的挂载点。它本身不能参与 flex 布局 ——
+   否则会成为一个"格子"，把后面的页签挤到下一行
+   （2026-10-21 手机端实测：页签被撑成两行且错位）。 */
+#plugin-tabs {
+  display: contents;
+}
 .tab {
   background: none;
   border: none;
@@ -163,7 +169,43 @@ body {
 }
 .collapsible > summary::before { content: '▸ '; }
 .collapsible[open] > summary::before { content: '▾ '; }
-.collapsible .coll-body { padding: 4px 14px 12px; white-space: pre-wrap; font-family: var(--mono); font-size: 11.5px; color: var(--line2); line-height: 1.65; max-height: 300px; overflow-y: auto; }
+/* ── 折叠区正文（2026-10-21 重做）────────────────────────────
+   原来：font-size 11.5px + color: var(--line2)（描边色当正文色）
+        + white-space: pre-wrap 硬撑长行 → 大段提示词糊成一片，读不动。
+   现在：正文字号/行高/前景色都按"可读文本"给，并把长行折行交给容器。 */
+.collapsible .coll-body {
+  padding: 14px 18px 18px;
+  margin: 0 6px 6px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--fs-sm);
+  line-height: 1.85;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;   /* 超长 URL/无空格串也强制折行 */
+  word-break: break-word;
+  max-height: 460px;
+  overflow-y: auto;
+  tab-size: 2;
+}
+/* Markdown 风格的小标题（## 开头那些）稍微提亮，形成阅读锚点 */
+.collapsible .coll-body .pt-h { color: var(--fg); font-weight: 700; }
+
+/* 折叠标题做得更像"区块标题"而不是一行灰字 */
+.collapsible > summary {
+  cursor: pointer;
+  padding: 11px 16px;
+  color: var(--fg2);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  user-select: none;
+  list-style: none;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+}
+.collapsible > summary:hover { background: var(--raised); color: var(--on-raised); }
+.collapsible[open] > summary { border-bottom: 1px solid var(--line); margin-bottom: 10px; }
 
 .msg-flow { display: flex; flex-direction: column; gap: 10px; }
 
@@ -862,3 +904,158 @@ tbody tr:hover { background: var(--raised); color: var(--on-raised); }
   font-family: var(--mono); white-space: pre-wrap; max-height: 260px; overflow-y: auto;
 }
 .switch-row { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-sm); }
+
+/* ══════════════════════════════════════════════════════════
+   移动端适配（2026-10-21）
+   ══════════════════════════════════════════════════════════
+   原来一条 @media 都没有，布局全是固定宽度：
+     · .list-pane 固定 320px —— 手机宽 375px，详情区只剩 55px
+     · 设置页左栏 220px 同理
+     · 顶栏状态挤成一行，横向溢出
+     · 表格 7 列在手机上严重变形
+
+   策略：不改桌面端，只在窄屏切换为「单列堆叠」。
+   ══════════════════════════════════════════════════════════ */
+
+/* ── 平板 / 小笔记本 ───────────────────────────────── */
+@media (max-width: 900px) {
+  .list-pane { width: 240px; }
+  .settings-sidebar { width: 180px; }
+  #plugins-page table { table-layout: auto; }   /* 让表格自适应，别强压列宽 */
+  #plugins-page table th:nth-child(1),
+  #plugins-page table th:nth-child(4),
+  #plugins-page table th:nth-child(5),
+  #plugins-page table th:nth-child(6),
+  #plugins-page table th:nth-child(7) { width: auto; }
+}
+
+/* ── 手机 ───────────────────────────────────────── */
+@media (max-width: 640px) {
+  /* 顶栏：品牌与状态分行，不再挤一行 */
+  #topbar {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    padding: 8px 12px;
+  }
+  .brand { font-size: 15px; }
+  .brand-sub { display: none; }        /* 副标题在手机上是噪音 */
+  .top-status {
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    width: 100%;
+    font-size: 11.5px;
+  }
+  .top-status .sep { display: none; }   /* 竖分隔线在换行后很碍眼 */
+
+  /* 页签：横向滚动，不折行不挤压 */
+  #tabs {
+    overflow-x: auto;
+    overflow-y: hidden;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding: 0 4px;
+  }
+  #tabs::-webkit-scrollbar { display: none; }
+  #tabs .tab { flex: 0 0 auto; padding: 10px 12px; font-size: 13px; }
+
+  /* 主布局：左右分栏在手机上必须改成上下堆叠 */
+  #layout { flex-direction: column; }
+  .view.active { flex-direction: column; }
+
+  /* 列表区：全宽、限高，让详情区拿回空间 */
+  .list-pane {
+    width: 100%;
+    max-height: 34vh;              /* 列表最多占三分之一屏 */
+    border-right: none;
+    border-bottom: 1px solid var(--line2);
+    flex-shrink: 0;
+  }
+  .detail-pane {
+    padding: 12px 12px 24px;
+    min-height: 40vh;
+  }
+
+  /* 设置页：侧栏变顶部横滑菜单 */
+  #view-settings { flex-direction: column; }
+  .settings-sidebar {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--line2);
+    max-height: none;
+    padding: 8px 10px;
+  }
+  .settings-menu {
+    display: flex;
+    flex-direction: row;
+    overflow-x: auto;
+    gap: 6px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .settings-menu::-webkit-scrollbar { display: none; }
+  .settings-menu-item {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    padding: 7px 12px;
+    font-size: 13px;
+  }
+  .settings-pane { padding: 14px 12px 32px; }
+
+  /* 表单：字段一律竖向堆叠，不要并排 */
+  .field-row { flex-direction: column; gap: 10px; }
+  .field { min-width: 0; width: 100%; }
+  .field input, .field select, .field textarea { width: 100% !important; }
+  .row { flex-wrap: wrap; }
+
+  /* 折叠区正文：手机上可读性优先，字号不要再压小 */
+  .collapsible .coll-body {
+    padding: 12px 12px 14px;
+    margin: 0 4px 4px;
+    font-size: 12.5px;
+    line-height: 1.8;
+    max-height: 60vh;
+  }
+  .collapsible > summary { padding: 10px 12px; font-size: 13px; }
+
+  /* 聊天气泡：手机上占满宽度上限放宽 */
+  .bubble { max-width: 94%; }
+  .msg-flow { gap: 8px; }
+
+  /* 插件页：卡片间距收紧，表格允许横向滚动而不是挤压 */
+  #plugins-page { padding: 10px 10px 24px; gap: 10px; }
+  #plugins-page .card,
+  .card { padding: 12px 12px; }
+  .pl-panel-body table.table,
+  #plugins-page table { display: block; overflow-x: auto; white-space: nowrap; }
+  .pl-panel-body input,
+  .pl-panel-body select { width: 100% !important; box-sizing: border-box; }
+
+  /* 按钮组：允许换行，别撑破容器 */
+  .row .btn { flex: 0 0 auto; }
+
+  /* 提示条：贴底显示更符合手机习惯 */
+  .pl-toast {
+    left: 12px; right: 12px; bottom: 12px;
+    transform: none;
+    text-align: center;
+  }
+}
+
+/* ── 超窄屏（iPhone SE 等）───────────────────────── */
+@media (max-width: 380px) {
+  .brand { font-size: 14px; }
+  .top-status { font-size: 11px; }
+  .collapsible .coll-body { font-size: 12px; }
+  .card { padding: 10px; }
+}
+
+/* ── 触屏优化：点击目标不小于 40px ───────────────── */
+@media (hover: none) and (pointer: coarse) {
+  .btn { min-height: 38px; padding: 8px 14px; }
+  .btn.tiny { min-height: 32px; padding: 5px 10px; }
+  .tab { min-height: 42px; }
+  .pl-switch-track { width: 40px; height: 22px; }
+  .pl-switch-knob { width: 18px; height: 18px; }
+  .pl-switch input:checked + .pl-switch-track .pl-switch-knob { transform: translateX(18px); }
+}

@@ -50,6 +50,42 @@ const state = {
  *   同类调用当时有 9 处（圣杯战争的操作按钮全中），逐个改容易漏，
  *   所以在这一层统一兜住：字符串原样传，对象自动序列化。
  */
+/**
+ * 提示词正文的可读化渲染（2026-10-21）。
+ *
+ * 原样 esc() 后整块等宽字，几万字符的提示词读起来是一片糊。
+ * 这里只做**轻量**增强，不引 Markdown 库（没必要，也不安全）：
+ *   · 【xxx】/ ## xxx 开头的小节 → 加粗成阅读锚点
+ *   · 连续空行压成一个空行，减少视觉碎片
+ *   · 其余全部转义，不解释任何 HTML
+ */
+function fmtPrompt(text) {
+  if (!text) return '';
+  return esc(String(text))
+    .replace(/(^|\n)(【[^】\n]{1,30}】)/g, '$1<span class="pt-h">$2</span>')
+    .replace(/(^|\n)(#{1,3} [^\n]{1,60})/g, '$1<span class="pt-h">$2</span>')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
+/**
+ * 轻提示。前端出错时**必须让人看见** ——
+ * 之前所有失败只往 console 打日志，页面上完全静默，
+ * 用户看到的就是"点了没反应"（2026-10-21 广告添加/删除都踩过）。
+ */
+function toast(msg, ms = 2600) {
+  let el = document.getElementById('pl-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'pl-toast';
+    el.className = 'pl-toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = String(msg);
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), ms);
+}
+
 async function api(path, options = {}) {
   const opts = { ...options };
   if (opts.body !== undefined && opts.body !== null && typeof opts.body === 'object'
@@ -409,14 +445,14 @@ function renderSessionDetail(s) {
     html.push(`
       <details class="collapsible">
         <summary>系统提示（${s.systemPrompt.length} 字符，每次运行重发）</summary>
-        <div class="coll-body">${esc(s.systemPrompt)}</div>
+        <div class="coll-body">${fmtPrompt(s.systemPrompt)}</div>
       </details>`);
   }
   if (s.userPrompt) {
     html.push(`
       <details class="collapsible" open>
         <summary>本次输入（${s.userPrompt.length} 字符 —— 零对话历史，全部来自 JSON 存档）</summary>
-        <div class="coll-body">${esc(s.userPrompt)}</div>
+        <div class="coll-body">${fmtPrompt(s.userPrompt)}</div>
       </details>`);
   }
 
@@ -3559,30 +3595,52 @@ function renderAd(el, ai) {
       maxPerDayPerGroup: Number($('#ad-daily').value),
     };
     await api('/api/config', { method: 'POST', body: { adInject: patch } });
-    alert('已保存');
+    toast('已保存');
   });
 
-  $('#ad-add')?.addEventListener('click', async () => {
+  $('#ad-add')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
     const name = $('#ad-new-name').value.trim();
     const keys = $('#ad-new-keys').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
     const msgs = $('#ad-new-msg').value.split('|').map((s) => s.trim()).filter(Boolean);
-    if (!name || !keys.length || !msgs.length) return alert('名称、关键词、内容都要填');
-    const cfg = await api('/api/config');
-    const next = [...((cfg.adInject && cfg.adInject.ads) || []), {
-      id: 'ad' + Date.now(), name, keywords: keys, messages: msgs,
-      matchMode: 'contains', enabled: true, priority: 10,
-    }];
-    await api('/api/config', { method: 'POST', body: { adInject: { ads: next } } });
-    loadAdPage();
+    if (!name || !keys.length || !msgs.length) return toast('名称、关键词、回复内容都要填');
+
+    // 防连点：处理中禁用按钮，避免重复添加同一条
+    // （用户反馈"点添加没反应"，实际是加了但没反馈，于是连点 2 次）
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const oldText = btn.textContent;
+    btn.textContent = '添加中…';
+    try {
+      const cfg = await api('/api/config');
+      const ads = [...((cfg.adInject && cfg.adInject.ads) || []), {
+        id: 'ad' + Date.now(), name, keywords: keys, messages: msgs,
+        matchMode: 'contains', enabled: true, priority: 10,
+      }];
+      await api('/api/config', { method: 'POST', body: { adInject: { ads } } });
+      toast(`已添加「${name}」`);
+      await loadAdPage();          // 重绘会清空输入框
+    } catch (e) {
+      toast('添加失败：' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldText;
+    }
   });
 
   $$('[data-ad-del]').forEach((b) => b.addEventListener('click', async () => {
     const i = Number(b.dataset.adDel);
-    const cfg = await api('/api/config');
-    const next = [...((cfg.adInject && cfg.adInject.ads) || [])];
-    next.splice(i, 1);
-    await api('/api/config', { method: 'POST', body: { adInject: { ads: next } } });
-    loadAdPage();
+    try {
+      const cfg = await api('/api/config');
+      const ads = [...((cfg.adInject && cfg.adInject.ads) || [])];
+      const removed = ads[i];
+      ads.splice(i, 1);
+      await api('/api/config', { method: 'POST', body: { adInject: { ads } } });
+      toast(removed ? `已删除「${removed.name}」` : '已删除');
+      await loadAdPage();
+    } catch (e) {
+      toast('删除失败：' + e.message);
+    }
   }));
 }
 
