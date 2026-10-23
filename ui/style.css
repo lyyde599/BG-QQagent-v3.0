@@ -798,8 +798,10 @@ tbody tr:hover { background: var(--raised); color: var(--on-raised); }
 
 /* 插件页：工具列可能很长，限制宽度并允许换行，避免挤走右侧操作列 */
 #plugins-page table { table-layout: fixed; }
-#plugins-page table th:nth-child(1) { width: 190px; }  /* 插件 */
+#plugins-page table th:nth-child(1) { width: 200px; }  /* 插件（含作者行） */
 #plugins-page table th:nth-child(2) { width: 70px; }   /* 状态 */
+#plugins-page table th:nth-child(3) { width: auto; }   /* 说明：吃剩余空间，限宽后自动换行（全文显示） */
+
 #plugins-page table th:nth-child(4) { width: 240px; }  /* 工具 */
 #plugins-page table th:nth-child(5) { width: 92px; }   /* 数据 */
 #plugins-page table th:nth-child(6) { width: 72px; }   /* 作用域 */
@@ -1052,7 +1054,14 @@ tbody tr:hover { background: var(--raised); color: var(--on-raised); }
   #plugins-page .card,
   .card { padding: 12px 12px; }
   .pl-panel-body table.table,
-  #plugins-page table { display: block; overflow-x: auto; white-space: nowrap; }
+  /* 手机上表格允许横滑；但「说明」列必须能换行，否则会被 nowrap 压成一行 */
+  #plugins-page table { display: block; overflow-x: auto; }
+  #plugins-page table th,
+  #plugins-page table td { white-space: nowrap; }
+  #plugins-page table td.pl-desc {
+    white-space: normal;
+    max-width: 60vw;      /* 手机上给相对宽度，不受桌面 460px 限制 */
+  }
   .pl-panel-body input,
   .pl-panel-body select { width: 100% !important; box-sizing: border-box; }
 
@@ -1224,4 +1233,92 @@ html.has-user-bg select {
   background-color: var(--sunken);
   display: flex; align-items: center; justify-content: center;
   color: var(--fg2); font-size: var(--fs-sm);
+}
+
+/* ── 插件表：作者 + 两行说明（2026-10-21）─────────────────
+   原来「说明」被 slice(0,70) 硬截成一行 70 字，
+   中英文混排时常常半句话就断了，还浪费横向空间。
+   改成 CSS 两行截断：能显示到两整行，超出才省略。 */
+.pl-meta {
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+/* 作者名单独给一点强调 —— 它是「谁做的」，比 id/版本更该被看到 */
+.pl-author {
+  color: var(--fg2);
+  font-weight: 600;
+}
+.pl-dot { color: var(--line2); }
+
+/* 说明列（2026-10-21 定稿）
+   需求：**全文显示，但不要无限拉长** —— 限宽 + 自动换行成多行。
+   ⚠️ 不要用 -webkit-line-clamp 截断（会丢内容，用户明确要能看全）。
+   做法：给一个合理的宽度上限，剩下的交给 word-break 折行。
+   表格用 table-layout:fixed，所以这个宽度是稳定的，不会被内容撑开。 */
+.pl-desc {
+  font-size: 12px;
+  color: var(--fg2);
+  line-height: 1.6;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  max-width: 460px;
+}
+
+/* ── 技能管理页（2026-10-21）─────────────────────────────── */
+#skills-page { padding: 16px 18px 40px; display: flex; flex-direction: column; gap: 14px; }
+#skills-page .card h3 { margin-top: 0; }
+
+/* 来源标签：三种来源用不同形态区分（不靠色相，纸墨灰体系） */
+.skill-src {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: var(--r-pill);
+  font-size: 11.5px;
+  border: 1px solid var(--line2);
+  color: var(--fg2);
+  white-space: nowrap;
+}
+.skill-src-user { border-color: var(--acc); color: var(--fg); font-weight: 600; }
+.skill-src-plugin { border-style: dashed; }
+
+#sk-editor textarea { resize: vertical; line-height: 1.7; }
+
+/* ── 插件配置弹窗（2026-10-21）────────────────────────────
+   原来配置面板是内嵌在插件页底部，点「配置」要 scrollIntoView 跳到底部，
+   长列表（19 个插件）时体验很差：跳转、丢失当前位置、关掉还得滚回去。
+   改成居中弹窗：不打断滚动位置，随时 ESC / 点背幕关闭。 */
+.modal.plugin-modal {
+  width: min(860px, 92vw);
+  max-height: 84vh;
+  padding: 0;
+  overflow: hidden;
+}
+.plugin-modal .pm-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.plugin-modal .pm-title { font-weight: 600; font-size: 15px; }
+.plugin-modal .pm-body {
+  padding: 16px 18px 22px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+/* 弹窗内的 panelShell 卡片不要再套一层边框 */
+.plugin-modal .pl-panel-card { border-left: 3px solid var(--acc); padding: 14px 16px; }
+.plugin-modal h3:first-child { margin-top: 0; }
+
+@media (max-width: 640px) {
+  .modal.plugin-modal {
+    width: 94vw;
+    max-height: 88vh;
+  }
+  .plugin-modal .pm-body { padding: 12px 12px 18px; }
 }

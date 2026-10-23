@@ -29,6 +29,7 @@ import { GroupMemberCache } from './group-member-cache.js';
 import { PluginHost } from './core/plugin-host.js';
 import { projectLegacyConfig, splitLegacyPatch } from './core/config-compat.js';
 import { registerPluginAdmin } from './core/plugin-admin.js';
+import { listSkills, getSkillBody, reloadUserSkills, userSkillDir } from './skill.js';
 
 /**
  * 把面板传来的值规范成字符串数组。
@@ -1235,6 +1236,80 @@ export function createApp({ log = console.log } = {}) {
           return json(res, 200, { ok: true, model: r.model, reply, latencyMs: Date.now() - startedAt });
         } catch (error) {
           return json(res, 200, { ok: false, error: String(error?.message ?? error), latencyMs: Date.now() - startedAt });
+        }
+      }
+
+      // ── Skill 管理（2026-10-21）──────────────────────────
+      //
+      // 三种来源统一在这里列出，前端「技能」页据此渲染。
+      // 用户自定义的 .md 支持增删改 —— 主人不用写代码就能加知识。
+      if (pathname === '/api/skills' && method === 'GET') {
+        return json(res, 200, { ok: true, skills: listSkills() });
+      }
+
+      // 读单个 skill 的完整正文（内置/插件的也能读，只是不可编辑）
+      if (pathname === '/api/skills/one' && method === 'GET') {
+        const id = String(url.searchParams.get('id') || '');
+        const s = getSkillBody(id);
+        if (!s) return json(res, 404, { ok: false, error: `没有这个 skill：${id}` });
+        return json(res, 200, {
+          ok: true,
+          skill: {
+            id: s.id, name: s.name, summary: s.summary, when: s.when,
+            source: s.source || 'builtin', content: s.content
+          }
+        });
+      }
+
+      // 新建 / 覆盖**用户** skill（内置与插件的不可改）
+      if (pathname === '/api/skills/save' && method === 'POST') {
+        const body = await readBody(req).catch(() => ({}));
+        const id = String(body?.id || '').trim();
+        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) {
+          return json(res, 400, { ok: false, error: 'id 只能用字母数字下划线连字符，长度 1~64' });
+        }
+        const existing = listSkills().find((s) => s.id === id);
+        if (existing && existing.source !== 'user') {
+          return json(res, 400, {
+            ok: false,
+            error: `「${id}」是${existing.source === 'builtin' ? '内核内置' : '插件提供'}的技能，不能在这里改`
+          });
+        }
+        const content = String(body?.content ?? '').trim();
+        if (!content) return json(res, 400, { ok: false, error: '内容不能为空' });
+
+        // 元信息写进 frontmatter，保持「文件即真相」
+        const name = String(body?.name || id).trim();
+        const summary = String(body?.summary || '').trim();
+        const when = String(body?.when || '').trim();
+        const lines = ['---', `name: ${name}`];
+        if (summary) lines.push(`summary: ${summary}`);
+        if (when) lines.push(`when: ${when}`);
+        lines.push('---', '');
+        const full = `${lines.join('\n')}\n${content}\n`;
+
+        const dir = userSkillDir();
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, `${id}.md`), full, 'utf8');
+        reloadUserSkills();
+        return json(res, 200, { ok: true, id, note: '已保存，下一轮运行即生效' });
+      }
+
+      // 删除用户 skill
+      if (pathname === '/api/skills/delete' && method === 'POST') {
+        const body = await readBody(req).catch(() => ({}));
+        const id = String(body?.id || '').trim();
+        const existing = listSkills().find((s) => s.id === id);
+        if (!existing) return json(res, 404, { ok: false, error: '没有这个 skill' });
+        if (existing.source !== 'user') {
+          return json(res, 400, { ok: false, error: '只有用户自定义的技能可以删除' });
+        }
+        try {
+          fs.unlinkSync(path.join(userSkillDir(), `${id}.md`));
+          reloadUserSkills();
+          return json(res, 200, { ok: true });
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e?.message ?? e) });
         }
       }
 

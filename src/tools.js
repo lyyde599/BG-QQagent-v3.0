@@ -4,7 +4,8 @@
 //
 // 工具命名去掉了 qq_ 前缀（更短，省 token）。
 import path from 'node:path';
-import { getConfig, ROOT } from './config.js';
+import { getConfig, updateConfig, ROOT } from './config.js';
+import { listSkills, getSkillBody } from './skill.js';
 import { normalizeMessageList, unquoteJsonString } from './util.js';
 import { formatStickerList } from './stickers.js';
 import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
@@ -91,6 +92,33 @@ function imageParts(text, dataUrls) {
  *   emit  (事件上报给 UI/日志)
  * }
  */
+/**
+ * 配置脱敏：把密钥类字段换成 "长度 N"。
+ *
+ * 用途：主人通过对话查看配置时，模型能看到"有没有配、多长"，
+ * 但**看不到原文** —— 与密钥零披露纪律一致（记忆 00 第二节第 4 条）。
+ * 即使是主人，也不该让 API Key 经过模型上下文。
+ */
+function redactSecrets(v, depth = 0) {
+  if (depth > 8 || v == null) return v;
+  if (Array.isArray(v)) return v.map((x) => redactSecrets(x, depth + 1));
+  if (typeof v === 'object') {
+    const out = {};
+    for (const [k, val] of Object.entries(v)) {
+      if (/apikey|apiKeyFrom|accessToken|secret|password|^token$|keys$/i.test(k)
+          && typeof val === 'string' && val) {
+        out[k] = `[已隐藏，长度 ${val.length}]`;
+      } else if (/anysearchKeys$/i.test(k) && Array.isArray(val)) {
+        out[k] = val.map((s) => `[已隐藏，长度 ${String(s).length}]`);
+      } else {
+        out[k] = redactSecrets(val, depth + 1);
+      }
+    }
+    return out;
+  }
+  return v;
+}
+
 export function buildToolDefs() {
   return [
     {
@@ -407,8 +435,197 @@ export function buildToolDefs() {
         return ok({ finished: true });
       }
     },
-    
-    
+
+    // ── Skill：按需加载知识（2026-10-21）────────────────────
+    //
+    // 与工具的区别：工具**做事**，skill 让模型**知道怎么做**。
+    // 提示词里只留索引（id + 一句话），正文靠这个工具取 —— 省 token。
+    {
+      name: 'load_skill',
+      description: '读取一个技能（skill）的完整内容。提示词里的【技能库】列出了所有可用 skill 及其 id。需要具体规范/套路/领域知识时先读，不要凭印象猜。',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: '技能 id（见【技能库】列表）' }
+        },
+        required: ['id']
+      },
+      async execute(ctx, args) {
+        try {
+          const id = String(args.id ?? '').trim();
+          if (!id) return err('id 不能为空。可用：' + listSkills().map((s) => s.id).join(' / '));
+          const s = getSkillBody(id);
+          if (!s) {
+            return err(`没有这个 skill：${id}。可用：` + listSkills().map((x) => x.id).join(' / '));
+          }
+          // 截断保护：再长的规范也不该一次灌爆上下文
+          const MAX = 20000;
+          const content = s.content.length > MAX
+            ? s.content.slice(0, MAX) + `\n\n…（内容过长，已截断到 ${MAX} 字，完整内容见 ${s.file || '对应文件'}）`
+            : s.content;
+          return ok({ id: s.id, name: s.name, source: s.source || 'builtin', content });
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
+      }
+    },
+
+    // ── 主人专属控制工具（2026-10-21）────────────────────────
+    //
+    // 用户要求：主人的要求一律答应，且**可以通过对话让 Agent 改内核与插件的任意参数**。
+    //
+    // 三个工具各管一段，边界清晰：
+    //   • master_list_capabilities  看：有什么插件、什么工具、可调哪些配置项
+    //   • master_get_config         读：任意配置路径的值
+    //   • master_set_config         写：任意配置路径（内核 + 插件都行）
+    //
+    // 🔴 安全边界（写在工具内部，不靠模型自觉）：
+    //   1. 三个都是 masterOnly —— 群友触发时模型根本看不到
+    //   2. 禁写字段黑名单：allow / deny（白名单）、persona.masterQQ（主人身份）、
+    //      api.apiKey 等凭据 —— 这些改了会把人锁在外面，或让群友自封主人
+    //   3. 路径白名单校验：必须落在 config 里真实存在的键上，防止凭空造字段
+    {
+      name: 'master_list_capabilities',
+      masterOnly: true,
+      description: '【主人专属】列出当前所有插件、每个插件提供的工具、以及可调整的配置项。想"看看它能做什么"或"某个功能对应哪个插件"时先调它。',
+      parameters: { type: 'object', properties: {}, required: [] },
+      async execute(ctx) {
+        try {
+          const host = ctx.pluginHost;
+          if (!host) return err('插件宿主未就绪');
+          const cfg = getConfig();
+          const rows = [];
+          for (const [id, rec] of host.records) {
+            const m = rec.manifest || {};
+            const tools = (host.allToolDefs?.() || [])
+              .filter((d) => d.pluginId === id)
+              .map((d) => d.name);
+            rows.push({
+              plugin: id,
+              name: m.name || id,
+              status: rec.status,
+              enabled: cfg.plugins?.[id]?.enabled === true,
+              tools,
+              configKeys: Object.keys(cfg.plugins?.[id] || {}),
+              hasPanel: !!m.ui
+            });
+          }
+          return ok({
+            plugins: rows,
+            kernelConfigKeys: Object.keys(cfg).filter((k) => k !== 'plugins'),
+            note: '改配置用 master_set_config(path, value)；读用 master_get_config(path)。'
+              + ' 例如 path=plugins.voice.config.enabled，或 path=persona.participation。'
+          });
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
+      }
+    },
+    {
+      name: 'master_get_config',
+      masterOnly: true,
+      description: '【主人专属】读取配置。path 用点号分隔，如 persona.botName / plugins.graal.enabled / api.model。不传 path 返回全部（脱敏：密钥只显示长度）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '配置路径，点号分隔；省略=返回全部' }
+        },
+        required: []
+      },
+      async execute(ctx, args) {
+        try {
+          const cfg = getConfig();
+          const pathStr = String(args.path ?? '').trim();
+          const pick = (obj, p) => p.split('.').filter(Boolean)
+            .reduce((o, k) => (o == null ? undefined : o[k]), obj);
+          if (!pathStr) {
+            return ok({ config: redactSecrets(cfg), note: '密钥已脱敏，只显示长度。' });
+          }
+          const v = pick(cfg, pathStr);
+          if (v === undefined) return err(`配置里没有这一项：${pathStr}`);
+          return ok({ path: pathStr, value: redactSecrets(v) });
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
+      }
+    },
+    {
+      name: 'master_set_config',
+      masterOnly: true,
+      description: '【主人专属】修改配置。path 点号分隔（如 plugins.study.enabled / persona.participation / api.temperature）。value 传新值（字符串会按原类型尝试解析 JSON）。支持内核配置与任意插件配置。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '配置路径，点号分隔' },
+          value: { description: '新值（数字/布尔/字符串/对象均可）' },
+          reason: { type: 'string', description: '可选：为什么改（会写进日志，便于回溯）' }
+        },
+        required: ['path', 'value']
+      },
+      async execute(ctx, args) {
+        try {
+          const pathStr = String(args.path ?? '').trim();
+          if (!pathStr) return err('path 不能为空');
+
+          // 🔴 禁写字段：这些改了会出安全问题或把人锁在外面
+          const FORBIDDEN = [
+            /^allow(\.|$)/, /^deny(\.|$)/,           // 白名单：改错=陌生人可操控机器人
+            /^persona\.masterQQ$/,                    // 主人身份：改=群友可自封主人
+            /^server\.token$/,                        // 控制台令牌
+            /apiKey|apiKeyFrom|accessToken|token$/i   // 任何凭据
+          ];
+          const hit = FORBIDDEN.find((re) => re.test(pathStr));
+          if (hit) {
+            return err(`拒绝修改 ${pathStr}：这是受保护字段。`
+              + '（白名单、主人身份、密钥只能由主人在面板里改，不允许模型代改）');
+          }
+
+          // 只允许"已存在"的路径或 plugins.<id>.* —— 防止凭空造键
+          const cfg = getConfig();
+          const segs = pathStr.split('.').filter(Boolean);
+          const exists = segs.reduce((o, k) => (o == null ? undefined : o[k]), cfg) !== undefined;
+          const isPluginPath = segs[0] === 'plugins' && segs.length >= 2;
+          if (!exists && !isPluginPath) {
+            return err(`配置里没有 ${pathStr}，不能凭空新增。`
+              + '先用 master_get_config 确认现有键名。');
+          }
+
+          // 值解析：传进来是字符串时尝试 JSON 解析（"true"→true / "0.5"→0.5）
+          let val = args.value;
+          if (typeof val === 'string') {
+            const s = val.trim();
+            if (s === 'true') val = true;
+            else if (s === 'false') val = false;
+            else if (s === 'null') val = null;
+            else if (s !== '' && !Number.isNaN(Number(s))) val = Number(s);
+            else if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
+              try { val = JSON.parse(s); } catch { /* 保持字符串 */ }
+            }
+          }
+
+          // 构造增量补丁并写入
+          const patch = {};
+          let cur = patch;
+          for (let i = 0; i < segs.length - 1; i++) {
+            cur[segs[i]] = {};
+            cur = cur[segs[i]];
+          }
+          cur[segs[segs.length - 1]] = val;
+          updateConfig(patch);
+
+          return ok({
+            ok: true,
+            path: pathStr,
+            value: redactSecrets(val),
+            reason: String(args.reason || ''),
+            note: '已写入。绝大多数配置下一轮运行即生效；插件级开关可能需要重载插件。'
+          });
+        } catch (error) {
+          return err(error?.message ?? error);
+        }
+      }
+    },
+
   ];
 }
 

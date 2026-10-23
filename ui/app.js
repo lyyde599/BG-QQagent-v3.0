@@ -533,6 +533,15 @@ function connectSSE() {
     const d = JSON.parse(ev.data);
     if (d.level === 'error') console.warn('[agent 反馈]', d.message);
   });
+  // 🔴 插件动作（偷图/发表情）—— 不改内核 session，由前端追加显示
+  es.addEventListener('sticker-action', (ev) => {
+    const d = JSON.parse(ev.data);
+    // 存到全局，会话详情渲染时取出来追加
+    (state.pluginActions ||= []).push(d);
+    if (state.currentSessionId && state.tab === 'sessions') {
+      loadSessionDetail(state.currentSessionId, { quiet: true });
+    }
+  });
   es.onerror = () => { /* EventSource 自动重连 */ };
 }
 
@@ -679,6 +688,29 @@ function renderSessionDetail(s) {
         ${esc(sent.text)}
       </div>`);
   }
+  // 🔴 插件动作（偷图/发表情）—— 由 sticker-action SSE 事件追加
+  const actions = (state.pluginActions || []).filter((a) => a.chatKey === s.chatKey);
+  for (const a of actions) {
+    if (a.type === 'collect') {
+      html.push(`
+        <div class="tool-card" style="border-left:3px solid var(--accent)">
+          <div class="tool-head">
+            <span class="tool-name">🐳 偷图收藏</span>
+            <span class="muted">${a.inQQ ? '已写入 QQ 收藏' : '仅本地'}${a.selfLike ? ' · 像自己' : ''}${a.score ? ` · ${a.score}分` : ''}</span>
+          </div>
+          <div class="tool-result">${esc(a.note || '')}</div>
+        </div>`);
+    } else if (a.type === 'send') {
+      html.push(`
+        <div class="tool-card" style="border-left:3px solid var(--accent)">
+          <div class="tool-head">
+            <span class="tool-name">📤 发表情</span>
+            <span class="muted">${esc(a.mood || '')}${a.note ? ` · ${esc(a.note)}` : ''}</span>
+          </div>
+        </div>`);
+    }
+  }
+
   if (s.error) html.push(`<div class="session-error">${esc(s.error)}</div>`);
   if (s.finishReason) html.push(`<div class="bubble bubble-user">finish：${esc(s.finishReason)}</div>`);
   html.push('</div>');
@@ -1720,6 +1752,7 @@ function dispatchTabLoad(name) {
   if (name === 'snowluma') return loadSnowlumaPage();
   if (name === 'settings') return loadSettings();
   if (name === 'plugins') return loadPluginsPage();
+  if (name === 'skills') { loadSkillsPage().then(bindSkillsEvents); return; }
 
   // ── 插件页签（2026-10-21）──
   // 内核**不再认识任何具体插件**。页签内容由插件自己的 ui.js 提供，
@@ -2136,8 +2169,22 @@ function renderGroupMgrSection(c) {
 }
 
 function renderAllowSection(c) {
+  const masterQQ = String(c.persona?.masterQQ || '');
   return `
-    <h3 id="settings-allow">聊天白名单</h3>
+    <h3 id="settings-allow">主人</h3>
+    <div class="hint" style="margin-bottom:10px">
+      主人拥有最高权限：可以命令机器人主动调用任意插件能力，也可以让机器人
+      修改内核与插件的配置参数。群友触发时这些工具不会挂载。
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>主人 QQ（逗号分隔可填多个）</label>
+        <input type="text" id="cfg-masterqq" value="${esc(masterQQ)}" placeholder="例如 100012345" />
+        <div class="hint">改这里会同时影响：主人专属工具、白名单私聊放行、被动唤醒对象。</div>
+      </div>
+    </div>
+
+    <h3 id="settings-allow" style="margin-top:26px">聊天白名单</h3>
     <div class="hint" style="margin-bottom:10px">白名单为空时机器人不会在任何群聊/私聊内运行。</div>
     <div class="field"><label>从 QQ 账号直接勾选（不用查群号）</label>
       <div style="display:flex;gap:8px">
@@ -3258,6 +3305,11 @@ async function saveConfig({ quiet = false } = {}) {
     };
     patch.deny = { groups: [], private: [] };
     patch.allowAllWhenEmpty = false;
+
+    // 主人 QQ（2026-10-21）：与 masterOnly 工具共用同一份配置 persona.masterQQ。
+    // 只取第一个 —— 判定逻辑（orchestrator 的 isMaster）比较的是单个值。
+    const masters = parseList(val('#cfg-masterqq', c.persona?.masterQQ || ''));
+    patch.persona = { ...(c.persona || {}), masterQQ: masters[0] || '' };
   }
 
   if (sec === 'chat') {
@@ -3381,6 +3433,185 @@ $$('.tab').forEach((tab) => {
 // ══════════════════════════════════════════════════════════════
 //  插件管理面板（2026-10-20 插件化）
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+//  技能管理（2026-10-21）
+// ══════════════════════════════════════════════════════════════
+//
+// Skill = 按需加载的知识块。内核内置 / 插件注册 / 用户自定义三种来源。
+// 这个页面只允许**编辑用户自定义的**（.md 文件），
+// 内置与插件提供的只读 —— 它们随代码走，改了下次更新就被覆盖。
+
+const SKILL_SOURCE_LABEL = {
+  builtin: '内核内置',
+  plugin: '插件提供',
+  user: '自定义'
+};
+
+async function loadSkillsPage() {
+  const el = $('#skills-page');
+  if (!el) return;
+  el.innerHTML = '<div class="muted" style="padding:16px">加载中…</div>';
+  try {
+    const d = await api('/api/skills');
+    renderSkills(el, d.skills || []);
+  } catch (e) {
+    el.innerHTML = `<div class="card"><div class="error">加载失败：${esc(e.message)}</div></div>`;
+  }
+}
+
+function renderSkills(el, skills) {
+  const userCount = skills.filter((s) => s.source === 'user').length;
+  const rows = skills.map((s) => {
+    const editable = s.source === 'user';
+    return `
+      <tr>
+        <td>
+          <strong>${esc(s.name)}</strong>
+          <div class="muted pl-meta"><span>${esc(s.id)}</span></div>
+        </td>
+        <td><span class="skill-src skill-src-${esc(s.source || 'builtin')}">${esc(SKILL_SOURCE_LABEL[s.source] || s.source)}</span></td>
+        <td class="pl-desc">${esc(s.summary || '—')}</td>
+        <td class="pl-desc">${esc(s.when || '—')}</td>
+        <td style="white-space:nowrap">
+          <button class="btn tiny" data-sk-view="${esc(s.id)}">查看</button>
+          ${editable ? `<button class="btn tiny" data-sk-edit="${esc(s.id)}">编辑</button>
+          <button class="btn tiny" data-sk-del="${esc(s.id)}">删除</button>` : ''}
+        </td>
+      </tr>`;
+  }).join('');
+
+  el.innerHTML = `
+    <div class="card">
+      <h3>技能（Skill）</h3>
+      <p class="muted">
+        技能是<b>按需加载</b>的知识：提示词里只留一行索引，模型需要时才调 <code>load_skill</code> 读正文。
+        这样长文档（规范、套路、领域资料）不会每轮都占 token。
+      </p>
+      <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn primary" id="sk-new">新建技能</button>
+        <span class="muted" style="font-size:12px">
+          共 ${skills.length} 个（自定义 ${userCount} 个，其余随内核/插件）
+        </span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>全部技能</h3>
+      <table class="table">
+        <thead><tr><th>名称</th><th>来源</th><th>说明</th><th>何时用</th><th>操作</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" class="muted">还没有技能</td></tr>'}</tbody>
+      </table>
+      <p class="muted" style="font-size:12px;margin-top:10px">
+        🔒 内核内置与插件提供的技能<b>只读</b> —— 它们随代码走，改了下次更新会被覆盖。
+        想定制可以新建一个同用途的自定义技能，模型会优先读你的。
+      </p>
+    </div>
+
+    <div class="card" id="sk-editor" style="display:none"></div>`;
+}
+
+/** 打开编辑器（id 为空 = 新建） */
+async function openSkillEditor(id) {
+  const box = $('#sk-editor');
+  if (!box) return;
+  box.style.display = '';
+  box.innerHTML = '<div class="muted" style="padding:12px">加载中…</div>';
+
+  let s = { id: '', name: '', summary: '', when: '', content: '', source: 'user' };
+  if (id) {
+    try {
+      const r = await api('/api/skills/one?id=' + encodeURIComponent(id));
+      if (!r.ok) throw new Error(r.error || '读取失败');
+      s = r.skill;
+    } catch (e) {
+      box.innerHTML = `<div class="error" style="padding:12px">${esc(e.message)}</div>`;
+      return;
+    }
+  }
+  const readonly = s.source && s.source !== 'user';
+
+  box.innerHTML = `
+    <div class="row" style="align-items:center">
+      <h3 style="margin:0">${id ? '编辑技能' : '新建技能'}</h3>
+      <span style="flex:1"></span>
+      <button class="btn tiny" id="sk-close">收起</button>
+    </div>
+    ${readonly ? `<p class="error" style="font-size:13px">这是${esc(SKILL_SOURCE_LABEL[s.source])}技能，只读。</p>` : ''}
+    <div class="field-row" style="margin-top:12px">
+      <div class="field">
+        <label>id（唯一，只能字母数字下划线连字符）</label>
+        <input type="text" id="sk-id" value="${esc(s.id)}" ${id ? 'disabled' : ''} placeholder="如 my-guide" />
+      </div>
+      <div class="field">
+        <label>显示名称</label>
+        <input type="text" id="sk-name" value="${esc(s.name)}" placeholder="如 代码风格" />
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>一句话说明（模型据此判断是什么）</label>
+        <input type="text" id="sk-summary" value="${esc(s.summary || '')}" placeholder="如 本项目写代码的约定" />
+      </div>
+      <div class="field">
+        <label>何时该用（写给模型看）</label>
+        <input type="text" id="sk-when" value="${esc(s.when || '')}" placeholder="如 主人让你改代码时" />
+      </div>
+    </div>
+    <div class="field" style="margin-top:10px">
+      <label>正文（Markdown）</label>
+      <textarea id="sk-content" rows="18" style="width:100%;font-family:var(--mono);font-size:12.5px"
+        ${readonly ? 'readonly' : ''}>${esc(s.content || '')}</textarea>
+    </div>
+    ${readonly ? '' : `<div class="row" style="margin-top:12px;gap:8px">
+      <button class="btn primary" id="sk-save">保存</button>
+      <span class="muted" style="font-size:12px">保存后下一轮运行即生效，不用重启</span>
+    </div>`}`;
+
+  $('#sk-close')?.addEventListener('click', () => { box.style.display = 'none'; box.innerHTML = ''; });
+
+  $('#sk-save')?.addEventListener('click', async () => {
+    const newId = (id || $('#sk-id')?.value || '').trim();
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(newId)) return toast('id 只能用字母数字下划线连字符');
+    const content = $('#sk-content')?.value || '';
+    if (!content.trim()) return toast('正文不能为空');
+    try {
+      const r = await api('/api/skills/save', {
+        method: 'POST',
+        body: {
+          id: newId,
+          name: $('#sk-name')?.value || newId,
+          summary: $('#sk-summary')?.value || '',
+          when: $('#sk-when')?.value || '',
+          content
+        }
+      });
+      if (!r.ok) throw new Error(r.error || '保存失败');
+      toast('已保存');
+      loadSkillsPage();
+    } catch (e) { toast('保存失败：' + e.message); }
+  });
+}
+
+/** 技能页事件绑定 */
+function bindSkillsEvents() {
+  if (state.tab !== 'skills') return;
+
+  $('#sk-new')?.addEventListener('click', () => openSkillEditor(''));
+
+  $$('[data-sk-view]').forEach((b) => b.addEventListener('click', () => openSkillEditor(b.dataset.skView)));
+  $$('[data-sk-edit]').forEach((b) => b.addEventListener('click', () => openSkillEditor(b.dataset.skEdit)));
+  $$('[data-sk-del]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`删除技能「${b.dataset.skDel}」？`)) return;
+    try {
+      const r = await api('/api/skills/delete', { method: 'POST', body: { id: b.dataset.skDel } });
+      if (!r.ok) throw new Error(r.error || '删除失败');
+      toast('已删除');
+      loadSkillsPage();
+    } catch (e) { toast('删除失败：' + e.message); }
+  }));
+}
+
 async function loadPluginsPage() {
   const el = $('#plugins-page');
   if (!el) return;
@@ -3426,11 +3657,22 @@ function renderPlugins(el, data) {
       + `<button class="btn tiny" data-pl-data="${esc(p.id)}">数据</button>`
       + `<button class="btn tiny" data-pl-export="${esc(p.id)}">导出</button>`
       + `<button class="btn tiny" data-pl-del="${esc(p.id)}">卸载</button>`;
+    // 作者展示（2026-10-21）：从 manifest.author 取，没有就显示"—"
+    const author = (p.author || '').trim();
     return `
     <tr>
-      <td><strong>${esc(p.name)}</strong><div class="muted" style="font-size:12px">${esc(p.id)} · v${esc(p.version)}</div></td>
+      <td>
+        <strong>${esc(p.name)}</strong>
+        <div class="muted pl-meta">
+          <span class="pl-author" title="作者">${author ? esc(author) : '—'}</span>
+          <span class="pl-dot">·</span>
+          <span>${esc(p.id)}</span>
+          <span class="pl-dot">·</span>
+          <span>v${esc(p.version)}</span>
+        </div>
+      </td>
       <td>${pluginStatusBadge(p)}</td>
-      <td class="muted" style="font-size:12px">${esc(p.description || '').slice(0, 70)}</td>
+      <td class="pl-desc" title="${esc(p.description || '')}">${esc(p.description || '')}</td>
       <td style="font-size:12px">${tools}</td>
       <td style="font-size:12px">${dataCell}</td>
       <td style="font-size:12px">${scopeCount ? scopeCount + ' 处覆盖' : '全局'}</td>
@@ -3466,7 +3708,6 @@ function renderPlugins(el, data) {
       </table>
     </div>
 
-    <div id="pl-panel" style="display:none"></div>
     <div class="card" id="pl-data-card" style="display:none"></div>`;
 
   const post = async (path, body) => {
@@ -3610,13 +3851,72 @@ function renderPlugins(el, data) {
 // 新增插件面板请写 plugins/<id>/ui.js，不要往这里加。
 const PANEL_RENDERERS = {};
 
-/** 打开某个插件的配置面板（在插件页内展开） */
+/**
+ * 插件配置弹窗容器（2026-10-21）
+ *
+ * 原来配置面板内嵌在插件页底部，点「配置」要滚到页尾 ——
+ * 19 个插件的长列表里体验很差：跳走、丢位置、关掉还得滚回来。
+ * 改成居中弹窗：不打断浏览位置，点背幕 / ESC / 收起按钮都能关。
+ */
+function ensurePluginModal() {
+  let ov = document.getElementById('plugin-modal-overlay');
+  if (ov) return ov;
+
+  ov = document.createElement('div');
+  ov.id = 'plugin-modal-overlay';
+  ov.className = 'modal-overlay';
+  ov.style.display = 'none';
+  ov.innerHTML = `
+    <div class="modal plugin-modal" role="dialog" aria-modal="true">
+      <div class="pm-head">
+        <span class="pm-title" id="pm-title">插件配置</span>
+        <span style="flex:1"></span>
+        <button class="btn tiny" id="pm-close">收起</button>
+      </div>
+      <div class="pm-body" id="pm-body"></div>
+    </div>`;
+
+  // 点背幕关闭（点内容区不关）
+  ov.addEventListener('click', (e) => { if (e.target === ov) closePluginModal(); });
+  // ESC 关闭
+  ov._esc = (e) => { if (e.key === 'Escape') closePluginModal(); };
+  document.body.appendChild(ov);
+  return ov;
+}
+
+/** 打开弹窗并清空内容 */
+function openPluginModal(title) {
+  const ov = ensurePluginModal();
+  const tEl = ov.querySelector('#pm-title');
+  if (tEl) tEl.textContent = title || '插件配置';
+  ov.querySelector('#pm-body').innerHTML = '';
+  ov.style.display = 'flex';
+  document.addEventListener('keydown', ov._esc);
+  ov.querySelector('#pm-close').onclick = closePluginModal;
+  return ov.querySelector('#pm-body');
+}
+
+/** 关闭弹窗 */
+function closePluginModal() {
+  const ov = document.getElementById('plugin-modal-overlay');
+  if (!ov) return;
+  ov.style.display = 'none';
+  ov.querySelector('#pm-body').innerHTML = '';
+  if (ov._esc) document.removeEventListener('keydown', ov._esc);
+}
+
+/** 打开某个插件的配置面板（弹窗展示） */
 async function openPluginPanel(id) {
-  const box = $('#pl-panel');
-  if (!box) return;
-  box.style.display = '';
+  // 先取插件名做标题，取不到就用 id
+  let title = id;
+  try {
+    const d0 = await api('/api/plugins');
+    const meta = (d0.plugins || []).find((x) => x.id === id);
+    if (meta?.name) title = `${meta.name} · 配置`;
+  } catch { /* 忽略，用 id 当标题 */ }
+
+  const box = openPluginModal(title);
   box.innerHTML = '<div class="muted" style="padding:16px">加载中…</div>';
-  box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 
   // ① 优先用**插件自己提供的**配置面板（plugins/<id>/ui.js 的 mountPanel）
   //    这是插件化要求：插件的界面归插件，内核不认识具体插件。
@@ -3676,6 +3976,8 @@ function panelShell(id, title, bodyHtml, hint) {
 /** 绑定「收起」 */
 function bindPanelClose(box) {
   box.querySelectorAll('[data-panel-close]').forEach((b) => b.addEventListener('click', () => {
+    // 面板现在渲染在弹窗里，「收起」应当关掉整个弹窗，而不是留一个空壳
+    if (document.getElementById('plugin-modal-overlay')) { closePluginModal(); return; }
     box.style.display = 'none';
     box.innerHTML = '';
   }));

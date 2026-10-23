@@ -12,6 +12,7 @@ import { pathToFileURL } from 'node:url';
 import { ROOT, DATA_DIR } from '../config.js';
 import { normalizeManifest, PLUGIN_API_VERSION } from './manifest.js';
 import { createPluginConfig, resolveEnabled } from './plugin-config.js';
+import { registerPluginSkill, unregisterPluginSkills } from '../skill.js';
 
 const PLUGINS_DIR = path.join(ROOT, 'plugins');
 
@@ -278,6 +279,8 @@ export class PluginHost {
     this.routes = this.routes.filter((r) => r.id !== id);
     this.toolDefs = this.toolDefs.filter((t) => t.id !== id);
     this.promptSections = this.promptSections.filter((s) => s.id !== id);
+    // 摘掉该插件注册的 skill（否则卸载后模型还能 load 到孤儿技能）
+    unregisterPluginSkills(id);
     for (const t of sub.timers || []) clearInterval(t);
     this.uiTabs = this.uiTabs.filter((t) => t.pluginId !== id);
   }
@@ -434,6 +437,22 @@ export class PluginHost {
         }
       },
 
+      // ── Skill 注册（2026-10-21）──
+      //
+      // 插件自带的知识块。与 promptSections 的区别：
+      //   promptSections → **每轮都拼进提示词**（常驻，吃 token）
+      //   skill          → 只在【技能库】里留一行索引，模型按需 load_skill 取正文
+      //
+      // 插件卸载时自动摘除，不会留下"孤儿 skill"。
+      skill: {
+        register(def) {
+          if (!def?.id) throw new Error('skill 需要 id');
+          if (!def.body && !def.file) throw new Error(`skill ${def.id} 需要 body 或 file`);
+          registerPluginSkill(id, def);
+          return () => unregisterPluginSkills(id);
+        }
+      },
+
       ui: {
         /** 等价于 manifest.uiTab，供动态场景使用 */
         register(tab) {
@@ -554,6 +573,7 @@ export class PluginHost {
         version: r.manifest?.version || '?',
         status: r.status,
         description: r.manifest?.description || '',
+        author: r.manifest?.author || '',       // 作者（面板展示用）
         category: r.manifest?.category || '其他',
         summary: r.manifest?.summary || '',
         lastError: r.lastError,
