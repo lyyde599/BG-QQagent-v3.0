@@ -95,7 +95,11 @@ export class StickerManager {
       resId: id,
       url,
       md5: '',
-      desc: String(note || '').slice(0, 20),
+      // 🔴 不要截断（2026-10-21 修）：desc 会进提示词（见 stickers.js 的
+      // buildStickerContext），截成 20 字会让模型看到半句话，
+      // 例如「粉色小猪，圆滚滚，用来卖萌/自嘲"我是猪」—— 结尾引号都丢了，
+      // 选表情时被误导。展示用不着省这几个字，直接存完整备注。
+      desc: String(note || ''),
       localNote: String(note || ''),
       tags: [],
       usage: '',

@@ -167,6 +167,12 @@ export function applyStickerNote(entries, id, patch = {}) {
   const next = normalizeStickerEntry({
     ...target,
     localNote: patch.note !== undefined ? String(patch.note ?? '').trim() : target.localNote,
+    // 🔴 desc 必须跟着 note 一起更新（2026-10-21 修）。
+    //    原来这里漏了 desc，导致 desc 永远停在**第一次收藏时**的版本：
+    //    collect() 首次写入 desc，之后再次收藏只调 note() 不碰 desc，
+    //    于是同一条记录里 desc 是第 1 版、localNote 是第 3 版，
+    //    而提示词读的是 desc —— 模型看到的是过期认知。
+    desc: patch.note !== undefined ? String(patch.note ?? '').trim() : target.desc,
     tags: Array.isArray(patch.tags) ? patch.tags.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 20) : target.tags,
     usage: patch.usage !== undefined ? String(patch.usage ?? '').trim() : target.usage,
     source: patch.source || target.source || 'ai',
