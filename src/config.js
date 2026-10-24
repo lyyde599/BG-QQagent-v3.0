@@ -266,6 +266,26 @@ let currentConfig = null;
 let saveTimers = new Map();
 
 /** 取当前生效配置（未初始化时从磁盘读）。 */
+// ── 关于 / 交流群（2026-10-24）────────────────────────────────────
+//
+// 需求：控制面板里让人知道有这个 QQ 群，但**只做静态展示**，不打扰使用。
+//
+// 三条自我约束（避免变成骚扰式推广）：
+//   ① 只出现在「设置 → 关于」，不弹窗、不轮播、不挡住操作
+//   ② 不写进提示词 —— 模型不知道这个群，不会被诱导在聊天里拉人
+//   ③ 不写进任何一个 Tab 的首屏，用户不主动看就看不到
+//
+// 想改群号/群名只需要动这里一处。
+export const COMMUNITY = {
+  name: '白光AI技术交流群',
+  number: '1127063335',
+  intro: '插件开发、部署踩坑、模型接入，都在这里聊',
+  // 加群链接：QQ 群的分享链接，手机点开可直接跳转
+  joinUrl: 'https://qm.qq.com/q/RDq35J6PQu',   // 群分享短链（群号拼出来的 /q/<群号> 是无效的，实测 404）
+  // 项目主页
+  repo: 'https://github.com/lyyde599/BG-QQagent-v3.0'
+};
+
 export function getConfig() {
   if (!currentConfig) currentConfig = loadConfig();
   return currentConfig;

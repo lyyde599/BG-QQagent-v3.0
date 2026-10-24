@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { getConfig, updateConfig, ROOT, DATA_DIR } from './config.js';
+import { getConfig, updateConfig, ROOT, DATA_DIR, COMMUNITY } from './config.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments } from './onebot.js';
 import { ChatStore } from './store.js';
 import { MemoryStore } from './memory.js';
@@ -712,6 +712,16 @@ export function createApp({ log = console.log } = {}) {
       if (!authorize(req)) return json(res, 401, { error: '未授权' });
       const method = req.method;
       const cfgNow = getConfig();
+
+      // 关于 / 交流群（2026-10-24）：只读，供控制台「关于」区展示
+      if (pathname === '/api/about' && method === 'GET') {
+        return json(res, 200, {
+          ok: true,
+          community: COMMUNITY,
+          version: process.env.npm_package_version || null,
+          node: process.version
+        });
+      }
 
       if (pathname === '/api/status' && method === 'GET') {
         const dayKey = todayKey();

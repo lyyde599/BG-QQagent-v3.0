@@ -1763,6 +1763,57 @@ function dispatchTabLoad(name) {
 }
 
 
+// ── 关于（2026-10-24）──────────────────────────────────────
+//
+// 放交流群信息，但**只放这一处**：
+//   · 不弹窗、不自动展开、不挡住任何操作
+//   · 不写进提示词，模型不知道这个群
+//   · 不放进任何 Tab 首屏，用户主动点「关于」才看得到
+//
+// 群信息在 src/config.js 的 COMMUNITY 里，改群号只需改那一处。
+function renderAboutSection(c) {
+  const k = (c && c.community) || {};
+  const qq = String(k.number || '').trim();
+  const name = String(k.name || '').trim();
+  const intro = String(k.intro || '').trim();
+  const repo = String(k.repo || '').trim();
+
+  return `
+    <h3>关于</h3>
+    <div class="hint" style="margin-bottom:14px">
+      QQ Agent 是一个可扩展的群机器人框架：内核只保留收发消息与调度，
+      其余能力都以插件形式装卸。
+    </div>
+
+    ${name ? `
+    <div style="padding:16px 18px;border:1px solid var(--line2);border-radius:var(--r);background:var(--panel)">
+      <div style="font-size:14px;font-weight:600">${esc(name)}</div>
+      ${intro ? `<div class="muted" style="font-size:13px;margin-top:6px">${esc(intro)}</div>` : ''}
+      ${qq ? `
+      <div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span class="muted" style="font-size:13px">群号</span>
+        <code style="font-size:14px;letter-spacing:.5px">${esc(qq)}</code>
+        <button class="btn tiny" id="about-copy">复制群号</button>
+        <a class="btn tiny" href="${esc(k.joinUrl || '')}" target="_blank" rel="noopener">加入群聊</a>
+      </div>` : ''}
+      <div class="muted" style="font-size:12px;margin-top:10px">
+        用这个项目遇到问题、想找现成插件、或者想分享自己写的插件，都可以进群聊。
+      </div>
+    </div>` : ''}
+
+    ${repo ? `
+    <h3 style="margin-top:24px">项目主页</h3>
+    <div class="muted" style="font-size:13px">
+      <a href="${esc(repo)}" target="_blank" rel="noopener">${esc(repo)}</a>
+    </div>` : ''}
+
+    <h3 style="margin-top:24px">运行环境</h3>
+    <div class="muted" style="font-size:13px;line-height:1.9">
+      Node ${esc(String((c && c.node) || '').replace(/^v/, ''))}${(c && c.version) ? ` · 版本 ${esc(c.version)}` : ''}<br>
+      所有时间按北京时间显示（进程已锁 TZ=Asia/Shanghai）
+    </div>`;
+}
+
 // ── 外观设置面板 ────────────────────────────────────────────
 function renderAppearanceSection(c) {
   const app = (c && c.appearance) || { skin: 'default', background: {} };
@@ -1919,7 +1970,8 @@ function renderSettingsSidebar() {
     ['chat', '聊天设置'],
     ['appearance', '外观'],
     ['desktop', '桌面端'],
-    ['onebot', 'OneBot（SnowLuma）']
+    ['onebot', 'OneBot（SnowLuma）'],
+    ['about', '关于']
   ];
   sidebar.innerHTML = `
     <div class="settings-runstate">
@@ -1946,6 +1998,26 @@ function renderSettings() {
   box.innerHTML = `
     ${renderSettingsSection(c)}`;
   bindSettingsEvents(c);
+
+  // 「关于」区需要 /api/about 的数据（群信息、Node 版本），
+  // 是异步的，所以先渲染空壳再补内容 —— 不阻塞其它设置项。
+  if ((state.settingsSection || 'api') === 'about') {
+    api('/api/about').then((d) => {
+      const pane = $('#settings-form');
+      if (!pane || (state.settingsSection || 'api') !== 'about') return;
+      pane.innerHTML = renderAboutSection(d);
+      $('#about-copy')?.addEventListener('click', async () => {
+        const qq = String(d?.community?.number || '');
+        if (!qq) return;
+        try {
+          await navigator.clipboard.writeText(qq);
+          toast('群号已复制');
+        } catch {
+          toast('复制失败，请手动选中');
+        }
+      });
+    }).catch(() => { /* 取不到就保持空壳，不影响其它设置 */ });
+  }
 }
 
 function renderSettingsSection(c) {
@@ -1958,7 +2030,8 @@ function renderSettingsSection(c) {
     chat: () => renderChatSection(c),
     desktop: () => renderDesktopSection(c),
     onebot: () => renderOnebotSection(c),
-    appearance: () => renderAppearanceSection(c)
+    appearance: () => renderAppearanceSection(c),
+    about: () => renderAboutSection(c)
   };
   const render = sections[sec] || sections.api;
   const saveBar = `
