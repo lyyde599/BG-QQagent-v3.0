@@ -277,11 +277,41 @@ refs:
     // 显式启用本测试要验证的插件。
     // 插件默认 defaultEnabled:false（干净版原则），不写就等于全关 ——
     // 那样记忆/搜索/识图场景会全部跳过，等于没测。
+    // 🔴 必须**逐个显式声明**（2026-10-24 修）
+    //   老写法只写 4 个要用的，其余留空 → 走 manifest.defaultEnabled。
+    //   但后来新增的插件里有 6 个 defaultEnabled:true（reply-control / group-daily /
+    //   file-recv / astrbot-compat / plugin-center / group-cost-report），
+    //   它们会自动启用并干预消息链 —— reply-control 默认"只回 @ 和命令"，
+    //   直接把场景 1 的「在吗？」判成"不回复"，第一次 LLM 调用永远等不到。
+    //   所以这里对**每个**插件都写明开关：用的开，其余全关。
     plugins: {
+      'ad-inject': { enabled: false },
+      'affinity': { enabled: false },
+      'anti-ad': { enabled: false },
+      'astrbot-compat': { enabled: false },
+      'bili-pond': { enabled: false },
+      'blacklist': { enabled: false },
+      'file-recv': { enabled: false },
+      'grail': { enabled: false },
+      'group-cost-report': { enabled: false },
+      'group-daily': { enabled: false },
+      'group-manager': { enabled: false },
+      'group-pond': { enabled: false },
+      'image-gen': { enabled: false },
+      'master-tools': { enabled: false },
       'memory': { enabled: true },
-      'websearch': { enabled: true },
+      'plugin-center': { enabled: false },
+      'qa-handbook': { enabled: false },
+      'qzone-sweeper': { enabled: false },
+      'reply-control': { enabled: false },
+      'schedule': { enabled: false },
+      'sticker': { enabled: true },
+      'study': { enabled: false },
+      'teacher': { enabled: false },
       'vision': { enabled: true },
-      'sticker': { enabled: true }
+      'voice': { enabled: false },
+      'websearch': { enabled: true },
+      'welfare': { enabled: false }
     }
   };
   fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify(cfg));

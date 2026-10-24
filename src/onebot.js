@@ -191,11 +191,23 @@ export class OneBotClient {
       if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
       segments.push({ type: 'at', data: { qq: at } });
     }
-    segments.push({ type: 'image', data: { file: String(imageUrl) } });
+    // 🔴 表情要带这两个字段，否则 QQ 按**普通图片**渲染（2026-10-24 修）。
+    //
+    //   summary    = '[动画表情]'  消息摘要标记
+    //   sub_type   = 1            子类型：表情
+    //
+    // 依据：plugins/sticker/index.js 的发送路径（走的 sendSegments）就带了这两个
+    // 字段，同一个 NapCat 接口，差别只在这里 —— 它发出来是表情样式。
+    //
+    // ⚠️ 只改 sendSticker。sendImage 保持只传 file，图片仍然是图片。
+    segments.push({
+      type: 'image',
+      data: { file: String(imageUrl), summary: '[动画表情]', sub_type: 1 }
+    });
     return this.sendSegments(kind, id, segments);
   }
 
-  /** 发送一张任意公网图片（URL 或本地路径），与表情同构。 */
+  /** 发送一张任意公网图片（URL 或本地路径）。**不带表情字段**，渲染成普通图片。 */
   async sendImage(kind, id, imageUrl, { replyToMessageId = null, atUserId = null } = {}) {
     const segments = [];
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
