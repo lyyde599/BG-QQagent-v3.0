@@ -165,16 +165,43 @@ export function registerPluginAdmin(host, { getConfig, log }) {
         data: { exists: d.exists, fileCount: d.files.length, bytes: d.totalBytes, sizeText: humanSize(d.totalBytes) }
       };
     }),
-    // inline=true 的页签内嵌在插件页渲染，不占顶栏
-    // file: 插件前端入口（manifest.ui），前端据此动态 import
-    // /plugin-ui/<pluginId>/<file>
-    tabs: host.uiTabs.map((t) => ({
-      id: t.id, label: t.label, pluginId: t.pluginId,
-      inline: t.inline === true, file: t.file || '',
-      // fileStamp = ui.js 的 mtime：前端据此加 ?v= 后缀，
-      // 避免浏览器对 ES module 的激进缓存导致"改了插件没生效"
-      fileStamp: uiFileStamp(t.pluginId, t.file)
-    }))
+    // ── 插件页签列表（2026-10-21 修）──
+    //
+    // 🔴 原来只从 host.uiTabs 生成，而 uiTabs 只在插件**激活时**登记
+    //    （plugin-host.js 的两处 push 都在 enable 流程里）。
+    //    后果：插件一停用，配置面板就打不开了 ——
+    //    前端拿不到 entry（file 为空），回退成"这个插件没有独立配置面板"。
+    //    而"想改完配置再启用"是很常见的操作，禁用状态下看不到配置页很别扭。
+    //
+    // 现在合并两个来源：
+    //   ① 已激活插件的 uiTabs（照旧）
+    //   ② 未激活但 manifest 里声明了 uiTab 的插件 —— 从 records 补上
+    //      （禁用时 manifest 仍然保留，见 plugin-host 的 records 构造）
+    //
+    // fileStamp 只读文件 mtime，不依赖运行时 dir，禁用的插件也能算。
+    tabs: (() => {
+      const seen = new Set(host.uiTabs.map((t) => t.pluginId));
+      const out = [...host.uiTabs];
+      for (const rec of host.records.values()) {
+        const m = rec?.manifest;
+        if (!m?.uiTab || seen.has(m.id)) continue;
+        out.push({
+          id: m.uiTab.id,
+          label: m.uiTab.label,
+          pluginId: m.id,
+          file: m.ui || '',           // manifest.ui 就是插件前端入口
+          dir: null,
+          inline: m.uiTab.inline === true
+        });
+      }
+      return out.map((t) => ({
+        id: t.id, label: t.label, pluginId: t.pluginId,
+        inline: t.inline === true, file: t.file || '',
+        // fileStamp = ui.js 的 mtime：前端据此加 ?v= 后缀，
+        // 避免浏览器对 ES module 的激进缓存导致"改了插件没生效"
+        fileStamp: uiFileStamp(t.pluginId, t.file)
+      }));
+    })()
   }));
 
   // ── 启停 ──
