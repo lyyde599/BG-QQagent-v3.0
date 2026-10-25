@@ -9,3 +9,12 @@ __pycache__/
 .env
 .env.*
 !README*
+
+# 运行产物 / 临时备份（2026-10-25 补）
+backup/
+plugins/*/quota.json
+data/plugins/*/quota.json
+
+# 遗留备份（2026-10-25 清理）
+*.bak-*
+备份/

@@ -50,7 +50,13 @@ import { OneBotHealth } from './onebot-health.js';
 import { ScheduledTaskRunner } from './scheduled-tasks.js';
 import { createEventBus, todayKey } from './util.js';
 import { getGrant } from './core/plugin-grants.js';
-import { sendMail, mailReady } from './core/mailer.js';
+import { sendMail, mailReady, mailStatus, saveMailConfig, clearMailConfig } from './core/mailer.js';
+import crypto from 'node:crypto';
+
+// 验证码暂存（中心端，内存即可 —— 重启失效是特性不是缺陷）
+const authCodes = new Map();     // email -> { code, at }
+const authSendLog = new Map();   // email -> 上次发送时间
+const authIpLog = new Map();     // ip -> [时间戳]
 
 // 全局 fetch（undici）默认连接建立超时只有 10 秒，openrouter.ai 这类海外端点
 // 握手慢时会直接报 "Connect Timeout Error ... timeout: 10000ms"（注意这不是
@@ -1472,6 +1478,111 @@ export function createApp({ log = console.log } = {}) {
         if (next.proactive?.enabled) orchestrator.startProactiveLoop(); else orchestrator.stopProactiveLoop();
         emit('status', { configUpdated: true });
         return json(res, 200, { ok: true, config: next });
+      }
+
+      // ── 邮件通道（内核能力，2026-10-25）──
+      //
+      // 这是**后端基础设施**，不归任何插件。
+      // 理由：它和 OneBot token、模型 key 同级 ——
+      // 谁能发信、用什么邮箱发，是部署方的事，
+      // 不该由某个业务插件替部署方决定。
+      //
+      // 创造营的邮箱验证码注册会用到这里配的凭据。
+      // ── 验证码服务（中心端，2026-10-25）──
+      //
+      // 架构决定：**验证码是服务方的事，不是部署方的事**。
+      //
+      // 别人的机器上没有我们的邮箱授权码，也不该为了注册一个作者账号
+      // 跑去 QQ 邮箱开 SMTP。所以：
+      //   · 中心服务器（这台）暴露 /api/auth/send 和 /api/auth/verify
+      //   · 客户端部署的创造营调这两个接口
+      //   · 验证码存在中心，不上传、不下发、不经过客户端
+      //
+      // 这个接口**自带限流**：同邮箱 60 秒一次、同 IP 每小时 20 次。
+      // 它是公网接口，必须防刷。
+      if (pathname === '/api/auth/send' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const email = String(body?.email || '').trim().toLowerCase();
+        if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) {
+          return json(res, 400, { ok: false, error: '邮箱格式不对' });
+        }
+        if (!mailReady()) {
+          return json(res, 503, { ok: false, error: '验证码服务暂时不可用（中心端未配置发信）' });
+        }
+
+        // 同邮箱 60 秒
+        const last = authSendLog.get(email) || 0;
+        if (Date.now() - last < 60 * 1000) {
+          const wait = Math.ceil((60 * 1000 - (Date.now() - last)) / 1000);
+          return json(res, 429, { ok: false, error: `刚发过，请 ${wait} 秒后再试` });
+        }
+        // 同 IP 每小时 20 次
+        const ip = String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress || '');
+        const now = Date.now();
+        const arr = (authIpLog.get(ip) || []).filter((x) => now - x < 3600 * 1000);
+        if (arr.length >= 20) {
+          return json(res, 429, { ok: false, error: '这个网络发得太频繁了，一小时后再试' });
+        }
+        arr.push(now);
+        authIpLog.set(ip, arr);
+
+        const code = String(crypto.randomInt(100000, 1000000));
+        authCodes.set(email, { code, at: now });
+
+        const r = await sendMail(email, '【QQAgent 创造营】注册验证码',
+          `你好，\n\n你正在注册 QQAgent 创造营的作者账号。\n\n验证码：${code}\n\n10 分钟内有效。若不是你本人操作，忽略这封邮件。\n\n—— QQAgent 创造营`);
+        if (!r.ok) {
+          authCodes.delete(email);
+          return json(res, 500, { ok: false, error: '发信失败' });
+        }
+        authSendLog.set(email, now);
+        log(`[auth] 验证码已发往 ${email.replace(/^(.{3}).*(@.*)$/, '$1***$2')}`);
+        return json(res, 200, { ok: true, message: '验证码已发送' });
+      }
+
+      if (pathname === '/api/auth/verify' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const email = String(body?.email || '').trim().toLowerCase();
+        const input = String(body?.code || '').trim();
+        const rec = authCodes.get(email);
+        if (!rec) return json(res, 400, { ok: false, error: '请先获取验证码' });
+        if (Date.now() - rec.at > 10 * 60 * 1000) {
+          authCodes.delete(email);
+          return json(res, 400, { ok: false, error: '验证码已过期，请重新获取' });
+        }
+        if (input !== rec.code) {
+          return json(res, 400, { ok: false, error: '验证码不对' });
+        }
+        authCodes.delete(email);
+        return json(res, 200, { ok: true });
+      }
+
+      if (pathname === '/api/mail' && method === 'GET') {
+        return json(res, 200, {
+          ok: true,
+          ...mailStatus(),
+          hint: 'QQ 邮箱 → 设置 → 账户 → 开启 SMTP 服务 → 生成授权码（16 位）',
+        });
+      }
+
+      if (pathname === '/api/mail' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const r = saveMailConfig({ user: body?.user, code: body?.code });
+        if (r.ok) log(`[mail] 邮件通道已更新：${r.user || '（未设发件人）'}`);
+        return json(res, r.ok ? 200 : 400, r);
+      }
+
+      if (pathname === '/api/mail' && method === 'DELETE') {
+        return json(res, 200, clearMailConfig());
+      }
+
+      if (pathname === '/api/mail/test' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const to = String(body?.to || '').trim();
+        if (!to) return json(res, 400, { ok: false, error: '请填收件邮箱' });
+        const r = await sendMail(to, '【QQAgent】邮件通道测试',
+          '这是测试邮件。\n\n收到说明邮件通道配置正确，注册作者时可以收到验证码了。\n\n—— QQAgent');
+        return json(res, 200, r.ok ? { ok: true, message: '已发送，请查收（含垃圾箱）' } : { ok: false, error: r.error });
       }
 
       if (pathname === '/api/models' && method === 'GET') {

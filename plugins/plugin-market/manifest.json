@@ -18,7 +18,8 @@
     "mirrorUrl": "https://pub-01d4abacd76d41c6b0ea5f6b6bc1d36e.r2.dev/index.json",
     "showUntrusted": false,
     "autoCheckUpdate": true,
-    "checkIntervalHours": 24
+    "checkIntervalHours": 24,
+    "authUrl": "https://auth.597457.xyz/api/auth"
   },
   "permissions": [
     "network"

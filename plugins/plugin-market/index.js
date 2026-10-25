@@ -22,6 +22,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
 
 export async function activate(ctx) {
   const cfg = () => {
@@ -136,9 +137,67 @@ export async function activate(ctx) {
    *    但插件包是公开的，等于把整套发信实现分发给所有人。
    *    现在改成调 ctx.mail.send()，插件看不到 SMTP 细节和凭据。
    */
-  const sendMail = (to, subject, body) => {
-    if (!ctx.mail) return Promise.resolve({ ok: false, error: '内核未提供邮件能力' });
-    return ctx.mail.send(to, subject, body);
+  // ── 验证码发送（2026-10-25 改为分布式）──
+  //
+  // 🔴 架构决定：验证码**不该让每个部署者自己配 SMTP**。
+  //
+  //   原因：
+  //     · 别人的机器上没有我们的邮箱授权码，也没有 QQ 邮箱的 SMTP 权限
+  //     · 让每个用户去 QQ 邮箱开 SMTP、生成授权码，门槛太高
+  //     · 验证码是**服务方的事**，不是部署方的事
+  //
+  //   现在的两条路：
+  //     ① 本机配了 SMTP（qq-user + qq-authcode 都有）→ 直接发
+  //     ② 本机没配 → 调到中心服务请求发信
+  //
+  //   中心服务地址由 config.authUrl 指定（默认我们这台）。
+  //   请求只带 email，中心负责发信并把"发没发出去"告诉调用方。
+  //   **验证码本身不经过客户端** —— 校验也在中心做（见 verify）。
+  const CENTER_URL = () => {
+    const c = ctx.config.get() || {};
+    return String(c.authUrl || 'https://auth.597457.xyz/api/auth');
+  };
+
+  const sendVerifyCode = async (email) => {
+    // ① 本机有 SMTP 就自己发
+    if (ctx.mail?.ready?.()) {
+      const code = String(crypto.randomInt(100000, 1000000));
+      const body = [
+        '你好，',
+        '',
+        '你正在注册 QQAgent 创造营的作者账号。',
+        '',
+        `验证码：${code}`,
+        '',
+        '10 分钟内有效。若不是你本人操作，忽略这封邮件。',
+        '',
+        '—— QQAgent 创造营',
+      ].join('\n');
+      const r = await ctx.mail.send(email, '【QQAgent 创造营】注册验证码', body);
+      if (!r.ok) return { ok: false, error: '发信失败：' + r.error };
+      return { ok: true, local: true, code };
+    }
+
+    // ② 没配 SMTP → 请求中心服务
+    try {
+      const res = await fetch(`${CENTER_URL()}/send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'User-Agent': UA },
+        body: JSON.stringify({ email }),
+        signal: AbortSignal.timeout(30000),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d?.ok === false) {
+        return { ok: false, error: d?.error || `中心服务返回 HTTP ${res.status}` };
+      }
+      return { ok: true, central: true };
+    } catch (e) {
+      return {
+        ok: false,
+        error: '连不上验证码服务（' + String(e?.message ?? e).slice(0, 60) + '）。'
+          + '可以在「设置」里配自己的邮箱，或检查网络。',
+      };
+    }
   };
 
   // ── 验证码暂存（内存）──
@@ -175,56 +234,67 @@ export async function activate(ctx) {
     }
 
     cleanCodes();
-    const code = String(crypto.randomInt(100000, 1000000));
-    codes.set(email, { code, at: Date.now(), tries: 0 });
+    const r = await sendVerifyCode(email);
 
-    const body2 = [
-      '你好，',
-      '',
-      '你正在注册 QQAgent 创造营的作者账号。',
-      '',
-      `验证码：${code}`,
-      '',
-      '10 分钟内有效。如果不是你本人操作，忽略这封邮件即可。',
-      '',
-      '—— QQAgent 创造营',
-    ].join('\n');
-
-    const r = await sendMail(email, '【QQAgent 创造营】注册验证码', body2);
     if (!r.ok) {
       codes.delete(email);
-      return { ok: false, error: '发信失败：' + r.error };
+      return { ok: false, error: r.error };
     }
+    // 本地发的：记下验证码自己校验；中心发的：不存，验证时问中心
+    if (r.local && r.code) codes.set(email, { code: r.code, at: Date.now(), tries: 0 });
+
     sendLog.set(email, Date.now());
-    ctx.log(`[市场] 验证码已发往 ${email.replace(/(.{3}).*(@.*)/, '$1***$2')}`);
-    return { ok: true, message: '验证码已发送，请查收（含垃圾箱）' };
+    ctx.log(`[市场] 验证码已发往 ${email.replace(/(.{3}).*(@.*)/, '$1***$2')}（${r.local ? '本地' : '中心服务'}）`);
+    return {
+      ok: true,
+      via: r.local ? 'local' : 'central',
+      message: '验证码已发送，请查收（含垃圾箱）',
+    };
   }, { absolute: true });
 
-  ctx.http.route('POST', '/api/market/register/verify', (_req, body) => {
+  ctx.http.route('POST', '/api/market/register/verify', async (_req, body) => {
     const email = String(body?.email || '').trim().toLowerCase();
     const input = String(body?.code || '').trim();
     const qq = String(body?.qq || '').trim();
     const nickname = String(body?.nickname || '').trim().slice(0, 20);
 
+    // 验证码校验：本地发的自己验，中心发的不存验证码，去问中心
     const rec = codes.get(email);
-    if (!rec) return { ok: false, error: '请先获取验证码' };
-    if (Date.now() - rec.at > CODE_TTL) {
+    if (rec) {
+      // ① 本地验证码
+      if (Date.now() - rec.at > CODE_TTL) {
+        codes.delete(email);
+        return { ok: false, error: '验证码已过期，请重新获取' };
+      }
+      if (rec.tries >= 5) {
+        codes.delete(email);
+        return { ok: false, error: '错误次数太多，请重新获取验证码' };
+      }
+      if (input !== rec.code) {
+        rec.tries++;
+        return { ok: false, error: `验证码不对（还可以试 ${5 - rec.tries} 次）` };
+      }
       codes.delete(email);
-      return { ok: false, error: '验证码已过期，请重新获取' };
-    }
-    if (rec.tries >= 5) {
-      codes.delete(email);
-      return { ok: false, error: '错误次数太多，请重新获取验证码' };
-    }
-    if (input !== rec.code) {
-      rec.tries++;
-      return { ok: false, error: `验证码不对（还可以试 ${5 - rec.tries} 次）` };
+    } else {
+      // ② 中心验证码：本地不存，转发给中心校验
+      try {
+        const res = await fetch(`${CENTER_URL()}/verify`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'User-Agent': UA },
+          body: JSON.stringify({ email, code: input }),
+          signal: AbortSignal.timeout(20000),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok || d?.ok === false) {
+          return { ok: false, error: d?.error || `验证失败（HTTP ${res.status}）` };
+        }
+      } catch (e) {
+        return { ok: false, error: '连不上验证服务：' + String(e?.message ?? e).slice(0, 60) };
+      }
     }
 
     // 通过：写作者档案
     if (qq && !/^\d{5,12}$/.test(qq)) return { ok: false, error: 'QQ 号格式不对' };
-
-    codes.delete(email);
     const author = {
       email,
       qq: qq || '',
@@ -469,7 +539,17 @@ export async function activate(ctx) {
   // 凭据从 /home/lyy/.secrets/market-r2/r2.env 读（600），
   // 不存在时降级为"只改本地"，并在返回值里说明。
 
-  const R2_ENV = '/home/lyy/.secrets/market-r2/r2.env';
+  // 🔴 不写死本机路径（2026-10-25）：别人部署后发布功能要能用
+  //    查找顺序：环境变量 → 项目内 .secrets → 家目录 .secrets
+  const R2_ENV = (() => {
+    if (process.env.BG_R2_ENV) return process.env.BG_R2_ENV;
+    const cands = [
+      path.join(ctx.paths?.root || process.cwd(), '.secrets', 'market-r2', 'r2.env'),
+      path.join(os.homedir(), '.secrets', 'market-r2', 'r2.env')
+    ];
+    for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch { /* ignore */ } }
+    return cands[0];
+  })();
 
   const loadR2 = () => {
     try {
