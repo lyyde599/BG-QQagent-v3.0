@@ -1,9 +1,9 @@
 {
   "id": "plugin-market",
   "name": "BG-QQAgent 创造营",
-  "version": "1.0.0",
+  "version": "1.5.0",
   "apiVersion": 1,
-  "description": "浏览安装社区插件（下载后校验 sha256 再装），发布自己的插件包与技能。支持作者注册（邮箱验证码）、版本管理、改动说明、下架。**核心功能，不可停用**。",
+  "description": "BG-QQAgent 创造营：装插件、发技能。支持作者注册（邮箱验证码走中心服务）、插件打包发布下架卸载、版本自动检查与覆盖更新、Skill 发布管理。核心功能，不可停用。",
   "author": "白光",
   "entry": "index.js",
   "ui": "ui.js",
@@ -18,8 +18,9 @@
     "mirrorUrl": "https://pub-01d4abacd76d41c6b0ea5f6b6bc1d36e.r2.dev/index.json",
     "showUntrusted": false,
     "autoCheckUpdate": true,
-    "checkIntervalHours": 24,
-    "authUrl": "https://auth.597457.xyz/api/auth"
+    "checkIntervalHours": 6,
+    "authUrl": "https://auth.597457.xyz/api/auth",
+    "autoUpdate": false
   },
   "permissions": [
     "network"
@@ -27,7 +28,7 @@
   "scopes": [
     "all"
   ],
-  "category": "工具",
+  "category": "系统工具",
   "summary": "装插件、发技能的市场",
   "uiTab": {
     "id": "plugin-market",

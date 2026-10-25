@@ -339,6 +339,7 @@ export function registerPluginAdmin(host, { getConfig, log }) {
       return { ok: false, error: `删除目录失败：${error?.message ?? error}` };
     }
     host.records.delete(id);
+    host.forgetGeneration?.(id);   // 清掉模块世代号，避免 Map 无限增长
 
     let dataNote = `私有数据保留在 data/plugins/${id}`;
     if (purge) {
@@ -588,6 +589,10 @@ export function registerPluginAdmin(host, { getConfig, log }) {
       try { fs.rmSync(targetDir, { recursive: true, force: true }); }
       catch (error) { return { ok: false, error: `清除旧版本失败：${error?.message ?? error}` }; }
       host.records.delete(id);
+      // 🔴 覆盖安装**不能**清代号（2026-10-25 实踩）
+      //    清了之后新版本从 1 重新开始，?v=1 与首次装载完全相同
+      //    → Node 命中旧缓存 → 「版本号变了、代码没变」。
+      //    代号必须只增不减，才能保证每次覆盖都是新的 URL。
     }
 
     // 包里带了数据吗？（决定要不要清空现有数据，避免新旧数据混在一起）

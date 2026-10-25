@@ -1,6 +1,6 @@
 {
   "name": "qq-agent",
-  "version": "2.9.0",
+  "version": "2.9.14",
   "private": true,
   "description": "Standalone QQ agent desktop app: event-driven stateless agent runs over an OpenAI-compatible API, with a session-style UI. Decoupled from DeepSeek Harness.",
   "type": "module",

@@ -145,6 +145,19 @@ export const DEFAULT_CONFIG = {
       mode: 'cover'     // cover | contain | repeat
     }
   },
+  // ── 界面（2026-10-25）──────────────────────────────
+  //
+  // hidePluginPage：隐藏顶栏内置的「插件」页。
+  //
+  // 背景：装上 plugin-center 之后，它的功能是内置「插件」页的**超集**
+  // （多了按 category 分组、黑名单、救援列表、bulk 开关）。
+  // 两个入口做同一件事，顶栏显得啰嗦。
+  //
+  // 为什么做成开关而不是直接删：没装 plugin-center 的用户会失去插件管理入口。
+  // 默认 false —— 行为与之前完全一致，想清的人自己打开。
+  ui: {
+    hidePluginPage: false
+  },
   // 内核更新（2026-10-25）
   //
   // autoCheck  ：启动后定期查有没有新版本，有就在面板角标提示（不打扰）
@@ -154,8 +167,16 @@ export const DEFAULT_CONFIG = {
     autoCheck: true,
     checkIntervalHours: 24,
     autoDownload: false,
+    // 🔴 autoInstall=true：查到新版自动装（会重启服务一次）
+    //    流程与手动「下载并自动安装」完全一致：
+    //    备份 → 语法自检 → 替换 → 重启 → 健康探测 → 失败自动回滚
+    //    默认关 —— 自动重启对正在用的人有影响，得用户自己开
+    autoInstall: false,
+    // 自动安装前的等待分钟数：避开刚启动时的忙碌期
+    installDelayMinutes: 5,
     lastCheckAt: null,
-    lastSeenVersion: null
+    lastSeenVersion: null,
+    lastInstallAt: null
   },
   // 预算保险丝：今日估算成本达到上限（元）自动暂停；0 = 不限制
   budget: {

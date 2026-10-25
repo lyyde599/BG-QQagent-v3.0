@@ -13,6 +13,61 @@ import { ROOT, DATA_DIR } from '../config.js';
 import { normalizeManifest, PLUGIN_API_VERSION, HOOK_NAMES } from './manifest.js';
 import { createPluginConfig, resolveEnabled } from './plugin-config.js';
 import { registerPluginSkill, unregisterPluginSkills } from '../skill.js';
+import { registerHooks } from 'node:module';
+
+// ── 插件模块缓存击穿（2026-10-25 修）──────────────────────────────
+//
+// 问题：enable() 只给**入口**加了 ?v=，入口里 import 的 ./sub.js、./vendor/*.mjs
+//       按绝对路径被 Node 永久缓存。于是覆盖更新后「版本号变了、代码没变」，
+//       严重时新入口用到子模块的新导出 → ERR_MODULE_NOT_FOUND 直接装不上。
+//
+// 解法：全局注册**唯一一个**解析钩子，给 plugins/<id>/ 下的所有模块统一加 ?v=<代号>。
+//       代号在 enable / 覆盖安装时 +1，整张模块图一起换新。
+//
+// 🔴 四条硬约束（踩过才知道）：
+//   ① 钩子必须全局唯一 —— 不能每次 enable 都 registerHooks，会叠加越来越慢
+//   ② 只动 plugins/ 下的文件 —— 给 src/ 加 query 会让持有模块级状态的
+//      文件（scheduled-tasks 的 tasks 数组）被加载成多份，定时任务异常
+//   ③ 同一插件所有模块用**同一个**代号 —— ab-xxx 里 import ../astrbot-compat/runtime.js
+//      若代号不同，runtime.js 会实例化两次，内部 Map 分裂
+//   ④ ESM 无法卸载，频繁 reload 会缓慢涨内存 —— 面板保留「重启服务」作为彻底清理
+const pluginGen = new Map();   // pluginId -> 代号
+let hooksInstalled = false;
+
+function ensureModuleHooks() {
+  if (hooksInstalled) return;
+  hooksInstalled = true;
+  try {
+    registerHooks({
+      resolve(specifier, context, nextResolve) {
+        const r = nextResolve(specifier, context);
+        if (!r?.url || !r.url.startsWith('file:')) return r;      // node: / 裸模块放过
+        if (r.url.includes('/node_modules/')) return r;            // 依赖包别动
+        const m = /\/plugins\/([^/]+)\//.exec(r.url);
+        if (!m) return r;                                          // 不在插件目录，放过
+
+        // 🔴 按「文件所在插件目录」取代号，不是按「谁发起的导入」。
+        //    原因：ab-xxx 的入口会 import '../astrbot-compat/runtime.js'。
+        //    若按发起方算，同一个 runtime.js 会因两个不同代号被实例化两次，
+        //    它内部的 runners Map 会分裂 → 子进程记账错乱、可能重复拉起。
+        let owner = m[1];
+        let gen = pluginGen.get(owner);
+
+        // 目标插件自身没有代号（没 enable 过）时，退到发起方所在的插件，
+        // 保证它至少跟着调用者一起换新，而不是永远吃老缓存。
+        if (!gen && context?.parentURL) {
+          const p = /\/plugins\/([^/]+)\//.exec(context.parentURL);
+          if (p) gen = pluginGen.get(p[1]);
+        }
+        if (!gen) return r;
+        return { ...r, url: r.url + (r.url.includes('?') ? '&' : '?') + 'v=' + gen };
+      }
+    });
+  } catch (e) {
+    // 老 Node 没有 registerHooks —— 降级为「只有入口换新」，不会崩
+    console.warn('[plugins] registerHooks 不可用，插件子模块更新需重启服务：', e?.message ?? e);
+  }
+}
 
 const PLUGINS_DIR = path.join(ROOT, 'plugins');
 
@@ -195,7 +250,11 @@ export class PluginHost {
 
     let handle = null;
     try {
-      const mod = await import(pathToFileURL(entryFile).href + `?v=${Date.now()}`);
+      // 用「代号」而不是时间戳：钩子要靠它给同一插件的所有子模块加同一个 ?v=
+      ensureModuleHooks();
+      const gen = (pluginGen.get(id) || 0) + 1;
+      pluginGen.set(id, gen);
+      const mod = await import(pathToFileURL(entryFile).href + `?v=${gen}`);
       const activate = mod.activate || mod.default;
       if (typeof activate !== 'function') throw new Error('没有导出 activate(ctx) 函数');
       handle = await activate(ctx);
@@ -257,15 +316,29 @@ export class PluginHost {
   }
 
   /** 重新启用（面板用） */
+  /**
+   * 忘掉某插件的模块世代号（卸载时调）。
+   *
+   * 不清的话 Map 会随着装卸次数无限增长。
+   * 注意：这**不会**卸载已加载的 ESM 模块（Node 没有这个能力），
+   * 只是不再给它加新的 ?v=，下次重装会从 1 重新开始。
+   */
+  forgetGeneration(id) {
+    pluginGen.delete(id);
+  }
+
   async reload(id) {
     const rec = this.records.get(id);
-    // manifest 可能为空（首次装载就失败、或从未装载过的新插件）——
-    // 此时不能直接报错，要回磁盘重读一份再试，否则"修复后重载"永远走不通。
-    let manifest = rec?.manifest;
-    if (!manifest) {
-      manifest = this.#readManifest(id);
-      if (!manifest) return { ok: false, error: '没有该插件的 manifest（文件缺失或校验失败）' };
-    }
+    // 🔴 磁盘优先（2026-10-25 修）
+    //
+    // 原来先用内存里那份 manifest —— 于是手改 manifest.json
+    // （版本号 / 默认配置 / 权限 / 展示名）后点「重载」完全不生效，必须重启服务。
+    // 「重载」的语义就是「让磁盘上那份生效」，所以必须回磁盘读。
+    // 读不到磁盘才退回内存（兜底，避免把原本能跑的重载搞挂）。
+    const fresh = this.#readManifest(id);
+    const manifest = fresh || rec?.manifest;
+    if (!manifest) return { ok: false, error: '没有该插件的 manifest（文件缺失或校验失败）' };
+
     if (rec) await this.disable(id);
     const again = await this.enable(manifest);
     return { ok: again?.status === 'enabled', status: again?.status, error: again?.lastError };

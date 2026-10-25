@@ -1688,15 +1688,66 @@ function applyProviderPick(value, { silent = false } = {}) {
  * 插件卸载后页签还在，点进去就是"未知 API"报错。
  * 现在插件没了页签也没了，视图容器一并清理。
  */
+/**
+ * 按配置隐藏内置「插件」页（2026-10-25）
+ *
+ * 用户反馈：装上 plugin-center 后，「插件中心」与内置「插件」功能重复，
+ * 而且插件中心是超集（分组折叠、黑名单、救援列表、批量开关）。
+ *
+ * 设计取舍：
+ *   · 默认 false，行为与之前完全一致
+ *   · 只在检测到 plugin-center 时生效 —— 否则藏了就没入口了
+ *   · 幂等：重复调用不会出错（摘除是 remove，已删再删是空操作）
+ *
+ * @returns {boolean} 是否真的隐藏了
+ */
+function applyHidePluginPage(tabs = []) {
+  if (state.config?.ui?.hidePluginPage !== true) return false;
+
+  // 没装插件中心时忽略该配置，避免用户失去插件管理入口
+  const hasCenter = tabs.some((t) => t.id === 'plugin-center');
+  if (!hasCenter) {
+    if (!state.__hidePluginWarned) {
+      state.__hidePluginWarned = true;
+      console.warn('[ui] ui.hidePluginPage 已开启，但没检测到 plugin-center，已忽略（否则会失去插件管理入口）');
+    }
+    return false;
+  }
+
+  $('#tab-plugins')?.remove();
+  $('#view-plugins')?.remove();
+
+  // 如果用户正停在被隐藏的页，切到插件中心
+  if (state.tab === 'plugins') {
+    state.tab = 'plugin-center';
+    $$('.tab').find((x) => x.dataset.tab === 'plugin-center')?.click();
+  }
+  return true;
+}
+
 async function syncPluginTabs() {
   const holder = $('#plugin-tabs');
   if (!holder) return;
+
+  // 🔴 配置要单独拉一次（2026-10-25）
+  //
+  // state.config 原本只在用户打开「设置」页时才由 loadSettings 赋值。
+  // 而本函数在**页面启动时**就跑，那时 state.config 还是空对象 →
+  // ui.hidePluginPage 读不到，开关形同虚设。
+  // 这里补一次轻量请求（同一个接口，浏览器有缓存，代价很小）。
+  if (!state.config || !('ui' in state.config) || !Object.keys(state.config).length) {
+    try { state.config = await api('/api/config'); } catch { /* 拉不到就跳过隐藏 */ }
+  }
+
   let tabs = [];
   try {
     const d = await api('/api/plugins');
     // 只保留"要占顶栏"的插件页签；inline 的收在插件页里渲染
     tabs = (d.tabs || []).filter((t) => t.inline !== true);
   } catch { tabs = []; }
+
+  // 即使页签没变化，也要把「隐藏内置插件页」跑一遍（它与插件页签无关）
+  applyHidePluginPage(tabs);
 
   const want = tabs.map((t) => t.id).join(',');
   if (holder.dataset.sig === want) return;      // 没变化就不重绘（避免闪）
@@ -1730,8 +1781,10 @@ async function syncPluginTabs() {
   //    服务端 HTML 明明有，DOM 里却找不到，页签点开一片空白。
   //
   //    凡是 ui/index.html 里写死的 <section id="view-xxx">，都必须在这里列出。
+  const hidePluginPage = applyHidePluginPage(tabs);
   const alive = new Set(tabs.map((t) => t.id));
-  const builtin = ['sessions', 'chats', 'snowluma', 'plugins', 'skills', 'settings', 'market'];
+  const builtin = ['sessions', 'chats', 'snowluma', 'skills', 'settings', 'market']
+    .concat(hidePluginPage ? [] : ['plugins']);
   $$('[id^="view-"]').forEach((v) => {
     const id = v.id.slice(5);
     if (!builtin.includes(id) && !alive.has(id)) v.remove();
@@ -1786,7 +1839,31 @@ async function loadMarketPage() {
       return;
     }
     box.innerHTML = '';
-    await mount(box, { ...pluginUiContext('plugin-market'), openPluginPanel });
+    await mount(box, {
+      ...pluginUiContext('plugin-market'),
+      openPluginPanel,
+      // 🔴 提供"只重挂这个面板"的能力（2026-10-25）
+      //
+      // 用户反馈："创作营刷新的时候能不能不刷新网页，只刷新这个窗口"
+      //
+      // 原来插件内部用的是 location.reload() —— 整页重载：
+      //   · 会话列表、滚动位置全部丢失
+      //   · 要重新请求所有接口，慢
+      //   · 用户在别的页签切回来时体验很差
+      //
+      // 这里给一个 remount()：清空当前容器、重新 mount。
+      // 效果上等价于"刷新这个窗口"，但不动整个页面。
+      remount: async () => {
+        const fresh = await loadPluginUi('plugin-market', meta.ui || 'ui.js');
+        const m2 = fresh?.mountPanel || fresh?.mount;
+        if (typeof m2 !== 'function') return;
+        box.innerHTML = '';
+        await m2(box, {
+          ...pluginUiContext('plugin-market'),
+          openPluginPanel,
+        });
+      },
+    });
     box.dataset.mounted = '1';
   } catch (e) {
     box.innerHTML = `<div class="card"><h3>创造营</h3>
@@ -1833,6 +1910,194 @@ function dispatchTabLoad(name) {
 //   · 不放进任何 Tab 首屏，用户主动点「关于」才看得到
 //
 // 群信息在 src/config.js 的 COMMUNITY 里，改群号只需改那一处。
+/**
+ * BUG 反馈 / 优化建议页（2026-10-25）
+ *
+ * 放在设置最下面。需要创造营登录 —— 复用作者账号，不另建体系。
+ * 未登录只给提示，不给表单（避免提交后被后端拒，白填）。
+ */
+async function renderFeedbackSection() {
+  const pane = $('#settings-form');
+  if (!pane) return;
+  pane.innerHTML = '<div class="muted" style="padding:16px">加载中…</div>';
+
+  let st;
+  try {
+    st = await api('/api/feedback/ping');
+  } catch (e) {
+    pane.innerHTML = `<div class="card"><div class="error">加载失败：${esc(e.message)}</div></div>`;
+    return;
+  }
+
+  // 未登录：只给引导
+  if (!st?.logged) {
+    pane.innerHTML = `
+      <div class="card">
+        <h3>BUG 反馈</h3>
+        <p class="muted" style="font-size:13px;line-height:1.8">
+          这个功能需要先登录创造营作者账号。<br>
+          到 <b>BG创造营 → 发布 → 作者账号</b> 注册或用邮箱密码登录，回来就能提交。
+        </p>
+      </div>`;
+    return;
+  }
+
+  const who = st.who || {};
+  const env = st.env || {};
+  const stats = st.stats || {};
+
+  pane.innerHTML = `
+    <div class="card">
+      <h3>BUG 反馈 / 优化建议</h3>
+      <p class="muted" style="font-size:13px;line-height:1.7">
+        提交内核的问题报告或改进想法。可以附错误日志、也可以直接传一份 .md。
+        提交时会<b>自动带上运行环境</b>（版本、Node、平台），不用你手抄。
+      </p>
+      <div class="muted" style="font-size:12px;margin-top:8px">
+        当前登录：<b>${esc(who.nickname || who.email || '')}</b>
+        · 已提交 ${esc(String(stats.total ?? 0))} 条
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="field" style="margin-bottom:12px">
+        <label class="muted" style="font-size:12.5px">类型</label>
+        <select id="fb-type" style="max-width:200px">
+          <option value="bug">BUG / 报错</option>
+          <option value="feature">优化建议</option>
+          <option value="other">其它</option>
+        </select>
+      </div>
+
+      <div class="field" style="margin-bottom:12px">
+        <label class="muted" style="font-size:12.5px">标题</label>
+        <input id="fb-title" placeholder="一句话说清问题，如「插件覆盖更新后版本号不对」" style="width:100%" />
+      </div>
+
+      <div class="field" style="margin-bottom:12px">
+        <label class="muted" style="font-size:12.5px">详细描述 / 错误日志</label>
+        <textarea id="fb-body" rows="10" style="width:100%;font-family:ui-monospace,monospace;font-size:12.5px"
+          placeholder="怎么复现、看到什么、期望什么。报错栈可以直接粘进来。"></textarea>
+      </div>
+
+      <div class="field" style="margin-bottom:12px">
+        <label class="muted" style="font-size:12.5px">附件（可选，.md / .txt / .log，≤2MB）</label>
+        <div class="row" style="gap:8px;align-items:center">
+          <input type="file" id="fb-file" accept=".md,.txt,.log,.json" style="font-size:12.5px" />
+          <span id="fb-file-name" class="muted" style="font-size:12px"></span>
+        </div>
+      </div>
+
+      <details style="margin-bottom:12px">
+        <summary class="muted" style="font-size:12.5px;cursor:pointer">会附带哪些环境信息</summary>
+        <pre class="muted" style="font-size:11.5px;line-height:1.6;margin:8px 0 0;white-space:pre-wrap">${esc(JSON.stringify(env, null, 2))}</pre>
+      </details>
+
+      <div class="row" style="gap:10px;align-items:center">
+        <button class="btn primary" id="fb-submit">提交反馈</button>
+        <span id="fb-msg" class="muted" style="font-size:12.5px"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>我提交过的</h3>
+      <div id="fb-list" class="muted" style="font-size:13px">加载中…</div>
+    </div>`;
+
+  bindFeedbackEvents();
+  loadFeedbackList();
+}
+
+/** 反馈页事件 */
+function bindFeedbackEvents() {
+  const msg = (s, ok) => {
+    const el = $('#fb-msg');
+    if (!el) return;
+    el.textContent = s;
+    el.style.color = ok ? 'var(--ok, #2f855a)' : 'var(--err, #b91c1c)';
+  };
+
+  let file = null;
+  $('#fb-file')?.addEventListener('change', (ev) => {
+    file = ev.target.files?.[0] || null;
+    const n = $('#fb-file-name');
+    if (n) n.textContent = file ? `${file.name}（${(file.size / 1024).toFixed(0)}KB）` : '';
+  });
+
+  $('#fb-submit')?.addEventListener('click', async () => {
+    const type = $('#fb-type')?.value || 'bug';
+    const title = ($('#fb-title')?.value || '').trim();
+    const body = ($('#fb-body')?.value || '').trim();
+    if (!title) return msg('请填标题');
+
+    msg('提交中…', true);
+    try {
+      let attachBase64 = '';
+      let attachName = '';
+      if (file) {
+        if (file.size > 2 * 1024 * 1024) return msg('附件超过 2MB');
+        attachBase64 = await new Promise((resolve, reject) => {
+          const fr = new FileReader();
+          fr.onload = () => resolve(String(fr.result || '').split(',')[1] || '');
+          fr.onerror = () => reject(new Error('附件读取失败'));
+          fr.readAsDataURL(file);
+        });
+        attachName = file.name;
+      }
+
+      const r = await api('/api/feedback/submit', {
+        method: 'POST',
+        body: { type, title, body, attachBase64, attachName }
+      });
+      if (!r.ok) return msg('失败：' + (r.error || ''));
+
+      msg(`✅ 已提交（编号 ${r.id}）`, true);
+      toast('反馈已提交，谢谢');
+      // 清空表单并刷新列表
+      const ti = $('#fb-title'); if (ti) ti.value = '';
+      const bo = $('#fb-body'); if (bo) bo.value = '';
+      const fi = $('#fb-file'); if (fi) fi.value = '';
+      const fn = $('#fb-file-name'); if (fn) fn.textContent = '';
+      file = null;
+      loadFeedbackList();
+    } catch (e) {
+      msg('失败：' + e.message);
+    }
+  });
+}
+
+/** 拉「我提交过的」 */
+async function loadFeedbackList() {
+  const box = $('#fb-list');
+  if (!box) return;
+  try {
+    const r = await api('/api/feedback/list');
+    if (!r.ok) {
+      box.textContent = '读取失败：' + (r.error || '');
+      return;
+    }
+    const items = r.items || [];
+    if (!items.length) {
+      box.innerHTML = '<span class="muted">还没有提交过</span>';
+      return;
+    }
+    const label = { bug: 'BUG', feature: '建议', other: '其它' };
+    box.innerHTML = `
+      <table class="table">
+        <thead><tr><th>类型</th><th>标题</th><th>提交时间</th><th>附件</th></tr></thead>
+        <tbody>${items.map((x) => `
+          <tr>
+            <td style="font-size:12px">${esc(label[x.type] || x.type)}</td>
+            <td>${esc(x.title)}</td>
+            <td class="muted" style="font-size:12px">${esc(fmtTime(x.submittedAt))}</td>
+            <td class="muted" style="font-size:12px">${x.attach ? esc(x.attach.name) : '—'}</td>
+          </tr>`).join('')}</tbody>
+      </table>`;
+  } catch (e) {
+    box.textContent = '读取失败：' + e.message;
+  }
+}
+
 function renderAboutSection(c) {
   const k = (c && c.community) || {};
   const qq = String(k.number || '').trim();
@@ -1980,7 +2245,23 @@ function renderAppearanceSection(c) {
     <p class="muted" style="font-size:12px;margin-top:10px">
       图片以 dataURL 存进 <code>data/config.json</code>，上限 2MB。<br>
       背景图只存在本机，不会随插件包导出。
-    </p>`;
+    </p>
+
+    <div class="card" style="margin-top:20px">
+      <h3>界面入口</h3>
+      <label class="row" style="gap:8px;font-size:13px;align-items:flex-start">
+        <input type="checkbox" id="hide-plugin-page" ${c?.ui?.hidePluginPage === true ? 'checked' : ''}>
+        <span>
+          隐藏顶栏的「插件」页
+          <div class="muted" style="font-size:12px;margin-top:4px;line-height:1.7">
+            装上「插件中心」之后，它和内置「插件」页功能重复，
+            而插件中心还多了分组折叠、黑名单、救援列表、批量开关。<br>
+            勾上后顶栏少一个入口，插件管理全部由插件中心承接。<br>
+            <b>没装插件中心时这项会被自动忽略</b>，不会让你失去入口。
+          </div>
+        </span>
+      </label>
+    </div>`;
 }
 
 /** 外观面板的事件绑定（由 bindSettingsEvents 调用） */
@@ -2044,6 +2325,21 @@ function bindAppearanceEvents() {
     try { await saveAppearance({ background: { mode: ev.target.value } }); }
     catch (e) { toast('保存失败：' + e.message); }
   });
+
+  // 隐藏内置「插件」页（2026-10-25）
+  $('#hide-plugin-page')?.addEventListener('change', async (ev) => {
+    const on = ev.target.checked;
+    try {
+      await api('/api/config', { method: 'POST', body: { ui: { hidePluginPage: on } } });
+      state.config = { ...(state.config || {}), ui: { ...(state.config?.ui || {}), hidePluginPage: on } };
+      toast(on ? '已隐藏，正在刷新…' : '已恢复，正在刷新…');
+      // 需要重载页面才生效（页签是启动时渲染的）
+      setTimeout(() => location.reload(), 600);
+    } catch (e) {
+      ev.target.checked = !on;
+      toast('保存失败：' + e.message);
+    }
+  });
 }
 
 
@@ -2059,7 +2355,8 @@ function renderSettingsSidebar() {
     ['appearance', '外观'],
     ['desktop', '桌面端'],
     ['onebot', 'OneBot（SnowLuma）'],
-    ['about', '关于']
+    ['about', '关于'],
+    ['feedback', 'BUG 反馈']
   ];
   sidebar.innerHTML = `
     <div class="settings-runstate">
@@ -2086,6 +2383,11 @@ function renderSettings() {
   box.innerHTML = `
     ${renderSettingsSection(c)}`;
   bindSettingsEvents(c);
+
+  // 「BUG 反馈」也自带异步渲染（要先查创造营登录态）
+  if ((state.settingsSection || 'api') === 'feedback') {
+    renderFeedbackSection();
+  }
 
   // 「关于」区需要 /api/about 的数据（群信息、Node 版本），
   // 是异步的，所以先渲染空壳再补内容 —— 不阻塞其它设置项。
@@ -2126,10 +2428,65 @@ function renderSettings() {
           setMsg(`有新版本 ${rel.version}（当前 ${r.current}）`);
           setBody(`
             <div style="margin-bottom:8px">${esc(String(rel.notes || '').slice(0, 600)).replace(/\n/g, '<br>')}</div>
-            <div style="margin-top:8px">
-              <button class="btn tiny" id="about-dl">下载更新包</button>
-              <span class="muted" style="font-size:11.5px;margin-left:8px">只下载不覆盖，下载后给你安装指引</span>
-            </div>`);
+            <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <button class="btn primary tiny" id="about-autoinstall">下载并自动安装</button>
+              <button class="btn tiny" id="about-dl">只下载</button>
+              <span class="muted" style="font-size:11.5px">自动安装会重启服务（约 30~90 秒），失败自动回滚</span>
+            </div>
+            <div id="about-installer-note" class="muted" style="font-size:11.5px;margin-top:6px"></div>`);
+
+          // 提示安装脚本是否太旧（太旧会导致更新失败/502）
+          api('/api/kernel/installer-check').then((r) => {
+            const el = $('#about-installer-note');
+            if (!el) return;
+            if (r?.outdated) {
+              el.innerHTML = `<span style="color:#b45309">⚠ 本机安装脚本是旧版（${esc(r.current || '无标记')}，需要 ${esc(r.required || '?')}）。`
+                + `本次安装会自动使用新包里的脚本，不影响；但装完会自动更新。</span>`;
+            } else {
+              el.innerHTML = `<span style="color:#2f855a">✓ 安装脚本已是最新（${esc(r?.current || '?')}）</span>`;
+            }
+          }).catch(() => {});
+
+          // 一键：下载 → 安装 → 轮询日志
+          $('#about-autoinstall')?.addEventListener('click', async () => {
+            if (!confirm('将自动安装并重启服务（约 30~90 秒不可用）。\n\n流程：备份 → 替换 → 重启 → 健康探测 → 失败自动回滚。\n继续？')) return;
+            setMsg('下载中…');
+            setBody('');
+            try {
+              const d2 = await api('/api/kernel/download', { method: 'POST' });
+              if (!d2.ok) { setMsg('下载失败：' + (d2.error || '未知')); return; }
+              if (d2.upToDate) { setMsg('已是最新'); return; }
+
+              setMsg('安装中，服务即将重启…');
+              const inst = await api('/api/kernel/install', { method: 'POST', body: {} });
+              if (!inst.ok) { setMsg('安装未启动：' + (inst.error || '未知')); return; }
+
+              // 轮询日志
+              let last = '';
+              const timer = setInterval(async () => {
+                try {
+                  const r = await api('/api/kernel/install-log');
+                  const lines = String(r.log || '').trim().split('\n').slice(-6);
+                  const tail = lines.join('\n');
+                  if (tail !== last) {
+                    last = tail;
+                    setBody(`<pre style="font-size:11.5px;line-height:1.6;white-space:pre-wrap;margin:0">${esc(tail)}</pre>`);
+                  }
+                  if (/安装成功/.test(r.log)) {
+                    clearInterval(timer);
+                    setMsg('✅ 安装成功，正在刷新…');
+                    setTimeout(() => location.reload(), 1500);
+                  } else if (/安装失败/.test(r.log)) {
+                    clearInterval(timer);
+                    setMsg('❌ 安装失败，已自动回滚，请查看日志');
+                  }
+                } catch { /* 服务重启中，接口暂时不可用，继续轮询 */ }
+              }, 3000);
+
+              // 90 秒后停止轮询
+              setTimeout(() => clearInterval(timer), 90000);
+            } catch (e) { setMsg('失败：' + e.message); }
+          });
           $('#about-dl')?.addEventListener('click', async () => {
             setMsg('下载中…');
             try {
@@ -2159,6 +2516,8 @@ function renderSettings() {
         try { cfgNow = (await api('/api/config'))?.kernelUpdate || {}; } catch { /* ignore */ }
         const onCheck = cfgNow.autoCheck !== false;
         const onDl = cfgNow.autoDownload === true;
+        const onInst = cfgNow.autoInstall === true;
+        const installDelay = Number(cfgNow.installDelayMinutes) || 5;
         const lastAt = cfgNow.lastCheckAt ? fmtTime(cfgNow.lastCheckAt) : '尚未检查';
 
         box.innerHTML = `
@@ -2170,25 +2529,60 @@ function renderSettings() {
             </label>
             <label class="row" style="gap:6px;font-size:13px;margin-top:6px">
               <input type="checkbox" id="kc-dl" ${onDl ? 'checked' : ''}>
-              发现新版后自动下载并校验（<b>不会自动安装</b>）
+              发现新版后自动下载并校验（不会安装）
             </label>
+            <label class="row" style="gap:6px;font-size:13px;margin-top:6px">
+              <input type="checkbox" id="kc-inst" ${onInst ? 'checked' : ''}>
+              <b>自动安装</b>（下载后自动装，<b>会重启服务一次</b>）
+            </label>
+            <div id="kc-inst-hint" class="muted" style="font-size:12px;margin-top:6px;padding-left:22px;${onInst ? '' : 'display:none'}">
+              安装前等待 <input id="kc-delay" type="number" min="1" max="120" value="${installDelay}" style="width:56px;font-size:12px;padding:1px 4px"> 分钟
+              （留出取消时间）。流程：备份 → 语法自检 → 替换 → 重启 → 健康探测，
+              <b>失败自动回滚</b>。期间服务会断 30~90 秒。
+            </div>
             <div class="muted" style="font-size:12px;margin-top:8px">
               上次检查：${esc(lastAt)} · 每 ${esc(String(cfgNow.checkIntervalHours || 24))} 小时一次
             </div>
             <div class="muted" style="font-size:12px;margin-top:4px">
-              内核替换永远需要你手动确认 —— 自动覆盖会把本机定制改动冲掉。
+              不开启自动安装时，替换内核永远需要你手动确认。
+              开启后每次都会先备份，装坏了自动回滚到备份。
             </div>
           </div>`;
 
+        // 🔴 只传**变更的键**，不要把整个 cfgNow 回写（2026-10-25 修）
+        //
+        // 原来的写法 body: { kernelUpdate: { ...cfgNow, ...patch } } 有隐患：
+        // cfgNow 是打开页面那一刻的快照，里面还带着 lastSeenVersion /
+        // lastInstallAt 这类会变动的字段。用户在别的开关上点一下，
+        // 就会把这份**过期快照**整体写回，覆盖掉后台刚更新的值。
+        // 深合并只补不改，这里传最小差异集最安全。
         const save = async (patch) => {
           try {
-            await api('/api/config', { method: 'POST', body: { kernelUpdate: { ...cfgNow, ...patch } } });
+            await api('/api/config', { method: 'POST', body: { kernelUpdate: patch } });
             cfgNow = { ...cfgNow, ...patch };
             toast('已保存');
           } catch (e) { toast('保存失败：' + e.message); }
         };
         box.querySelector('#kc-auto')?.addEventListener('change', (ev) => save({ autoCheck: ev.target.checked }));
         box.querySelector('#kc-dl')?.addEventListener('change', (ev) => save({ autoDownload: ev.target.checked }));
+
+        box.querySelector('#kc-inst')?.addEventListener('change', (ev) => {
+          const on = ev.target.checked;
+          const hint = box.querySelector('#kc-inst-hint');
+          if (hint) hint.style.display = on ? '' : 'none';
+          if (on && !confirm('开启自动安装后，每次发现新版本会在延时后自动替换内核并重启服务。\n\n失败会自动回滚，但期间服务会中断 30~90 秒。\n\n确定开启？')) {
+            ev.target.checked = false;
+            if (hint) hint.style.display = 'none';
+            return;
+          }
+          save({ autoInstall: on });
+        });
+
+        box.querySelector('#kc-delay')?.addEventListener('change', (ev) => {
+          const n = Math.max(1, Math.min(120, Number(ev.target.value) || 5));
+          ev.target.value = n;
+          save({ installDelayMinutes: n });
+        });
       })();
 
       // ── 作者发布区（2026-10-25）──
@@ -2273,7 +2667,10 @@ function renderSettingsSection(c) {
     desktop: () => renderDesktopSection(c),
     onebot: () => renderOnebotSection(c),
     appearance: () => renderAppearanceSection(c),
-    about: () => renderAboutSection(c)
+    about: () => renderAboutSection(c),
+    // BUG 反馈页自带异步渲染（要查登录态），这里给空壳，实际内容由
+    // renderFeedbackSection() 在设置渲染后填充
+    feedback: () => '<div class="card" id="fb-shell"><div class="muted" style="padding:16px">加载中…</div></div>'
   };
   const render = sections[sec] || sections.api;
   const saveBar = `
@@ -2281,8 +2678,10 @@ function renderSettingsSection(c) {
       <button class="btn btn-primary" id="save-cfg-btn">保存设置</button>
       <span id="cfg-save-result" class="muted"></span>
     </div>`;
+  // BUG 反馈不是配置项，是自己带提交按钮的表单，不该出现「保存设置」
+  const noSaveBar = sec === 'feedback';
   return `
-    ${saveBar}
+    ${noSaveBar ? '' : saveBar}
     ${render()}`;
 }
 

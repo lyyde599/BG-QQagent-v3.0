@@ -10,6 +10,40 @@
 export async function mountPanel(box, ctx) {
   const { api, esc } = ctx;
 
+  // 北京时间格式化（内核已锁 TZ=Asia/Shanghai，这里只管显示成好读的样子）
+  const fmtTime = (iso) => {
+    if (!iso) return '—';
+    try {
+      const d = new Date(iso);
+      const p = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    } catch { return String(iso); }
+  };
+
+  // ── 局部刷新（2026-10-25）──
+  //
+  // 用户反馈："创作营刷新的时候能不能不刷新网页，只刷新这个窗口"
+  //
+  // 原来用 location.reload() —— 整页重载，会话列表/滚动位置全丢，
+  // 还要重新请求所有接口。现在改成 ctx.remount()：
+  // 只清空这个容器重新挂载，等价于"刷新这个窗口"。
+  //
+  // 兜底：内核没提供 remount（老版本）才退回整页刷新。
+  // 记住当前在哪个标签 —— 重挂后要回到原处，否则每次刷新都跳回第一个标签
+  const rememberPane = () => {
+    try { return sessionStorage.getItem('cy_last_pane') || 'plugins'; } catch { return 'plugins'; }
+  };
+  const savePane = (id) => {
+    try { sessionStorage.setItem('cy_last_pane', id); } catch { /* ignore */ }
+  };
+
+  const refreshPanel = () => {
+    if (typeof ctx.remount === 'function') {
+      try { return ctx.remount(); } catch { /* 落到下面 */ }
+    }
+    try { location.reload(); } catch { /* ignore */ }
+  };
+
   // ── 拉数据 ──
   let market = { ok: false, plugins: [] };
   let marketCfg = {};
@@ -36,7 +70,7 @@ export async function mountPanel(box, ctx) {
   const pluginCards = (market.plugins || []).map((p) => {
     const t = TRUST[p.trust] || TRUST.unverified;
     return `
-      <div class="cy-card cy-card-2col">
+      <div class="cy-card cy-card-2col" data-pid="${esc(p.id)}" data-cat="${esc(p.category || '未分类')}">
         <div class="cy-card-main">
           <div class="cy-card-head">
             <span class="cy-name">${esc(p.name || p.id)}</span>
@@ -50,12 +84,15 @@ export async function mountPanel(box, ctx) {
           <div class="cy-desc">${esc(p.description || p.summary || '')}</div>
           ${(p.permissions || []).length ? `<div class="cy-perms">权限：${esc((p.permissions || []).join('、'))}</div>` : ''}
         </div>
-        <div class="cy-card-act">
+        <div class="cy-card-act" style="flex-direction:column;gap:6px;align-items:flex-end">
           ${p.installed
             ? (p.updatable
                 ? `<button class="btn tiny" data-install="${esc(p.id)}" data-confirm="${p.trust === 'unverified' ? 1 : 0}">更新</button>`
                 : `<span class="cy-installed">已安装</span>`)
             : `<button class="btn tiny primary" data-install="${esc(p.id)}" data-confirm="${p.trust === 'unverified' ? 1 : 0}">安装</button>`}
+          ${p.trust === 'unverified'
+            ? `<button class="btn tiny" data-trust-ok="${esc(p.id)}" title="标记为已审核，之后不再提示风险">审核通过</button>`
+            : ''}
         </div>
       </div>`;
   }).join('');
@@ -152,6 +189,18 @@ export async function mountPanel(box, ctx) {
         .cy-card-act { justify-content:flex-start; }
       }
       .cy-empty { font-size:12.5px; color:var(--muted,#888); padding:20px; text-align:center; }
+      .cy-group-title { font-size:13px; font-weight:640; margin:18px 0 10px;
+                        display:flex; align-items:center; gap:8px; }
+      .cy-group-title:first-child { margin-top:0; }
+      .cy-group-hint { font-size:11.5px; font-weight:400; color:var(--muted,#999); }
+
+      /* 分类筛选栏（2026-10-25） */
+      .cy-cats { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; }
+      .cy-cat { font-size:12px; padding:4px 11px; border-radius:14px; cursor:pointer;
+                border:1px solid var(--line); background:var(--bg,#fff); color:var(--muted,#888);
+                user-select:none; transition:all .12s; }
+      .cy-cat:hover { border-color:var(--acc); color:var(--fg,#222); }
+      .cy-cat.on { background:var(--acc); color:var(--on-acc,#fff); border-color:var(--acc); }
       .cy-box { border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-bottom:12px; }
       .cy-row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size:13px; }
       .cy-label { font-size:12.5px; display:block; margin-bottom:4px; color:var(--muted,#888); }
@@ -212,7 +261,7 @@ export async function mountPanel(box, ctx) {
       </div>
 
       <div class="cy-nav">
-        <button class="cy-tab on" data-pane="plugins">插件市场</button>
+        <button class="cy-tab" data-pane="plugins">插件市场</button>
         <button class="cy-tab" data-pane="mine">我的插件</button>
         <button class="cy-tab" data-pane="skills">技能库</button>
         <button class="cy-tab" data-pane="publish">发布</button>
@@ -221,7 +270,7 @@ export async function mountPanel(box, ctx) {
       </div>
 
       <!-- 插件市场 -->
-      <div class="cy-pane on" id="cy-pane-plugins">
+      <div class="cy-pane" id="cy-pane-plugins">
         <div class="cy-row" style="margin-bottom:10px">
           <span style="font-size:12.5px;color:var(--muted,#888)">
             共 ${market.total ?? 0} 个插件　源：${esc((market.source || '').replace(/^https?:\/\//, '').slice(0, 40) || '—')}${market.cached ? '（缓存）' : ''}
@@ -231,7 +280,8 @@ export async function mountPanel(box, ctx) {
         </div>
         ${market.warning ? `<div class="cy-box" style="border-color:#b7791f">⚠️ ${esc(market.warning)}</div>` : ''}
         ${!market.ok ? `<div class="cy-box">${esc(market.error || '拿不到市场清单')}</div>` : ''}
-        ${pluginCards || '<div class="cy-empty">清单是空的</div>'}
+        <div class="cy-cats" id="cy-cats"></div>
+        <div id="pm-list">${pluginCards || '<div class="cy-empty">清单是空的</div>'}</div>
         <div id="cy-msg" class="cy-meta" style="margin-top:8px"></div>
       </div>
 
@@ -240,8 +290,11 @@ export async function mountPanel(box, ctx) {
         <div class="cy-row" style="margin-bottom:12px">
           <span id="cy-mine-count" style="font-size:12.5px;color:var(--muted,#888)">加载中…</span>
           <span class="cy-spacer" style="flex:1"></span>
+          <button class="btn tiny" id="cy-check-upd">检测新版本</button>
+          <button class="btn tiny" id="cy-upd-all" style="display:none">全部更新</button>
           <button class="btn tiny" id="cy-mine-refresh">刷新</button>
         </div>
+        <div id="cy-upd-banner" style="display:none;margin-bottom:12px"></div>
         <div id="cy-mine-list"></div>
       </div>
 
@@ -258,13 +311,111 @@ export async function mountPanel(box, ctx) {
         <div class="cy-box" id="cy-author-box">
           <div class="cy-label">作者账号</div>
           <div id="cy-author-state" style="font-size:12.5px;color:var(--muted,#888)">检查中…</div>
+
+          <!-- 账密登录（2026-10-25）：验证码之外的第二种登录方式 -->
+          <div id="cy-login-box" style="margin-top:12px;padding-top:10px;border-top:1px dashed var(--line,#e5e5e5)">
+            <div style="font-size:12.5px;font-weight:600;margin-bottom:8px">邮箱密码登录</div>
+            <div class="cy-row" style="margin-bottom:6px">
+              <input id="cy-login-email" placeholder="邮箱" style="flex:1;min-width:200px;font-size:12.5px">
+              <input id="cy-login-pw" type="password" placeholder="密码" style="flex:1;min-width:160px;font-size:12.5px">
+            </div>
+            <div class="cy-row" style="flex-wrap:wrap">
+              <button class="btn tiny primary" id="cy-login-go">登录</button>
+              <button class="btn tiny" id="cy-login-setpw">设 / 改密码</button>
+              <button class="btn tiny" id="cy-login-forgot">忘记密码</button>
+              <span id="cy-login-msg" class="muted" style="font-size:12px"></span>
+            </div>
+
+            <!-- 找回密码（2026-10-25）：邮箱验证码 → 设新密码 -->
+            <div id="cy-reset-box" style="display:none;margin-top:10px;padding:10px 12px;border:1px dashed var(--line,#e5e5e5);border-radius:6px">
+              <div style="font-size:12.5px;font-weight:600;margin-bottom:8px">找回密码</div>
+              <div class="cy-row" style="margin-bottom:6px">
+                <input id="cy-reset-email" placeholder="注册邮箱" style="flex:1;min-width:200px;font-size:12.5px">
+                <button class="btn tiny" id="cy-reset-send">发送验证码</button>
+              </div>
+              <div class="cy-row" style="margin-bottom:6px">
+                <input id="cy-reset-code" placeholder="邮箱收到的验证码" style="width:170px;font-size:12.5px">
+              </div>
+              <div class="cy-row">
+                <input id="cy-reset-pw" type="password" placeholder="新密码（至少 8 位）" style="flex:1;min-width:200px;font-size:12.5px">
+                <button class="btn tiny primary" id="cy-reset-go">重置密码</button>
+              </div>
+              <div id="cy-reset-msg" class="muted" style="font-size:12px;margin-top:6px"></div>
+              <div class="cy-hint" style="margin-top:6px">
+                验证码 10 分钟有效。重置后旧密码立即失效。
+              </div>
+            </div>
+            <div class="cy-hint" style="margin-top:6px">
+              密码至少 8 位，需包含字母、数字、符号中的两类。
+              没设过密码就用邮箱验证码注册，注册时填密码即可。
+            </div>
+          </div>
         </div>
 
         <div class="cy-box">
-          <div class="cy-label">打包插件（自动剥离用户数据与密钥）</div>
+          <div class="cy-label">投稿到市场（外部作者用这个）</div>
+          <div class="cy-hint" style="margin-bottom:12px;line-height:1.7">
+            两条路，任选其一：<br>
+            <b>① GitHub 直链</b> —— 填你仓库地址，市场只读抓取，不用交包<br>
+            <b>② 上传包</b> —— 把 tar.gz 传到中心服务器，等审核通过后上架
+          </div>
+
+          <div class="cy-row" style="margin-bottom:8px">
+            <input id="cy-sub-repo" placeholder="https://github.com/你/仓库" style="flex:1;min-width:240px;font-size:12.5px">
+            <button class="btn tiny" id="cy-sub-probe">探测</button>
+            <button class="btn tiny" id="cy-sub-send-repo">提交直链</button>
+          </div>
+          <div id="cy-sub-repo-out" class="cy-out" style="display:none"></div>
+
+          <div style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--line,#e5e5e5)">
+            <div id="cy-sub-auth">
+              <!-- 已登录时显示这个 -->
+              <div id="cy-sub-ready" style="display:none">
+                <div class="cy-hint" style="margin-bottom:0">
+                  ✅ 已用 <b id="cy-sub-who"></b> 登录，可以直接投稿。
+                </div>
+              </div>
+              <!-- 未登录时才展开 -->
+              <div id="cy-sub-need" style="display:none">
+                <div style="font-size:12.5px;font-weight:600;margin-bottom:6px">投稿凭证</div>
+                <div class="cy-hint" style="margin-bottom:8px">
+                  先在上方「作者账号」登录或注册，登录后可直接投稿，不用再验一次。
+                </div>
+                <div class="cy-row" style="margin-bottom:6px">
+                  <input id="cy-sub-email" placeholder="你的邮箱" style="flex:1;min-width:200px;font-size:12.5px">
+                  <button class="btn tiny" id="cy-sub-sendcode">发验证码</button>
+                </div>
+                <div class="cy-row">
+                  <input id="cy-sub-code" placeholder="验证码" style="width:130px;font-size:12.5px">
+                  <button class="btn tiny primary" id="cy-sub-login">换取凭证</button>
+                  <span id="cy-sub-tokenstate" class="muted" style="font-size:12px"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="cy-row" style="margin-top:10px">
+            <label class="cy-file" id="cy-sub-label">
+              <input type="file" id="cy-sub-file" accept=".gz,.tgz,.tar.gz,application/gzip">
+              <span id="cy-sub-file-name">选择包（.tar.gz）</span>
+            </label>
+            <input id="cy-sub-version" placeholder="版本，如 1.0.0" style="width:130px;font-size:12.5px">
+            <button class="btn primary tiny" id="cy-sub-upload">上传投稿</button>
+          </div>
+          <div class="cy-hint">单包上限 20 MB。审核通过后才会出现在市场里。</div>
+          <div id="cy-sub-out" class="cy-out" style="display:none"></div>
+        </div>
+
+        <div class="cy-box">
+          <div class="cy-label">打包插件</div>
+          <div class="cy-hint" style="margin-bottom:10px">
+            只列出你署名的插件。打包会自动剥离用户数据与密钥，别人装上像刚装的。
+          </div>
           <div class="cy-row">
-            <input id="cy-pkg-id" placeholder="插件 id，如 sticker" style="width:200px;font-size:12.5px">
-            <button class="btn" id="cy-pkg">打包</button>
+            <select id="cy-pkg-id" class="cy-input" style="max-width:300px">
+              <option value="">选择要打包的插件…</option>
+            </select>
+            <button class="btn" id="cy-pkg" disabled>打包</button>
             <button class="btn tiny" id="cy-pkg-list">看已打的包</button>
           </div>
           <div id="cy-pkg-out" class="cy-out" style="display:none"></div>
@@ -366,7 +517,30 @@ license: MIT
             <input type="checkbox" id="cy-untrusted" ${marketCfg.showUntrusted ? 'checked' : ''}>
             <span>显示未审核插件（有风险）</span>
           </label>
-          <div style="margin-top:12px"><button class="btn primary" id="cy-save">保存</button></div>
+
+          <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+            <div class="cy-field-label" style="margin-bottom:10px">版本更新</div>
+            <label class="cy-row" style="gap:6px;margin-bottom:8px">
+              <input type="checkbox" id="cy-auto-check" ${marketCfg.autoCheckUpdate !== false ? 'checked' : ''}>
+              <span>自动检查新版本（只提示，不自动装）</span>
+            </label>
+            <label class="cy-row" style="gap:6px;margin-bottom:10px">
+              <input type="checkbox" id="cy-auto-update" ${marketCfg.autoUpdate === true ? 'checked' : ''}>
+              <span>自动更新（<b style="color:#b7791f">覆盖安装</b>，有风险）</span>
+            </label>
+            <div class="cy-row" style="gap:8px">
+              <span style="font-size:12.5px">检查间隔</span>
+              <input class="cy-input" id="cy-check-hours" type="number" min="1" max="168"
+                     value="${marketCfg.checkIntervalHours || 6}" style="max-width:90px">
+              <span style="font-size:12.5px;color:var(--muted,#888)">小时</span>
+            </div>
+            <div class="cy-hint" style="margin-top:8px">
+              自动更新会直接把新版本覆盖到本地，万一新版有 bug 会立刻生效。
+              不确定时建议只开「自动检查」。
+            </div>
+          </div>
+
+          <div style="margin-top:16px"><button class="btn primary" id="cy-save">保存</button></div>
         </div>
       </div>
     </div>`;
@@ -378,8 +552,34 @@ license: MIT
       box.querySelectorAll('.cy-pane').forEach((p) => {
         p.classList.toggle('on', p.id === `cy-pane-${btn.dataset.pane}`);
       });
+      savePane(btn.dataset.pane);   // 记住位置，重挂后回到这里
     });
   });
+
+  // 重挂后恢复到上次所在的标签
+  (() => {
+    const last = rememberPane();
+    if (last === 'plugins') return;   // 默认就是第一个
+    const tab = box.querySelector(`.cy-tab[data-pane="${last}"]`);
+    if (!tab) return;
+    box.querySelectorAll('.cy-tab').forEach((b) => b.classList.toggle('on', b === tab));
+    box.querySelectorAll('.cy-pane').forEach((p) => {
+      p.classList.toggle('on', p.id === `cy-pane-${last}`);
+    });
+    // 管理标签是动态显示的，如果恢复到这里要确保它可见
+    //
+    // 🔴 还要主动触发加载（2026-10-25 修）
+    //    原来只把 display 打开，但 loadAdminPanel 定义在后面，
+    //    这里运行时它还不存在 → 内容永远停在"检查权限中…"。
+    //    用 setTimeout 0 推到当前同步流之后，那时函数已定义。
+    if (last === 'admin') {
+      const at = box.querySelector('#cy-tab-admin');
+      if (at) at.style.display = '';
+      setTimeout(() => {
+        if (typeof loadAdminPanel === 'function') loadAdminPanel();
+      }, 0);
+    }
+  })();
 
   const msg = (t) => { const el = box.querySelector('#cy-msg'); if (el) el.textContent = t || ''; };
 
@@ -405,7 +605,7 @@ license: MIT
         if (r?.ok) {
           msg(`✅ ${r.message || '安装完成'}`);
           ctx.toast?.('安装完成');
-          setTimeout(() => location.reload(), 1500);
+          setTimeout(refreshPanel, 1500);
         } else {
           msg(`❌ ${r?.error || '安装失败'}`);
         }
@@ -561,7 +761,7 @@ license: MIT
         });
         if (r?.ok) {
           ctx.toast?.(`已发布 v${r.version}（${(r.bytes / 1024).toFixed(1)}KB）`);
-          setTimeout(() => location.reload(), 900);
+          setTimeout(refreshPanel, 900);
         } else {
           ctx.toast?.(r?.error || '发布失败');
         }
@@ -581,7 +781,7 @@ license: MIT
         const r = await api('/api/skill-market/unpublish', { method: 'POST', body: { id, reason } });
         if (r?.ok) {
           ctx.toast?.('已从市场下架');
-          setTimeout(() => location.reload(), 900);
+          setTimeout(refreshPanel, 900);
         } else {
           ctx.toast?.(r?.error || '下架失败');
         }
@@ -590,14 +790,458 @@ license: MIT
     });
   });
 
-  box.querySelector('#cy-refresh')?.addEventListener('click', () => location.reload());
+  // ── 分类筛选（2026-10-25）──
+  //
+  // 用户要求："插件功能分类"
+  //
+  // 28 个插件混在一个列表里不好找。按 category 做筛选栏，
+  // 每个分类带计数，点一下只看那一类。
+  // 分类来自 manifest.category，已在服务端统一成 4 类：
+  //   群运营 / 内容能力 / 娱乐互动 / 系统工具
+  (() => {
+    const catBar = box.querySelector('#cy-cats');
+    const listEl = box.querySelector('#pm-list');
+    if (!catBar || !listEl) return;
+
+    const all = market.plugins || [];
+    const counts = new Map();
+    for (const p of all) {
+      const c = p.category || '未分类';
+      counts.set(c, (counts.get(c) || 0) + 1);
+    }
+    const cats = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+
+    let current = '全部';
+    const chips = [['全部', all.length], ...cats];
+
+    const renderChips = () => {
+      catBar.innerHTML = chips.map(([name, n]) => `
+        <span class="cy-cat ${name === current ? 'on' : ''}" data-cat="${esc(name)}">
+          ${esc(name)} <span style="opacity:.6">${n}</span>
+        </span>`).join('');
+      catBar.querySelectorAll('[data-cat]').forEach((el) => {
+        el.addEventListener('click', () => {
+          current = el.dataset.cat;
+          renderChips();
+          applyFilter();
+        });
+      });
+    };
+
+    const applyFilter = () => {
+      // 🔴 直接读卡片上的 data-cat（2026-10-25 修）
+      //    原来靠 data-install 反查插件再取 category，
+      //    但已安装的卡片没有 data-install（只有"已安装"文字）→ 全部匹配不到。
+      const rows = [...listEl.querySelectorAll('[data-pid]')];
+      rows.forEach((row) => {
+        const cat = row.dataset.cat || '未分类';
+        row.style.display = (current === '全部' || cat === current) ? '' : 'none';
+      });
+      // 空结果提示
+      const visible = rows.filter((r) => r.style.display !== 'none').length;
+      let empty = listEl.querySelector('.cy-cat-empty');
+      if (!visible) {
+        if (!empty) {
+          empty = document.createElement('div');
+          empty.className = 'cy-empty cy-cat-empty';
+          listEl.appendChild(empty);
+        }
+        empty.textContent = `「${current}」分类下没有插件`;
+      } else if (empty) {
+        empty.remove();
+      }
+    };
+
+    renderChips();
+  })();
+
+  // ── 审核插件（2026-10-25）──
+  //
+  // 用户问"我作为作者去哪里审核插件"—— 后端接口一直有，
+  // 但界面上没入口。市场卡片上 unverified 的直接给个「审核通过」。
+  box.querySelectorAll('[data-trust-ok]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.trustOk;
+      if (!confirm(`把「${id}」标记为已审核？\n\n标记后别人安装时不再弹风险提示。`)) return;
+      if (btn.disabled) return;
+      btn.disabled = true;
+      const old = btn.textContent;
+      btn.textContent = '处理中…';
+      try {
+        const r = await api('/api/market/admin/trust', { method: 'POST', body: { id, trust: 'verified' } });
+        if (r?.ok) {
+          ctx.toast?.('已标记为已审核');
+          setTimeout(refreshPanel, 800);
+        } else {
+          alert(r?.error || '操作失败');
+        }
+      } catch (e) { alert('失败：' + e.message); }
+      finally { btn.disabled = false; btn.textContent = old; }
+    });
+  });
+
+  box.querySelector('#cy-refresh')?.addEventListener('click', () => refreshPanel());
 
   // ── 打包 ──
   const pkgOut = () => box.querySelector('#cy-pkg-out');
+  // ── 账密登录（2026-10-25）──────────────────────────────
+  //
+  // 补上「邮箱 + 密码」这条路。验证码仍是首次注册的主路径。
+  const loginMsg = (s) => { const el = box.querySelector('#cy-login-msg'); if (el) el.textContent = s; };
+
+  box.querySelector('#cy-login-go')?.addEventListener('click', async () => {
+    const email = box.querySelector('#cy-login-email')?.value?.trim();
+    const password = box.querySelector('#cy-login-pw')?.value || '';
+    if (!email || !password) return loginMsg('邮箱和密码都要填');
+    loginMsg('登录中…');
+    try {
+      const r = await api('/api/market/login/password', { method: 'POST', body: { email, password } });
+      if (!r.ok) return loginMsg('失败：' + (r.error || ''));
+      loginMsg(`✅ 已登录：${r.author?.nickname || email}`);
+      ctx.toast?.('登录成功');
+      // 刷新发布页（作者状态变了）
+      setTimeout(refreshPanel, 800);
+    } catch (e) { loginMsg('失败：' + e.message); }
+  });
+
+  box.querySelector('#cy-login-setpw')?.addEventListener('click', async () => {
+    const email = box.querySelector('#cy-login-email')?.value?.trim();
+    const password = box.querySelector('#cy-login-pw')?.value || '';
+    if (!email || !password) return loginMsg('邮箱和新密码都要填');
+    if (password.length < 8) return loginMsg('密码至少 8 位');
+
+    // 已有密码时要旧密码：这里简单用 prompt
+    let oldPassword = '';
+    try {
+      const info = await api('/api/market/login/account', { method: 'POST', body: { email } });
+      if (info?.hasPassword) {
+        oldPassword = prompt('这个邮箱已设过密码。请输入当前密码以修改：') || '';
+        if (!oldPassword) return loginMsg('已取消');
+      }
+    } catch { /* 查不到就当首次设置 */ }
+
+    loginMsg('设置中…');
+    try {
+      const r = await api('/api/market/login/set-password', { method: 'POST', body: { password, oldPassword } });
+      if (!r.ok) return loginMsg('失败：' + (r.error || ''));
+      loginMsg('✅ 密码已设置');
+      ctx.toast?.('密码已设置');
+    } catch (e) { loginMsg('失败：' + e.message); }
+  });
+
+  // ── 找回密码（2026-10-25）──────────────────────────────
+  //
+  // 流程：邮箱收码 → 填码 + 新密码 → 重置
+  // 服务端保证：无论邮箱是否注册，发码提示都一样（防枚举）
+  const resetMsg = (s) => { const el = box.querySelector('#cy-reset-msg'); if (el) el.textContent = s; };
+
+  box.querySelector('#cy-login-forgot')?.addEventListener('click', () => {
+    const rb = box.querySelector('#cy-reset-box');
+    if (!rb) return;
+    rb.style.display = rb.style.display === 'none' ? '' : 'none';
+    // 顺手把登录框里的邮箱带过来
+    const e1 = box.querySelector('#cy-login-email')?.value?.trim();
+    const e2 = box.querySelector('#cy-reset-email');
+    if (e1 && e2 && !e2.value) e2.value = e1;
+  });
+
+  box.querySelector('#cy-reset-send')?.addEventListener('click', async () => {
+    const email = box.querySelector('#cy-reset-email')?.value?.trim();
+    if (!email) return resetMsg('先填注册邮箱');
+    resetMsg('发送中…');
+    try {
+      const r = await api('/api/market/password/reset-send', { method: 'POST', body: { email } });
+      resetMsg(r.ok ? (r.message || '验证码已发送') : '失败：' + (r.error || ''));
+    } catch (e) { resetMsg('失败：' + e.message); }
+  });
+
+  box.querySelector('#cy-reset-go')?.addEventListener('click', async () => {
+    const email = box.querySelector('#cy-reset-email')?.value?.trim();
+    const code = box.querySelector('#cy-reset-code')?.value?.trim();
+    const password = box.querySelector('#cy-reset-pw')?.value || '';
+    if (!email || !code || !password) return resetMsg('邮箱、验证码、新密码都要填');
+    if (password.length < 8) return resetMsg('新密码至少 8 位');
+
+    resetMsg('重置中…');
+    try {
+      const r = await api('/api/market/password/reset', { method: 'POST', body: { email, code, password } });
+      if (!r.ok) return resetMsg('失败：' + (r.error || ''));
+      resetMsg('✅ ' + (r.message || '密码已重置'));
+      ctx.toast?.('密码已重置，请用新密码登录');
+      // 顺手填进登录框
+      const le = box.querySelector('#cy-login-email');
+      const lp = box.querySelector('#cy-login-pw');
+      if (le) le.value = email;
+      if (lp) lp.value = password;
+    } catch (e) { resetMsg('失败：' + e.message); }
+  });
+
+  // ── 外部投稿（2026-10-25）──────────────────────────────
+  //
+  // 两条路：
+  //   GitHub 直链 → 调 /api/market-submit/probe 看仓库能否识别
+  //   上传包     → 传本服务器队列（/api/market/submit），审核后上架
+  //
+  // 🔴 注意：上传包走的是**本机内核**的队列接口，不是中心服务器。
+  //    中心服务器版的接口是 Worker 的 /api/submit（见 market-worker/）。
+  //    两者互不干扰：本机队列给自己用，Worker 给外部作者用。
+  const subOut = (el, html) => {
+    if (!el) return;
+    el.style.display = '';
+    el.innerHTML = html;
+  };
+
+  box.querySelector('#cy-sub-probe')?.addEventListener('click', async () => {
+    const url = box.querySelector('#cy-sub-repo')?.value?.trim();
+    const out = box.querySelector('#cy-sub-repo-out');
+    if (!url) return subOut(out, '<span style="color:#b45309">先填仓库地址</span>');
+    subOut(out, '探测中…');
+    try {
+      const r = await api('/api/market-submit/probe', { method: 'POST', body: { url } });
+      if (!r.ok) return subOut(out, `<span style="color:#b91c1c">${esc(r.error || '探测失败')}</span>`);
+      const rows = (r.plugins || []).map((p) => p.ok
+        ? `<li>✅ <b>${esc(p.name)}</b>（${esc(p.id)} v${esc(p.version)}）by ${esc(p.author || '未署名')}</li>`
+        : `<li>❌ ${esc(p.id)}：${esc(p.error || '')}</li>`).join('');
+      subOut(out, `识别到 ${r.plugins.length} 个插件（${esc(r.host)}/${esc(r.owner)}/${esc(r.repo)} @ ${esc(r.branch)}）：<ul style="margin:6px 0 0 18px">${rows}</ul>`);
+    } catch (e) {
+      subOut(out, `<span style="color:#b91c1c">${esc(e.message)}</span>`);
+    }
+  });
+
+  box.querySelector('#cy-sub-send-repo')?.addEventListener('click', async () => {
+    const url = box.querySelector('#cy-sub-repo')?.value?.trim();
+    const out = box.querySelector('#cy-sub-repo-out');
+    if (!url) return subOut(out, '<span style="color:#b45309">先填仓库地址</span>');
+    subOut(out, `<span style="color:#b45309">提交直链需要中心服务器支持（Worker 的 /api/submit），本机暂无此接口。<br>
+      现在可以：用「探测」确认格式正确，然后联系市场所有者登记仓库地址。</span>`);
+  });
+
+  // ── 投稿凭证（2026-10-25）──
+  //
+  // 走中心 Worker：发码 → 转发 auth.597457.xyz → 换 token → 存 localStorage
+  const CENTER = 'https://market.baiguang211.top';
+  const tokenState = () => box.querySelector('#cy-sub-tokenstate');
+  const setTok = (s) => { const el = tokenState(); if (el) el.textContent = s; };
+
+  // ── 已登录自动换凭证（2026-10-25）──
+  //
+  // 用户要求："已登录账号无需再次验证，登录账号直接可投稿"
+  //
+  // 原来投稿要再走一遍「邮箱收码 → 换 token」，
+  // 但用户明明已经在创造营登录了。现在：
+  //   · 已登录 → 本机用 bridge 密钥代签 token → 直接可投稿
+  //   · 未登录 → 才显示邮箱验证码那一套
+  const subReady = () => box.querySelector('#cy-sub-ready');
+  const subNeed = () => box.querySelector('#cy-sub-need');
+  const subWho = () => box.querySelector('#cy-sub-who');
+
+  const ensureSubmitToken = async () => {
+    // 已有 token 且没过期，直接用
+    try {
+      const tk = localStorage.getItem('bg_market_token');
+      if (tk) {
+        const parts = tk.split('.');
+        if (parts.length === 2) {
+          const payload = JSON.parse(atob(parts[0].replace(/-/g, '+').replace(/_/g, '/')));
+          if (payload.exp && payload.exp > Date.now()) {
+            return { ok: true, token: tk, email: payload.email };
+          }
+        }
+      }
+    } catch { /* 解析失败当作没 token */ }
+
+    // 没 token：如果作者已登录，让本机代签一张
+    try {
+      const r = await api('/api/market/submit-token', { method: 'POST', body: {} });
+      if (r?.ok && r.token) {
+        localStorage.setItem('bg_market_token', r.token);
+        return { ok: true, token: r.token, email: r.email };
+      }
+      return { ok: false, error: r?.error || '无法获取投稿凭证' };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  };
+
+  (async () => {
+    const r = await ensureSubmitToken();
+    if (r.ok) {
+      if (subReady()) subReady().style.display = '';
+      if (subNeed()) subNeed().style.display = 'none';
+      if (subWho()) subWho().textContent = r.email || '你的账号';
+    } else {
+      // 未登录：显示验证码那一套
+      if (subReady()) subReady().style.display = 'none';
+      if (subNeed()) subNeed().style.display = '';
+      try {
+        const tk = localStorage.getItem('bg_market_token');
+        setTok(tk ? '✅ 已有投稿凭证' : '未登录');
+      } catch { setTok(''); }
+    }
+  })();
+
+  box.querySelector('#cy-sub-sendcode')?.addEventListener('click', async () => {
+    const email = box.querySelector('#cy-sub-email')?.value?.trim();
+    if (!email) return setTok('先填邮箱');
+    setTok('发送中…');
+    try {
+      const r = await fetch(`${CENTER}/api/send-code`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email })
+      }).then((x) => x.json());
+      setTok(r.ok ? '✅ 验证码已发到邮箱' : '失败：' + (r.error || ''));
+    } catch (e) { setTok('失败：' + e.message); }
+  });
+
+  box.querySelector('#cy-sub-login')?.addEventListener('click', async () => {
+    const email = box.querySelector('#cy-sub-email')?.value?.trim();
+    const code = box.querySelector('#cy-sub-code')?.value?.trim();
+    if (!email || !code) return setTok('邮箱和验证码都要填');
+    setTok('验证中…');
+    try {
+      const r = await fetch(`${CENTER}/api/login`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email, code })
+      }).then((x) => x.json());
+      if (!r.ok) return setTok('失败：' + (r.error || ''));
+      localStorage.setItem('bg_market_token', r.token);
+      setTok('✅ 凭证已保存（7 天）');
+    } catch (e) { setTok('失败：' + e.message); }
+  });
+
+  // 上传包：读文件 → base64 → 传本机队列
+  let subFile = null;
+  box.querySelector('#cy-sub-file')?.addEventListener('change', (ev) => {
+    subFile = ev.target.files?.[0] || null;
+    const name = box.querySelector('#cy-sub-file-name');
+    if (name) name.textContent = subFile ? `${subFile.name}（${(subFile.size / 1024).toFixed(0)}KB）` : '选择包（.tar.gz）';
+  });
+
+  box.querySelector('#cy-sub-upload')?.addEventListener('click', async () => {
+    const out = box.querySelector('#cy-sub-out');
+    if (!subFile) return subOut(out, '<span style="color:#b45309">先选一个 .tar.gz</span>');
+    if (subFile.size > 20 * 1024 * 1024) return subOut(out, '<span style="color:#b91c1c">包超过 20MB</span>');
+
+    subOut(out, '读取并上传中…');
+    try {
+      const b64 = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(String(fr.result || '').split(',')[1] || '');
+        fr.onerror = () => reject(new Error('读取失败'));
+        fr.readAsDataURL(subFile);
+      });
+      const version = box.querySelector('#cy-sub-version')?.value?.trim() || '';
+      const token = (() => { try { return localStorage.getItem('bg_market_token') || ''; } catch { return ''; } })();
+      if (!token) return subOut(out, '<span style="color:#b45309">先在上方换取投稿凭证</span>');
+      // 🔴 2026-10-25 修 bug：原来从文件名正则推 id
+      //
+      //   const pluginId = name.replace(/[-.].*$/, '');
+      //
+      //   这个正则在**第一个**连字符或点处就截断了：
+      //     proactive-private-clean-2026-10-25.tar.gz
+      //     → "proactive"（实际应该是整个名字）
+      //   结果中心端去找 proactive/manifest.json 找不到，
+      //   报「包里找不到 xxx/manifest.json」。
+      //   **所有带 - 的插件 id 都投不了稿。**
+      //
+      // 现在改成从包里读 manifest.json 的 id —— 更稳：
+      //   · 包本来就有 manifest，不用猜
+      //   · 不会和内容对不上（文件名可以随便改，manifest 才是权威）
+      //   · 后缀、版本号、日期怎么拼都不影响
+      const readTarGzId = async (base64) => {
+        // 浏览器里没有 zlib，用 DecompressionStream 解 gzip
+        const bin = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+        let tar;
+        if (typeof DecompressionStream === 'function') {
+          const ds = new DecompressionStream('gzip');
+          const stream = new Blob([bin]).stream().pipeThrough(ds);
+          tar = new Uint8Array(await new Response(stream).arrayBuffer());
+        } else {
+          throw new Error('浏览器不支持解压，请用新版 Chrome/Edge');
+        }
+        // 极简 tar 遍历：找 */manifest.json
+        let off = 0;
+        const dec = new TextDecoder('utf-8');
+        while (off + 512 <= tar.length) {
+          const header = tar.subarray(off, off + 512);
+          if (header.every((b) => b === 0)) break;
+          const name = dec.decode(header.subarray(0, 100)).replace(/\0.*$/, '');
+          const sizeStr = dec.decode(header.subarray(124, 136)).replace(/\0.*$/, '').trim();
+          const size = parseInt(sizeStr, 8) || 0;
+          off += 512;
+          if (/^[^/]+\/manifest\.json$/.test(name)) {
+            const body = tar.subarray(off, off + size);
+            const json = JSON.parse(dec.decode(body));
+            if (json?.id) return String(json.id);
+          }
+          off += size + ((512 - (size % 512)) % 512);
+        }
+        throw new Error('包里没有 manifest.json，或格式不对');
+      };
+
+      let pluginId;
+      try {
+        pluginId = await readTarGzId(b64);
+      } catch (e) {
+        return subOut(out, `<span style="color:#b91c1c">读包失败：${esc(e.message)}</span>`);
+      }
+
+      const r = await fetch(`${CENTER}/api/submit`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+        body: JSON.stringify({ token, id: pluginId, base64: b64, changelog: version })
+      }).then((x) => x.json());
+      if (!r.ok) return subOut(out, `<span style="color:#b91c1c">${esc(r.error || '上传失败')}</span>`);
+      const s = r.submission || {};
+      subOut(out, `✅ 已收到投稿 <code>${esc(s.id)}</code><br>
+        状态：${esc(s.status)} ｜ ${(s.bytes / 1024).toFixed(0)}KB ｜ sha256 ${esc(String(s.sha256).slice(0, 12))}…<br>
+        <span style="color:var(--muted,#888)">等管理员审核通过后会出现在市场里。</span>`);
+    } catch (e) {
+      subOut(out, `<span style="color:#b91c1c">${esc(e.message)}</span>`);
+    }
+  });
+
+  // ── 打包：从自己的插件里选（2026-10-25）──
+  //
+  // 用户要求："不要让作者选ID，最好是本地插件列表匹配了作者名字后
+  // 让作者直接点击上传"
+  //
+  // 原来要手填 id —— 容易打错字，还要记住自己的插件叫什么。
+  // 现在从 /api/market/myplugins 拉列表，只列 canManage 的（自己的），
+  // 每个选项带名字和版本，一眼能认出。
+  const pkgSelect = () => box.querySelector('#cy-pkg-id');
+
+  const loadPkgOptions = async () => {
+    const sel = pkgSelect();
+    if (!sel) return;
+    sel.innerHTML = '<option value="">选择要打包的插件…</option>';
+    try {
+      const d = await api('/api/market/myplugins');
+      const mine = (d?.plugins || []).filter((p) => p.canManage);
+      for (const p of mine) {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = `${p.name}  v${p.version}${p.offline ? '  （已下架）' : ''}`;
+        sel.appendChild(opt);
+      }
+      if (!mine.length) {
+        sel.innerHTML = '<option value="">（没有你署名的插件）</option>';
+      }
+    } catch { /* 忽略 */ }
+  };
+
+  // 选中后才能点打包
+  pkgSelect()?.addEventListener('change', () => {
+    const btn = box.querySelector('#cy-pkg');
+    if (btn) btn.disabled = !pkgSelect().value;
+  });
+
+  loadPkgOptions();
+
   box.querySelector('#cy-pkg')?.addEventListener('click', async (ev) => {
     const btn = ev.currentTarget;
-    const id = box.querySelector('#cy-pkg-id').value.trim();
-    if (!id) { if (pkgOut()) { pkgOut().style.display='block'; pkgOut().textContent = '先填插件 id'; } return; }
+    const id = pkgSelect()?.value.trim();
+    if (!id) { if (pkgOut()) { pkgOut().style.display='block'; pkgOut().textContent = '先选一个插件'; } return; }
     if (btn.disabled) return;
     btn.disabled = true;
     const old = btn.textContent;
@@ -607,13 +1251,61 @@ license: MIT
       const out = pkgOut();
       if (out) out.style.display = 'block';
       if (r?.ok) {
-        const lines = [`✅ 已打包 ${r.market.id} v${r.market.version}（${r.sizeText}）`, ''];
-        (r.warnings || []).forEach((w) => lines.push('⚠️ ' + w));
-        if ((r.warnings||[]).length) lines.push('');
-        lines.push(`文件：${r.packagePath}`, `sha256：${r.market.sha256}`, '', 'market.json：',
-          JSON.stringify(r.market, null, 2));
-        if (out) out.textContent = lines.join('\n');
-        ctx.toast?.('打包完成');
+        // 打包完直接给「发布到市场」按钮 —— 用户不用再去别的页签找入口
+        const warn = (r.warnings || []).length
+          ? `<div style="color:#b7791f;margin-bottom:10px">⚠️ ${(r.warnings || []).map(esc).join('<br>⚠️ ')}</div>`
+          : '';
+        if (out) {
+          out.innerHTML = `
+            ${warn}
+            <div style="margin-bottom:10px">
+              ✅ 已打包 <b>${esc(r.market.name || r.market.id)}</b> v${esc(r.market.version)}
+              （${esc(r.sizeText)}）
+            </div>
+            <div class="cy-row" style="margin-bottom:12px">
+              <input class="cy-input" id="cy-pkg-notes" placeholder="这次改了什么（会显示在发布记录里）"
+                     style="flex:1;min-width:200px">
+              <button class="btn primary" id="cy-pkg-publish">发布到市场</button>
+            </div>
+            <div id="cy-pkg-pubmsg" class="cy-msg"></div>
+            <details style="margin-top:12px">
+              <summary style="cursor:pointer;font-size:12px;color:var(--muted,#888)">技术细节（文件路径 / sha256 / market.json）</summary>
+              <div style="margin-top:8px;white-space:pre-wrap">文件：${esc(r.packagePath)}
+sha256：${esc(r.market.sha256)}
+
+market.json：
+${esc(JSON.stringify(r.market, null, 2))}</div>
+            </details>`;
+        }
+        ctx.toast?.('打包完成，可以发布了');
+
+        // 绑定「发布到市场」
+        out?.querySelector('#cy-pkg-publish')?.addEventListener('click', async (ev2) => {
+          const pb = ev2.currentTarget;
+          const notes = out.querySelector('#cy-pkg-notes')?.value.trim() || '';
+          const m = out.querySelector('#cy-pkg-pubmsg');
+          if (pb.disabled) return;
+          if (!confirm(`把「${r.market.name || r.market.id}」v${r.market.version} 发布到市场？\n\n发布后别人就能装到。`)) return;
+          pb.disabled = true;
+          const oldTxt = pb.textContent;
+          pb.textContent = '发布中…';
+          try {
+            const rr = await api('/api/market/myplugins/publish', {
+              method: 'POST', body: { id: r.market.id, changelog: notes },
+            });
+            if (m) {
+              m.className = 'cy-msg on ' + (rr?.remote?.ok ? 'ok' : 'err');
+              m.textContent = rr?.remote?.ok
+                ? `✅ 已发布到市场（${r.sizeText}），别人现在能装到了`
+                : (rr?.ok ? `⚠️ 打包好了但没传上去：${rr.remote?.reason || ''}` : '❌ ' + (rr?.error || '发布失败'));
+            }
+            if (rr?.remote?.ok) ctx.toast?.('发布成功');
+          } catch (e2) {
+            if (m) { m.className = 'cy-msg on err'; m.textContent = '❌ ' + e2.message; }
+          } finally { pb.disabled = false; pb.textContent = oldTxt; }
+        });
+
+        loadPkgOptions();   // 刷新下拉（版本可能没变，但保险）
       } else {
         if (out) out.textContent = '❌ ' + (r?.error || '打包失败');
       }
@@ -628,6 +1320,21 @@ license: MIT
   // 管理员可以对任何插件执行发布/下架（checkOwner 里放行）。
 
   const adminRoot = () => box.querySelector('#cy-admin-root');
+
+  // 把时间显示成"3 分钟前 / 2 小时前 / 5 天前"
+  const fmtWhen = (iso) => {
+    if (!iso) return '';
+    const diff = Date.now() - new Date(iso).getTime();
+    if (isNaN(diff) || diff < 0) return '';
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return '刚刚';
+    if (m < 60) return m + ' 分钟前';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + ' 小时前';
+    const dd = Math.floor(h / 24);
+    if (dd < 30) return dd + ' 天前';
+    return String(iso).slice(0, 10);
+  };
 
   const renderAdmin = (d) => {
     const el = adminRoot();
@@ -658,8 +1365,34 @@ license: MIT
         <div class="cy-stat"><b>${s.totalPublishes ?? 0}</b><span>累计发布</span></div>
       </div>
 
+      <div class="cy-section-title" style="display:flex;align-items:center;gap:8px">
+        全部注册用户
+        <span class="cy-badge">共 ${d.usersTotal || 0} 位</span>
+        <span class="cy-spacer" style="flex:1"></span>
+        <button class="btn tiny" id="cy-sync-users">同步用户数据</button>
+      </div>
+      <div id="cy-sync-msg" class="cy-msg" style="margin-bottom:8px"></div>
+      <div class="cy-author-list" style="margin-bottom:20px">
+        ${(d.users || []).length ? (d.users || []).map((u) => `
+          <div class="cy-author-row">
+            <div class="cy-avatar" style="width:32px;height:32px;font-size:14px">${esc(String(u.nickname || u.email).slice(0,1))}</div>
+            <div class="cy-author-info">
+              <div class="cy-author-name" style="font-size:13px">
+                ${esc(u.nickname || u.email.split('@')[0])}
+                ${u.qq ? `<span class="cy-badge">QQ ${esc(u.qq)}</span>` : ''}
+                ${u.verified ? '<span class="cy-badge" style="background:#2f855a22;color:#2f855a">已验证</span>' : ''}
+              </div>
+              <div class="cy-author-meta">
+                ${esc(u.email)}
+                ${u.firstSeenAt ? ' · 注册于 ' + esc(String(u.firstSeenAt).slice(0,10)) : ''}
+                ${u.lastSeenAt ? ' · 最近活跃 ' + esc(fmtWhen(u.lastSeenAt)) : ''}
+              </div>
+            </div>
+          </div>`).join('') : '<div class="cy-empty">还没有人注册。别人的创造营会来这台服务器发验证码，注册后自动登记。</div>'}
+      </div>
+
       <div class="cy-section-title">
-        全部作者
+        全部作者（有发布的）
         <span class="cy-badge" style="margin-left:8px">共 ${authors.length} 位</span>
       </div>
       <div class="cy-author-list">
@@ -705,15 +1438,115 @@ license: MIT
         }).join('')}
       </div>
 
-      <div class="cy-section-title" style="margin-top:20px">管理员设置</div>
-      <div class="cy-box">
-        <div class="cy-hint">只有管理员能看这个页面。可以添加/移除管理员。</div>
-        <div class="cy-row" style="margin-top:10px">
-          <input class="cy-input" id="cy-adm-email" placeholder="要设为管理员的邮箱" style="max-width:260px">
+      <div class="cy-section-title" style="margin-top:24px">
+        投稿审核
+        <span class="cy-badge" id="cy-sub-stats" style="margin-left:8px">加载中…</span>
+      </div>
+      <div id="cy-sub-list">
+        <div class="cy-empty">加载中…</div>
+      </div>
+
+      <div class="cy-section-title" style="margin-top:20px">
+        管理员
+        <span class="cy-badge" id="cy-adm-count">加载中…</span>
+      </div>
+      <div id="cy-adm-list"><div class="cy-empty">加载中…</div></div>
+
+      <div class="cy-box" style="margin-top:12px">
+        <div class="cy-label">添加管理员</div>
+        <div class="cy-row" style="margin-top:8px">
+          <input class="cy-input" id="cy-adm-email" placeholder="邮箱，如 name@qq.com" style="max-width:260px">
           <button class="btn tiny" id="cy-adm-add">设为管理员</button>
         </div>
+        <div class="cy-hint" style="margin-top:6px">
+          必须是完整邮箱（不是 QQ 号）。管理员能审核投稿、管理全部插件。
+        </div>
         <div id="cy-adm-msg" class="cy-msg"></div>
-      </div>`;
+      </div>
+
+      <!-- 内核反馈（2026-10-25）：查看用户从设置页提交的 BUG / 建议 -->
+      <div class="cy-section-title" style="margin-top:22px">
+        内核反馈
+        <button class="btn tiny" id="cy-fb-refresh" style="margin-left:8px">刷新</button>
+      </div>
+      <div id="cy-fb-root"><div class="cy-empty">加载中…</div></div>`;
+
+    // ── 内核反馈（2026-10-25）──
+    const loadFeedback = async () => {
+      const fbRoot = el.querySelector('#cy-fb-root');
+      if (!fbRoot) return;
+      fbRoot.innerHTML = '<div class="cy-empty">加载中…</div>';
+      try {
+        const r = await api('/api/market/admin/feedback');
+        if (!r?.ok) {
+          fbRoot.innerHTML = `<div class="cy-empty">${esc(r?.error || '读取失败')}</div>`;
+          return;
+        }
+        const items = r.items || [];
+        const s = r.stats || {};
+        if (!items.length) {
+          fbRoot.innerHTML = '<div class="cy-empty">还没有人提交反馈</div>';
+          return;
+        }
+        const typeLabel = { bug: 'BUG', feature: '建议', other: '其它' };
+        const stLabel = { open: '待处理', resolved: '已解决', ignored: '已忽略' };
+        fbRoot.innerHTML = `
+          <div class="cy-admin-stats" style="margin-bottom:12px">
+            <div class="cy-stat"><b>${s.total ?? 0}</b><span>总数</span></div>
+            <div class="cy-stat"><b>${s.open ?? 0}</b><span>待处理</span></div>
+            <div class="cy-stat"><b>${s.bug ?? 0}</b><span>BUG</span></div>
+            <div class="cy-stat"><b>${s.feature ?? 0}</b><span>建议</span></div>
+          </div>
+          ${items.map((x) => `
+            <div class="cy-box" style="margin-bottom:10px">
+              <div class="cy-row" style="justify-content:space-between;align-items:flex-start;gap:10px">
+                <div style="flex:1;min-width:0">
+                  <div style="font-size:13.5px;font-weight:600;margin-bottom:4px">
+                    <span class="cy-badge">${esc(typeLabel[x.type] || x.type)}</span>
+                    ${esc(x.title)}
+                  </div>
+                  <div class="cy-hint" style="margin-bottom:6px">
+                    ${esc(x.submitter?.nickname || x.submitter?.email || '?')}
+                    · ${esc(fmtTime(x.submittedAt))}
+                    ${x.attach ? ` · 附件 ${esc(x.attach.name)}（${Math.round(x.attach.bytes / 1024)}KB）` : ''}
+                    · 内核 ${esc(x.env?.kernelVersion || '?')} / Node ${esc(x.env?.nodeVersion || '?')}
+                  </div>
+                  ${x.body ? `<pre style="font-size:11.5px;line-height:1.6;white-space:pre-wrap;max-height:180px;overflow:auto;background:var(--bg-soft,#faf9f7);padding:8px;border-radius:6px;margin:0">${esc(x.body)}</pre>` : ''}
+                </div>
+                <div style="white-space:nowrap">
+                  <span class="cy-badge">${esc(stLabel[x.status] || x.status)}</span>
+                  <div style="margin-top:6px">
+                    ${x.status === 'open' ? `
+                      <button class="btn tiny" data-fb-set="${esc(x.id)}" data-fb-to="resolved">标为已解决</button>
+                      <button class="btn tiny" data-fb-set="${esc(x.id)}" data-fb-to="ignored">忽略</button>` : `
+                      <button class="btn tiny" data-fb-set="${esc(x.id)}" data-fb-to="open">重新打开</button>`}
+                  </div>
+                </div>
+              </div>
+            </div>`).join('')}`;
+
+        // 状态切换
+        fbRoot.querySelectorAll('[data-fb-set]').forEach((b) => {
+          b.addEventListener('click', async () => {
+            b.disabled = true;
+            try {
+              const r2 = await api('/api/market/admin/feedback/status', {
+                method: 'POST',
+                body: { id: b.dataset.fbSet, status: b.dataset.fbTo }
+              });
+              if (!r2?.ok) { ctx.toast?.('失败：' + (r2?.error || '')); b.disabled = false; return; }
+              ctx.toast?.('已更新');
+              loadFeedback();
+            } catch (e) { ctx.toast?.('失败：' + e.message); b.disabled = false; }
+          });
+        });
+      } catch (e) {
+        fbRoot.innerHTML = `<div class="cy-empty">读取失败：${esc(e.message)}</div>`;
+      }
+    };
+
+    el.querySelector('#cy-fb-refresh')?.addEventListener('click', loadFeedback);
+    loadFeedback();
 
     // 管理员操作：发布/下架任意插件
     el.querySelectorAll('[data-adm-pub]').forEach((btn) => {
@@ -748,7 +1581,180 @@ license: MIT
       });
     });
 
+    // 同步用户数据
+    el.querySelector('#cy-sync-users')?.addEventListener('click', async (ev) => {
+      const btn = ev.currentTarget;
+      const msg = el.querySelector('#cy-sync-msg');
+      if (btn.disabled) return;
+      btn.disabled = true;
+      const old = btn.textContent;
+      btn.textContent = '同步中…';
+      try {
+        const r = await api('/api/market/admin/sync-users', { method: 'POST', body: {} });
+        if (msg) {
+          msg.className = 'cy-msg on ' + (r?.ok ? 'ok' : 'err');
+          msg.textContent = r?.ok
+            ? `✅ 已同步（本机档案${r.pushed ? '已推送' : '推送失败'}，用户库 ${r.refreshed} 人）`
+            : '❌ ' + (r?.error || '同步失败');
+        }
+        // 延迟久一点，让用户看到结果再刷新（原来 900ms 太短，消息一闪就没了）
+        if (r?.ok) setTimeout(() => loadAdminPanel(), 2500);
+      } catch (e) {
+        if (msg) { msg.className = 'cy-msg on err'; msg.textContent = '❌ ' + e.message; }
+      } finally { btn.disabled = false; btn.textContent = old; }
+    });
+
+    // ── 投稿审核（2026-10-25）──
+    //
+    // 后端接口一直有（/api/market/submissions + /review），
+    // 但界面上没入口 —— 作者投了稿，管理员根本找不到在哪审。
+    const subList = el.querySelector('#cy-sub-list');
+    const subStats = el.querySelector('#cy-sub-stats');
+
+    const loadSubs = async () => {
+      if (!subList) return;
+      try {
+        const r = await api('/api/market/submissions');
+        const st = r?.stats || {};
+        const items = r?.items || [];
+        if (subStats) {
+          subStats.textContent = `待审 ${st.pending || 0} · 通过 ${st.approved || 0} · 驳回 ${st.rejected || 0}`;
+          subStats.style.background = (st.pending > 0) ? '#b7791f22' : '';
+          subStats.style.color = (st.pending > 0) ? '#b7791f' : '';
+        }
+        if (!items.length) {
+          subList.innerHTML = '<div class="cy-empty">还没有人投稿。<br><span style="font-size:11.5px">作者在「发布」页上传插件包后会出现在这里。</span></div>';
+          return;
+        }
+        subList.innerHTML = items.map((s) => {
+          const statusText = s.status === 'pending' ? '待审核'
+            : (s.status === 'approved' ? '已通过' : '已驳回');
+          const color = s.status === 'pending' ? '#b7791f'
+            : (s.status === 'approved' ? '#2f855a' : '#c00');
+          return `
+            <div class="cy-card" style="margin-bottom:8px">
+              <div class="cy-card-head">
+                <span class="cy-name">${esc(s.name || s.id)}</span>
+                ${s.version ? `<span class="cy-ver">v${esc(s.version)}</span>` : ''}
+                <span style="color:${color};font-size:11.5px">${statusText}</span>
+                <span class="cy-spacer"></span>
+                ${s.status === 'pending' ? `
+                  <button class="btn tiny primary" data-sub-ok="${esc(s.id)}">通过</button>
+                  <button class="btn tiny" data-sub-no="${esc(s.id)}" style="color:#c00">驳回</button>
+                ` : ''}
+              </div>
+              <div class="cy-summary">${esc(s.summary || '')}</div>
+              <div class="cy-meta">
+                ${s.author ? '作者：' + esc(s.author) : ''}
+                ${s.email ? ' · ' + esc(s.email) : ''}
+                ${s.bytes ? ' · ' + (s.bytes / 1024).toFixed(1) + ' KB' : ''}
+                ${(s.permissions || []).length ? ' · 权限：' + esc((s.permissions || []).join('、')) : ''}
+              </div>
+              ${s.changelog ? `<div class="cy-meta" style="margin-top:4px">说明：${esc(s.changelog)}</div>` : ''}
+            </div>`;
+        }).join('');
+
+        // 通过 / 驳回
+        subList.querySelectorAll('[data-sub-ok]').forEach((b) => {
+          b.addEventListener('click', async () => {
+            const id = b.dataset.subOk;
+            if (!confirm(`通过「${id}」的投稿？\n\n通过后它会上架到市场，别人就能装到了。`)) return;
+            b.disabled = true;
+            try {
+              const r = await api('/api/market/submissions/review', {
+                method: 'POST', body: { id, action: 'approve' },
+              });
+              ctx.toast?.(r?.ok ? '已通过，已上架' : (r?.error || '操作失败'));
+              loadSubs();
+            } catch (e) { ctx.toast?.('失败：' + e.message); }
+            finally { b.disabled = false; }
+          });
+        });
+        subList.querySelectorAll('[data-sub-no]').forEach((b) => {
+          b.addEventListener('click', async () => {
+            const id = b.dataset.subNo;
+            const note = prompt(`驳回「${id}」\n\n原因（会告诉作者，可留空）：`, '');
+            if (note === null) return;
+            b.disabled = true;
+            try {
+              const r = await api('/api/market/submissions/review', {
+                method: 'POST', body: { id, action: 'reject', note },
+              });
+              ctx.toast?.(r?.ok ? '已驳回' : (r?.error || '操作失败'));
+              loadSubs();
+            } catch (e) { ctx.toast?.('失败：' + e.message); }
+            finally { b.disabled = false; }
+          });
+        });
+      } catch (e) {
+        if (subList) subList.innerHTML = `<div class="cy-empty">读取失败：${esc(e.message)}</div>`;
+      }
+    };
+    loadSubs();
+
     // 加管理员
+    // ── 管理员名单（2026-10-25）──
+    //
+    // 用户反馈："管理员设置只能添加管理员，看不到有哪些管理员也不能删管理员"
+    //
+    // 后端 set 接口本来支持 remove:true，但界面没给入口。
+    // 现在列出全部管理员，每人带「移除」按钮。
+    const admList = el.querySelector('#cy-adm-list');
+    const admCount = el.querySelector('#cy-adm-count');
+
+    const loadAdmins = async () => {
+      if (!admList) return;
+      try {
+        const r = await api('/api/market/admin/list');
+        if (!r?.ok) {
+          admList.innerHTML = `<div class="cy-empty">${esc(r?.error || '读取失败')}</div>`;
+          return;
+        }
+        const list = r.admins || [];
+        if (admCount) admCount.textContent = `共 ${list.length} 位`;
+        if (!list.length) {
+          admList.innerHTML = '<div class="cy-empty">还没有管理员</div>';
+          return;
+        }
+        admList.innerHTML = list.map((a) => `
+          <div class="cy-card" style="margin-bottom:6px">
+            <div class="cy-card-head">
+              <span class="cy-name" style="font-size:13px">${esc(a.email)}</span>
+              ${a.isOwner ? '<span class="cy-badge" style="background:#2f855a22;color:#2f855a">市场所有者</span>' : ''}
+              ${a.valid === false ? '<span class="cy-badge" style="background:#c0000022;color:#c00">格式无效</span>' : ''}
+              ${a.nickname ? `<span class="cy-badge">${esc(a.nickname)}</span>` : ''}
+              <span class="cy-spacer"></span>
+              ${a.email === r.me ? '<span class="cy-badge">你自己</span>' : ''}
+              ${a.isOwner ? '' : `<button class="btn tiny" data-adm-rm="${esc(a.email)}" style="color:#c00">移除</button>`}
+            </div>
+            <div class="cy-meta">
+              ${a.since ? '加入于 ' + esc(String(a.since).slice(0, 10)) : ''}
+              ${a.qq ? ' · QQ ' + esc(a.qq) : ''}
+              ${a.lastSeenAt ? ' · 最近活跃 ' + esc(fmtWhen(a.lastSeenAt)) : ''}
+            </div>
+          </div>`).join('');
+
+        admList.querySelectorAll('[data-adm-rm]').forEach((b) => {
+          b.addEventListener('click', async () => {
+            const email = b.dataset.admRm;
+            if (!confirm(`把 ${email} 从管理员里移除？\n\n移除后他不能再审核投稿、管理插件。`)) return;
+            b.disabled = true;
+            try {
+              const rr = await api('/api/market/admin/set', {
+                method: 'POST', body: { email, remove: true },
+              });
+              if (rr?.ok) { ctx.toast?.('已移除'); loadAdmins(); }
+              else alert(rr?.error || '移除失败');
+            } catch (e) { alert('失败：' + e.message); }
+            finally { b.disabled = false; }
+          });
+        });
+      } catch (e) {
+        if (admList) admList.innerHTML = `<div class="cy-empty">读取失败：${esc(e.message)}</div>`;
+      }
+    };
+    loadAdmins();
+
     el.querySelector('#cy-adm-add')?.addEventListener('click', async (ev) => {
       const btn = ev.currentTarget;
       const email = el.querySelector('#cy-adm-email')?.value.trim();
@@ -762,6 +1768,7 @@ license: MIT
           msg.className = 'cy-msg on ' + (r?.ok ? 'ok' : 'err');
           msg.textContent = r?.ok ? `✅ ${email} 已成为管理员` : '❌ ' + (r?.error || '失败');
         }
+        if (r?.ok) { loadAdmins(); const inp = el.querySelector('#cy-adm-email'); if (inp) inp.value = ''; }
       } catch (e) { if (msg) { msg.className = 'cy-msg on err'; msg.textContent = '❌ ' + e.message; } }
       finally { btn.disabled = false; }
     });
@@ -815,15 +1822,24 @@ license: MIT
       return;
     }
 
-    el.innerHTML = list.map((p) => {
+    // ── 三段分组（2026-10-25）──
+    //
+    // 用户要求："我的插件 要把已发布和未发布和别人的插件分开"
+    //
+    // 原来 28 个插件混在一起滚，找自己没发的要翻半天。
+    // 现在按状态分三组，每组带计数，一眼知道该处理哪些。
+    const renderCard = (p) => {
       const pub = p.lastPublished;
-      const stateBadge = p.offline
-        ? `<span class="cy-badge" style="background:#c0000022;color:#c00">已下架</span>`
-        : (pub
-            ? (p.unpublished
-                ? `<span class="cy-badge" style="background:#b7791f22;color:#b7791f">有未发布改动</span>`
-                : `<span class="cy-badge" style="background:#2f855a22;color:#2f855a">已发布</span>`)
-            : `<span class="cy-badge">未发布</span>`);
+      // 别人的插件不显示发布状态（那是人家的运营信息，跟你无关）
+      const stateBadge = !p.canManage
+        ? ''
+        : (p.offline
+            ? `<span class="cy-badge" style="background:#c0000022;color:#c00">已下架</span>`
+            : (pub
+                ? (p.unpublished
+                    ? `<span class="cy-badge" style="background:#b7791f22;color:#b7791f">有未发布改动</span>`
+                    : `<span class="cy-badge" style="background:#2f855a22;color:#2f855a">已发布</span>`)
+                : `<span class="cy-badge">未发布</span>`));
       return `
         <div class="cy-card" data-mine="${esc(p.id)}">
           <div class="cy-card-head">
@@ -832,12 +1848,18 @@ license: MIT
             ${stateBadge}
             ${p.core ? '<span class="cy-badge">核心</span>' : ''}
             <span class="cy-spacer"></span>
-            <button class="btn tiny" data-mine-edit="${esc(p.id)}">编辑</button>
-            <button class="btn tiny primary" data-mine-pub="${esc(p.id)}">${p.offline ? '重新上架' : '发布'}</button>
-            ${p.offline ? '' : `<button class="btn tiny" data-mine-off="${esc(p.id)}" style="color:#c00">下架</button>`}
+            ${p.canManage ? `
+              <button class="btn tiny" data-mine-edit="${esc(p.id)}">编辑</button>
+              <button class="btn tiny primary" data-mine-pub="${esc(p.id)}">${p.offline ? '重新上架' : '发布'}</button>
+              ${p.offline ? '' : `<button class="btn tiny" data-mine-off="${esc(p.id)}" style="color:#c00">下架</button>`}
+            ` : `<span class="cy-badge">他人的插件</span>`}
+            ${p.canUninstall ? `<button class="btn tiny" data-mine-del="${esc(p.id)}" style="color:#c00">卸载</button>` : ''}
           </div>
           <div class="cy-summary">${esc(p.summary || '')}</div>
           <div class="cy-meta">
+            <b>${esc(p.author || '未署名')}</b>${p.authorQQ ? `（QQ ${esc(p.authorQQ)}）` : ''}${p.license ? ` · ${esc(p.license)}` : ''}
+            ${p.isOwn ? '' : ' · <span style="color:#b7791f">不是你的插件</span>'}
+            <br>
             ${(p.permissions || []).length ? `权限：${esc(p.permissions.join('、'))}` : '无特殊权限'}
             ${pub ? `　·　上次发布 v${esc(pub.version)}（${esc(String(pub.at).slice(0,10))}）${pub.changelog ? ' — ' + esc(pub.changelog.slice(0, 40)) : ''}` : ''}
           </div>
@@ -859,7 +1881,35 @@ license: MIT
             <div class="cy-out" data-mine-histout="${esc(p.id)}" style="display:none"></div>
           </div>
         </div>`;
-    }).join('');
+    };
+
+    // 分组：自己的已发布 / 自己的未发布 / 别人的
+    const ownPublished = [];
+    const ownDraft = [];
+    const others = [];
+    for (const p of list) {
+      if (!p.isOwn) { others.push(p); continue; }
+      // 未发布 = 从没发过，或本地有未发布改动
+      if (p.lastPublished && !p.unpublished && !p.offline) ownPublished.push(p);
+      else ownDraft.push(p);
+    }
+
+    const section = (title, arr, hint) => {
+      if (!arr.length) return '';
+      return `
+        <div class="cy-group-title">
+          ${title}
+          <span class="cy-badge">${arr.length}</span>
+          ${hint ? `<span class="cy-group-hint">${hint}</span>` : ''}
+        </div>
+        ${arr.map(renderCard).join('')}`;
+    };
+
+    el.innerHTML = [
+      section('未发布 / 待更新', ownDraft, '本地有改动，或还没发到市场'),
+      section('已发布', ownPublished, '市场上能装到的版本'),
+      section('别人的插件', others, '只能卸载，不能改'),
+    ].join('') || '<div class="cy-empty">没有插件</div>';
 
     bindMine();
   };
@@ -957,6 +2007,38 @@ license: MIT
       });
     });
 
+    // 卸载（2026-10-25）
+    box.querySelectorAll('[data-mine-del]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.mineDel;
+        if (btn.disabled) return;
+
+        // 二次确认：卸载是不可撤回的（源码目录会被删）
+        const ans = prompt(
+          `要卸载「${id}」吗？\n\n`
+          + `这会把 plugins/${id}/ 整个目录删掉，不可撤回。\n`
+          + `数据目录（data/plugins/${id}/）默认保留。\n\n`
+          + `确认请照抄插件 id：`
+        );
+        if (ans === null) return;
+        if (ans.trim() !== id) { ctx.toast?.('id 不一致，已取消'); return; }
+
+        btn.disabled = true;
+        const old = btn.textContent;
+        btn.textContent = '卸载中…';
+        try {
+          const r = await api('/api/market/uninstall', { method: 'POST', body: { id, purgeData: false } });
+          if (r?.ok) {
+            ctx.toast?.(r.message || '已卸载');
+            loadMine();
+          } else {
+            alert(r?.error || '卸载失败');
+          }
+        } catch (e) { alert('卸载失败：' + e.message); }
+        finally { btn.disabled = false; btn.textContent = old; }
+      });
+    });
+
     // 发布历史
     box.querySelectorAll('[data-mine-hist]').forEach((btn) => {
       btn.addEventListener('click', async () => {
@@ -986,6 +2068,108 @@ license: MIT
       if (mineCount()) mineCount().textContent = '读取失败：' + e.message;
     }
   };
+
+  // ── 版本检查与更新（2026-10-25）──
+  //
+  // 用户要求：自动检查新版本 / 手动检测 / 更新直接覆盖安装
+  const updBanner = () => box.querySelector('#cy-upd-banner');
+  const updAllBtn = () => box.querySelector('#cy-upd-all');
+
+  const showUpdates = (d) => {
+    const el = updBanner();
+    const allBtn = updAllBtn();
+    if (!el) return;
+    const list = d?.updates || [];
+    if (!list.length) {
+      el.style.display = 'none';
+      if (allBtn) allBtn.style.display = 'none';
+      return;
+    }
+    el.style.display = 'block';
+    if (allBtn) allBtn.style.display = '';
+    el.innerHTML = `
+      <div class="cy-box" style="border-color:#b7791f;background:rgba(183,121,31,.04)">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#b7791f">
+          有 ${list.length} 个插件可以更新
+        </div>
+        ${list.map((u) => `
+          <div class="cy-row" style="padding:6px 0;border-top:1px dashed var(--line);font-size:12.5px">
+            <span style="font-weight:500">${esc(u.name)}</span>
+            <span class="muted">v${esc(u.localVersion)} → <b style="color:#b7791f">v${esc(u.marketVersion)}</b></span>
+            <span class="cy-spacer" style="flex:1"></span>
+            <button class="btn tiny" data-upd-one="${esc(u.id)}">更新</button>
+          </div>`).join('')}
+      </div>`;
+
+    el.querySelectorAll('[data-upd-one]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.updOne;
+        if (btn.disabled) return;
+        btn.disabled = true;
+        const old = btn.textContent;
+        btn.textContent = '更新中…';
+        try {
+          const r = await api('/api/market/update', { method: 'POST', body: { id } });
+          if (r?.ok) {
+            ctx.toast?.(r.message || '更新完成');
+            checkUpdates();
+            loadMine();
+          } else {
+            alert(r?.error || '更新失败');
+          }
+        } catch (e) { alert('更新失败：' + e.message); }
+        finally { btn.disabled = false; btn.textContent = old; }
+      });
+    });
+  };
+
+  const checkUpdates = async (silent = false) => {
+    try {
+      const d = await api('/api/market/updates');
+      if (!d?.ok) {
+        if (!silent) ctx.toast?.(d?.error || '检测失败');
+        return;
+      }
+      showUpdates(d);
+      if (!silent) {
+        ctx.toast?.(d.total ? `发现 ${d.total} 个新版本` : '已是最新版本');
+      }
+    } catch (e) {
+      if (!silent) ctx.toast?.('检测失败：' + e.message);
+    }
+  };
+
+  box.querySelector('#cy-check-upd')?.addEventListener('click', (ev) => {
+    const btn = ev.currentTarget;
+    const old = btn.textContent;
+    btn.textContent = '检测中…';
+    btn.disabled = true;
+    checkUpdates().finally(() => { btn.textContent = old; btn.disabled = false; });
+  });
+
+  updAllBtn()?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    if (!confirm('更新全部插件？\n\n会逐个下载并覆盖安装，可能需要一点时间。')) return;
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = '更新中…';
+    try {
+      const r = await api('/api/market/update-all', { method: 'POST', body: {} });
+      if (r?.ok) {
+        ctx.toast?.(`已更新 ${r.updated} 个${(r.failed || []).length ? '，' + r.failed.length + ' 个失败' : ''}`);
+        checkUpdates(true);
+        loadMine();
+      } else {
+        alert(r?.error || '更新失败');
+      }
+    } catch (e) { alert('更新失败：' + e.message); }
+    finally { btn.disabled = false; btn.textContent = old; }
+  });
+
+  // 进页面自动静默检查一次（autoCheckUpdate 开着才查）
+  if (marketCfg?.autoCheckUpdate !== false) {
+    setTimeout(() => checkUpdates(true), 1200);
+  }
 
   box.querySelector('#cy-mine-refresh')?.addEventListener('click', loadMine);
   loadMine();
@@ -1041,6 +2225,15 @@ license: MIT
           <input class="cy-input" id="cy-reg-qq" placeholder="QQ 号（选填）" inputmode="numeric">
         </div>
         <div class="cy-hint">昵称会显示在插件上；QQ 号方便别人联系你。都可以不填。</div>
+
+        <div class="cy-inline" style="margin-top:10px">
+          <input class="cy-input" id="cy-reg-pw" type="password" placeholder="设置登录密码（选填）"
+                 autocomplete="new-password">
+        </div>
+        <div class="cy-hint">
+          设了密码以后就能<b>免验证码登录</b>，省得每次都等邮件。<br>
+          至少 8 位，需包含字母、数字、符号中的两类。不设也行，那以后每次都要验证码。
+        </div>
       </div>
 
       <div style="margin-top:16px;display:flex;align-items:center;gap:10px">
@@ -1093,13 +2286,16 @@ license: MIT
       const code = box.querySelector('#cy-reg-code').value.trim();
       const qq = box.querySelector('#cy-reg-qq').value.trim();
       const nickname = box.querySelector('#cy-reg-nick').value.trim();
+      const password = box.querySelector('#cy-reg-pw')?.value || '';
       if (!email) { showMsg('先填邮箱', 'err'); return; }
       if (!/^\d{6}$/.test(code)) { showMsg('验证码是 6 位数字', 'err'); return; }
       if (btn.disabled) return;
       btn.disabled = true;
       btn.textContent = '验证中…';
       try {
-        const r = await api('/api/market/register/verify', { method: 'POST', body: { email, code, qq, nickname } });
+        const r = await api('/api/market/register/verify', {
+          method: 'POST', body: { email, code, qq, nickname, password },
+        });
         if (r?.ok) {
           showMsg('');
           ctx.toast?.('注册成功');
@@ -1265,10 +2461,13 @@ license: MIT
           indexUrl: box.querySelector('#cy-index').value.trim(),
           mirrorUrl: box.querySelector('#cy-mirror').value.trim(),
           showUntrusted: box.querySelector('#cy-untrusted').checked,
+          autoCheckUpdate: box.querySelector('#cy-auto-check').checked,
+          autoUpdate: box.querySelector('#cy-auto-update').checked,
+          checkIntervalHours: Number(box.querySelector('#cy-check-hours').value) || 6,
         },
       });
       ctx.toast?.('已保存');
-      setTimeout(() => location.reload(), 800);
+      setTimeout(refreshPanel, 800);
     } catch (e) { ctx.toast?.('保存失败：' + e.message); }
     finally { btn.disabled = false; }
   });

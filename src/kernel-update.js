@@ -356,3 +356,166 @@ export async function publishKernel({ notes = '', dryRun = false } = {}) {
 
   return { ok: true, version, bytes: size, sha256, download, filename: fname, releases: idx.releases.length };
 }
+
+// ── 自动安装（2026-10-25）──────────────────────────────────────
+//
+// 用户需求：「自动更新加一个自动（安装）的选择」
+//
+// 🔴 约束：安装必须由**外部进程**做 —— 服务不能替换自己的代码再重启自己。
+//   这里只做两件事：校验包 + detached spawn 拉起 scripts/kernel-install.mjs。
+//   前端/调用方拿到 accepted 后轮询 /api/kernel/install-log 看进度。
+
+/** 安装日志路径 */
+function installLogPath() {
+  return path.join(DATA_DIR, 'kernel-updates', 'install.log');
+}
+
+/**
+ * 从安装包 (.tar.gz) 里取出 kernel-install.mjs
+ *
+ * 🔴 不依赖磁盘上那份 —— 见 autoInstallKernel 里的说明。
+ * 只读包内一个文件，用 Node 原生 zlib + 手写 tar 头解析，
+ * 避免依赖系统 tar（Windows 上对中文名会炸）。
+ *
+ * @returns {string|null} 临时脚本路径；失败返回 null
+ */
+async function extractInstaller(pkgPath) {
+  try {
+    const zlib = await import('node:zlib');
+    const buf = zlib.gunzipSync(fs.readFileSync(pkgPath));
+    const td = new TextDecoder('utf-8');
+
+    let off = 0;
+    let longName = '';
+    while (off + 512 <= buf.length) {
+      const header = buf.subarray(off, off + 512);
+      if (header.every((b) => b === 0)) break;
+
+      const readStr = (start, len) => {
+        const raw = header.subarray(start, start + len);
+        const end = raw.indexOf(0);
+        return td.decode(end >= 0 ? raw.subarray(0, end) : raw);
+      };
+      let name = readStr(0, 100);
+      const size = parseInt(readStr(124, 12).trim(), 8) || 0;
+      const typeflag = String.fromCharCode(header[156] || 0x30);
+      const prefix = readStr(345, 155);
+      if (prefix) name = `${prefix}/${name}`;
+      if (longName) { name = longName; longName = ''; }
+
+      const dataStart = off + 512;
+      const data = buf.subarray(dataStart, dataStart + size);
+      off = dataStart + Math.ceil(size / 512) * 512;
+
+      if (typeflag === 'L') { longName = td.decode(data).replace(/\0.*$/, ''); continue; }
+      if (typeflag !== '0' && typeflag !== '\0') continue;
+
+      // 匹配 qq-agent-v2/scripts/kernel-install.mjs（兼容任意顶层目录名）
+      if (/(^|\/)scripts\/kernel-install\.mjs$/.test(name)) {
+        const tmp = path.join(DATA_DIR, 'kernel-updates', 'installer-current.mjs');
+        fs.mkdirSync(path.dirname(tmp), { recursive: true });
+        fs.writeFileSync(tmp, data);
+        fs.chmodSync(tmp, 0o755);
+        return tmp;
+      }
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * 触发自动安装。
+ * @param {string} file 已下载的包（必须在 data/kernel-updates/ 下）
+ */
+export async function autoInstallKernel(file) {
+  const f = String(file || '');
+  if (!f) return { ok: false, error: '没有指定安装包' };
+  if (!fs.existsSync(f)) return { ok: false, error: '安装包不存在，请先下载' };
+
+  // 安全：只允许装 data/kernel-updates/ 下的包，防任意路径
+  const allowDir = path.resolve(UPDATE_DIR);
+  if (!path.resolve(f).startsWith(allowDir + path.sep)) {
+    return { ok: false, error: '安装包必须在 data/kernel-updates/ 目录下' };
+  }
+
+  // 🔴 鸡生蛋问题（2026-10-25 修）
+  //
+  // 原来执行的是**磁盘上那份** scripts/kernel-install.mjs。
+  // 但安装动作本身会替换 scripts/ —— 于是：
+  //   旧机器上的旧脚本 → 用旧逻辑装新版 → 旧逻辑的 bug 照旧（502）
+  //   而且装完之后脚本被换回包内版本，用户下次更新又被打回原形。
+  //
+  // 解法：**从安装包里把脚本解出来再执行**。
+  //   这样无论磁盘上那份多旧，这次安装用的都是包里的新逻辑。
+  const script = await extractInstaller(f);
+  if (!script) {
+    return { ok: false, error: '安装包里没有 scripts/kernel-install.mjs，无法安装' };
+  }
+
+  fs.mkdirSync(path.dirname(installLogPath()), { recursive: true });
+  const logFd = fs.openSync(installLogPath(), 'a');
+
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, [script, f], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    cwd: ROOT,
+    // 告诉脚本真实的内核根目录（它现在可能从 /tmp 运行）
+    env: { ...process.env, KERNEL_ROOT: ROOT }
+  });
+  child.unref();
+  fs.closeSync(logFd);
+
+  return {
+    ok: true,
+    accepted: true,
+    pid: child.pid,
+    log: installLogPath(),
+    note: '安装已在后台开始。服务会重启一次，期间约 30~90 秒不可用。失败会自动回滚。'
+  };
+}
+
+/** 读安装日志尾部 */
+export function readInstallLog(lines = 80) {
+  try {
+    return fs.readFileSync(installLogPath(), 'utf8').split('\n').slice(-lines).join('\n');
+  } catch {
+    return '';
+  }
+}
+
+/** 内核要求的最低安装脚本版本（与 scripts/kernel-install.mjs 里的标记对应） */
+const REQUIRED_INSTALLER_VERSION = '1.1.0';
+
+/**
+ * 检查磁盘上的安装脚本够不够新。
+ *
+ * 🔴 为什么要查：安装动作会替换 scripts/。老机器上的老脚本会让更新
+ *    再次变成「502」，而用户完全看不出原因。
+ *    面板上提前告诉他「脚本太旧，本次会用包里的新脚本」更保险。
+ */
+export function checkInstaller() {
+  const script = path.join(ROOT, 'scripts', 'kernel-install.mjs');
+  if (!fs.existsSync(script)) {
+    return { ok: false, exists: false, outdated: true, current: '', required: REQUIRED_INSTALLER_VERSION };
+  }
+  let current = '';
+  try {
+    const txt = fs.readFileSync(script, 'utf8');
+    current = /INSTALLER_VERSION\s*=\s*['"]([^'"]+)['"]/.exec(txt)?.[1] || '';
+  } catch { /* 读不了当旧版 */ }
+  // 没有标记 = 旧脚本（标记是 1.1.0 才加的）
+  const outdated = !current || compareVersion(current, REQUIRED_INSTALLER_VERSION) < 0;
+  return { ok: true, exists: true, outdated, current: current || '（无标记，视为旧版）', required: REQUIRED_INSTALLER_VERSION };
+}
+
+/** 上次安装结果 */
+export function lastInstallResult() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'kernel-updates', 'last-install.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}

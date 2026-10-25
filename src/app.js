@@ -12,7 +12,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { getConfig, updateConfig, ROOT, DATA_DIR, COMMUNITY } from './config.js';
-import { checkKernelUpdate, downloadKernelUpdate, localKernelVersion, listDownloaded, publishKernel, canPublishKernel } from './kernel-update.js';
+import { checkKernelUpdate, downloadKernelUpdate, localKernelVersion, listDownloaded, publishKernel, canPublishKernel, autoInstallKernel, readInstallLog, lastInstallResult, checkInstaller } from './kernel-update.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments } from './onebot.js';
 import { ChatStore } from './store.js';
 import { MemoryStore } from './memory.js';
@@ -32,6 +32,8 @@ import { projectLegacyConfig, splitLegacyPatch } from './core/config-compat.js';
 import { registerPluginAdmin } from './core/plugin-admin.js';
 import { listSkills, getSkillBody, reloadUserSkills, userSkillDir } from './skill.js';
 import { fetchSkillIndex, publishSkill, installSkill, unpublishSkill, checkSkillUpdates } from './skill-market.js';
+import { probeRepo, parseRepoUrl } from './market-submit.js';
+import { submitFeedback, listFeedback, collectEnv, feedbackStats } from './feedback.js';
 
 /**
  * 把面板传来的值规范成字符串数组。
@@ -55,6 +57,46 @@ import crypto from 'node:crypto';
 
 // 验证码暂存（中心端，内存即可 —— 重启失效是特性不是缺陷）
 const authCodes = new Map();     // email -> { code, at }
+
+// ── 中心端用户档案（2026-10-25）──
+//
+// 🔴 用户指出："他们注册的时候不是走我们的后端嘛？
+//    那时候就要记录他们的用户数据才行"
+//
+// 完全正确。原来 /api/auth/verify 只校验验证码就返回 ok，
+// **从不记录谁注册了** —— 结果中心服务器只知道"发过码"，
+// 不知道"谁成了作者"，管理后台自然看不到别人的邮箱。
+//
+// 注册走的是我们的服务，用户数据就该落在我们这里。
+// 存 data/market-users.json（明文邮箱 + 注册时间 + 来源 IP 的地区）。
+const MARKET_USERS_FILE = path.join(DATA_DIR, 'market-users.json');
+
+const loadMarketUsers = () => {
+  try { return JSON.parse(fs.readFileSync(MARKET_USERS_FILE, 'utf8')); }
+  catch { return { users: [] }; }
+};
+const saveMarketUsers = (d) => {
+  try {
+    fs.mkdirSync(path.dirname(MARKET_USERS_FILE), { recursive: true });
+    fs.writeFileSync(MARKET_USERS_FILE, JSON.stringify(d, null, 2), 'utf8');
+  } catch { /* 落盘失败不该阻断注册 */ }
+};
+
+/** 记录/更新一个中心端用户 */
+const recordMarketUser = (email, extra = {}) => {
+  const d = loadMarketUsers();
+  const now = new Date().toISOString();
+  const hit = (d.users || []).find((u) => u.email === email);
+  if (hit) {
+    hit.lastSeenAt = now;
+    Object.assign(hit, extra);
+  } else {
+    d.users = d.users || [];
+    d.users.push({ email, firstSeenAt: now, lastSeenAt: now, ...extra });
+  }
+  saveMarketUsers(d);
+  return d.users.find((u) => u.email === email);
+};
 const authSendLog = new Map();   // email -> 上次发送时间
 const authIpLog = new Map();     // ip -> [时间戳]
 
@@ -733,6 +775,69 @@ export function createApp({ log = console.log } = {}) {
       const method = req.method;
       const cfgNow = getConfig();
 
+      // ── 内核 BUG 反馈 / 优化建议（2026-10-25）──
+      //
+      // 🔴 必须创造营登录后才能用：读 data/plugins/plugin-market/author.json。
+      //    那是创造营验证过的作者身份，不另建账号体系。
+      if (pathname === '/api/feedback/ping' && method === 'GET') {
+        let author = null;
+        try {
+          const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
+          if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch { /* 没有档案 */ }
+        const logged = !!author?.email;
+        return json(res, 200, {
+          ok: true,
+          logged,
+          who: logged ? { nickname: author.nickname || '', email: author.email || '' } : null,
+          env: collectEnv(),
+          stats: logged ? feedbackStats(String(author.email).toLowerCase()) : null
+        });
+      }
+
+      if (pathname === '/api/feedback/submit' && method === 'POST') {
+        let author = null;
+        try {
+          const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
+          if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch { /* ignore */ }
+        if (!author?.email) {
+          return json(res, 403, { ok: false, error: '请先到「BG创造营 → 发布」登录作者账号' });
+        }
+        const body = await readBody(req, { limitMB: 4 }).catch(() => ({}));
+        const r = submitFeedback(author, body);
+        if (r.ok) log(`[反馈] ${author.email} 提交了 ${r.record.type}：${r.record.title}`);
+        return json(res, r.ok ? 200 : 400, r);
+      }
+
+      if (pathname === '/api/feedback/list' && method === 'GET') {
+        let author = null;
+        try {
+          const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
+          if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch { /* ignore */ }
+        if (!author?.email) return json(res, 403, { ok: false, error: '请先登录' });
+        const items = listFeedback({ email: String(author.email).toLowerCase() });
+        return json(res, 200, {
+          ok: true,
+          items: items.map(({ dir, ...rest }) => rest)   // 不暴露服务器路径
+        });
+      }
+
+      // ── 外部投稿：探测 GitHub/Gitee 仓库（2026-10-25）──
+      //
+      // 只读探测：读 qqagent-market.json 或 manifest.json，不下载整包。
+      if (pathname === '/api/market-submit/probe' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const r = await probeRepo(String(body?.url || ''));
+        return json(res, 200, r);
+      }
+
+      if (pathname === '/api/market-submit/parse' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        return json(res, 200, parseRepoUrl(String(body?.url || '')));
+      }
+
       // ── Skill 市场（2026-10-25）──
       //
       // 与插件市场的区别：skill 是单个 .md，装上即生效，不用重启。
@@ -849,6 +954,35 @@ export function createApp({ log = console.log } = {}) {
 
       if (pathname === '/api/kernel/downloaded' && method === 'GET') {
         return json(res, 200, { ok: true, items: listDownloaded() });
+      }
+
+      // ── 手动安装（2026-10-25 补 · 之前只有自动那条路有，手动点「安装」404）──
+      //
+      // 🔴 历史坑：autoInstallKernel 写好了、也 import 了，但 HTTP 路由从没注册，
+      //    只有后台定时器在用 → 界面点「安装」直接 404。
+      if (pathname === '/api/kernel/install' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        // 没指定就用刚下载的那个
+        const file = String(body?.file || '').trim() || (listDownloaded()[0]?.file || '');
+        if (!file) {
+          return json(res, 400, { ok: false, error: '没有已下载的安装包，请先点「下载」' });
+        }
+        const r = await autoInstallKernel(file);
+        return json(res, r.ok ? 200 : 400, r);
+      }
+
+      // 安装进度（界面轮询）
+      // 安装脚本版本检查（前端用来提示「脚本太旧」）
+      if (pathname === '/api/kernel/installer-check' && method === 'GET') {
+        return json(res, 200, checkInstaller());
+      }
+
+      if (pathname === '/api/kernel/install-log' && method === 'GET') {
+        return json(res, 200, {
+          ok: true,
+          log: readInstallLog(80),
+          last: lastInstallResult()
+        });
       }
 
       // 关于 / 交流群（2026-10-24）：只读，供控制台「关于」区展示
@@ -1540,6 +1674,49 @@ export function createApp({ log = console.log } = {}) {
         return json(res, 200, { ok: true, message: '验证码已发送' });
       }
 
+      // ── 补偿上报（2026-10-25）──
+      //
+      // 用户要求："新版本更新完首次启动就抓用户数据上传，
+      //           我们可以补上刚刚的注册作者的信息"
+      //
+      // 场景：老用户在本机注册过作者（author.json 里有邮箱），
+      // 但那时候中心端还没做登记功能，所以中心没有他的记录。
+      //
+      // 这个接口让客户端上报自己本地的作者档案，补齐历史数据。
+      //
+      // 安全设计：
+      //   · 只接受 email + qq + nickname，不接受任意字段
+      //   · 已有记录就只更新 lastSeenAt，不覆盖（防篡改邮箱归属）
+      //   · 带限流（同 IP 每小时 20 次），防止被拿来刷数据
+      if (pathname === '/api/auth/register-report' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const email = String(body?.email || '').trim().toLowerCase();
+        if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) {
+          return json(res, 400, { ok: false, error: '邮箱格式不对' });
+        }
+
+        const ip = String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress || '');
+        const now = Date.now();
+        const arr = (authIpLog.get(ip) || []).filter((x) => now - x < 3600 * 1000);
+        if (arr.length >= 20) {
+          return json(res, 429, { ok: false, error: '上报太频繁了' });
+        }
+        arr.push(now);
+        authIpLog.set(ip, arr);
+
+        const existed = loadMarketUsers().users?.some((u) => u.email === email);
+        const u = recordMarketUser(email, {
+          qq: String(body?.qq || '').trim(),
+          nickname: String(body?.nickname || '').trim().slice(0, 20),
+          lastIp: ip,
+          verified: true,
+          // 标记来源：区分"注册时登记的"和"客户端补报的"
+          reportedByClient: !existed,
+        });
+        log(`[auth] 客户端补报用户：${email.replace(/^(.{3}).*(@.*)$/, '$1***$2')}${existed ? '（已存在，仅刷新时间）' : '（新增）'}`);
+        return json(res, 200, { ok: true, existed: !!existed, email: u.email });
+      }
+
       if (pathname === '/api/auth/verify' && method === 'POST') {
         const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
         const email = String(body?.email || '').trim().toLowerCase();
@@ -1554,7 +1731,18 @@ export function createApp({ log = console.log } = {}) {
           return json(res, 400, { ok: false, error: '验证码不对' });
         }
         authCodes.delete(email);
-        return json(res, 200, { ok: true });
+
+        // 记录用户档案 —— 注册走我们的服务，数据就该落在我们这里
+        const ip = String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress || '');
+        const u = recordMarketUser(email, {
+          qq: String(body?.qq || '').trim(),
+          nickname: String(body?.nickname || '').trim().slice(0, 20),
+          lastIp: ip,
+          verified: true,
+        });
+        log(`[auth] 新用户登记：${email.replace(/^(.{3}).*(@.*)$/, '$1***$2')}`);
+
+        return json(res, 200, { ok: true, user: { email: u.email, firstSeenAt: u.firstSeenAt } });
       }
 
       if (pathname === '/api/mail' && method === 'GET') {
@@ -2061,6 +2249,7 @@ export function createApp({ log = console.log } = {}) {
    *   · 之后按 config.kernelUpdate.checkIntervalHours 周期查（默认 24h）
    *   · 查到新版 → 记进 config.lastSeenVersion，前端「关于」页显示提示
    *   · autoDownload=true 时顺带下载并校验（仍不安装）
+   *   · autoInstall=true 时下载 + 延时安装（会重启服务，失败自动回滚）
    *   · 网络不通只记日志，不影响任何功能
    */
   let _kernelCheckTimer = null;
@@ -2082,13 +2271,44 @@ export function createApp({ log = console.log } = {}) {
         log(`[内核更新] 发现新版本 ${r.latest}（当前 ${r.current}）`);
         updateConfig({ kernelUpdate: { lastSeenVersion: r.latest } });
 
-        if (cfgNow.autoDownload === true) {
-          log('[内核更新] 已开启自动下载，开始下载…');
+        // 自动安装优先于自动下载（装了就不用单独下了）
+        const wantInstall = cfgNow.autoInstall === true;
+        const wantDownload = wantInstall || cfgNow.autoDownload === true;
+
+        if (wantDownload) {
+          log(`[内核更新] 开始下载 v${r.latest}${wantInstall ? '（自动安装已开启）' : ''}…`);
           const d = await downloadKernelUpdate();
-          if (d.ok && !d.upToDate) {
-            log(`[内核更新] 已下载 v${d.version} → ${d.file}（校验${d.verified ? '通过' : '跳过'}），等待手动安装`);
-          } else {
-            log(`[内核更新] 下载失败：${d.error || '未知'}`);
+          if (!d.ok || d.upToDate) {
+            log(`[内核更新] 下载失败：${d.error || '已是新版'}`);
+            return;
+          }
+          log(`[内核更新] 已下载 v${d.version}（校验${d.verified ? '通过' : '跳过'}）`);
+
+          if (wantInstall) {
+            const delayMin = Math.max(1, Number(cfgNow.installDelayMinutes) || 5);
+            log(`[内核更新] ${delayMin} 分钟后自动安装（期间可随时关掉这个开关取消）`);
+
+            // 延时安装：给用户留出取消窗口，也避开刚启动的忙碌期
+            setTimeout(async () => {
+              try {
+                // 安装前再确认一次开关还开着（用户可能中途关了）
+                const now = getConfig().kernelUpdate || {};
+                if (now.autoInstall !== true) {
+                  log('[内核更新] 自动安装已被关闭，跳过');
+                  return;
+                }
+                log(`[内核更新] 开始自动安装 v${d.version}`);
+                const inst = await autoInstallKernel(d.file);
+                if (inst.ok) {
+                  updateConfig({ kernelUpdate: { lastInstallAt: new Date().toISOString() } });
+                  log(`[内核更新] 安装已启动（pid ${inst.pid}），服务即将重启`);
+                } else {
+                  log(`[内核更新] 安装未启动：${inst.error}`);
+                }
+              } catch (e) {
+                log(`[内核更新] 自动安装异常：${e?.message ?? e}`);
+              }
+            }, delayMin * 60 * 1000).unref?.();
           }
         }
       } catch (e) {
