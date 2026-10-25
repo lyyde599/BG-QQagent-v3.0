@@ -27,6 +27,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { ROOT } from '../config.js';
 import { PLUGIN_API_VERSION, normalizeManifest } from './manifest.js';
+import { getGrant, grant, revoke, describePermissions } from './plugin-grants.js';
 import {
   pluginDataDir, inspectData, clearDirContents, collectDataEntries,
   restoreDataEntries, humanSize
@@ -160,8 +161,14 @@ export function registerPluginAdmin(host, { getConfig, log }) {
     exportModes: Object.values(EXPORT_MODES).map(({ id, label, desc }) => ({ id, label, desc })),
     plugins: host.list().map((p) => {
       const d = inspectData(p.id);
+      const rec = host.records.get(p.id);
       return {
         ...p,
+        // 🔴 core / coreReason 透出给前端（2026-10-25）
+        // 前端据此把「停用」「卸载」按钮置灰并说明原因，
+        // 而不是让用户点了才被后端拒绝。
+        core: rec?.manifest?.core === true,
+        coreReason: rec?.manifest?.coreReason || '',
         data: { exists: d.exists, fileCount: d.files.length, bytes: d.totalBytes, sizeText: humanSize(d.totalBytes) }
       };
     }),
@@ -219,6 +226,24 @@ export function registerPluginAdmin(host, { getConfig, log }) {
     const id = String(body?.id || '');
     const rec = host.records.get(id);
     if (!rec) return { ok: false, error: '没有该插件' };
+
+    // 🔴 核心插件不可停用（2026-10-25）
+    //
+    // 起因：把「插件市场」做成了核心页签（内核给位置，插件给内容）。
+    // 但它本质上还是插件 —— 如果被误关，那个页签就白屏，
+    // 更糟的是：连"装别的插件"这个能力也没了。
+    //
+    // manifest.core = true 的插件受此保护。
+    // 报错文案要说清"为什么不让关"，不能只说"不允许"。
+    if (rec.manifest?.core === true) {
+      return {
+        ok: false,
+        error: `「${rec.manifest.name || id}」是核心插件，不能停用`,
+        reason: rec.manifest.coreReason || '停用后会影响基础功能',
+        core: true
+      };
+    }
+
     const cfg = rec.config;
     await host.disable(id);
     cfg?.set({ enabled: false });
@@ -294,6 +319,17 @@ export function registerPluginAdmin(host, { getConfig, log }) {
     if (!ID_RE.test(id)) return { ok: false, error: 'id 不合法' };
     const purge = body?.purgeData === true;
     const rec = host.records.get(id);
+
+    // 🔴 核心插件不可卸载（同 disable 的保护）
+    if (rec?.manifest?.core === true) {
+      return {
+        ok: false,
+        error: `「${rec.manifest.name || id}」是核心插件，不能卸载`,
+        reason: rec.manifest.coreReason || '卸载后会影响基础功能',
+        core: true
+      };
+    }
+
     if (rec) await host.disable(id);
 
     const dir = path.join(PLUGINS_DIR, id);
@@ -349,6 +385,54 @@ export function registerPluginAdmin(host, { getConfig, log }) {
     };
   });
 
+  // ── 权限授权接口（2026-10-25）──
+  add('GET', '/api/plugins/grants', () => {
+    const out = {};
+    for (const p of host.list()) {
+      const rec = host.records.get(p.id);
+      const declared = rec?.manifest?.permissions || [];
+      if (!declared.length) continue;
+      const g = getGrant(p.id);
+      out[p.id] = {
+        declared,
+        granted: g?.granted || null,
+        grantedAt: g?.grantedAt || null,
+        grantedVersion: g?.version || null,
+        // 已声明但没授权的
+        missing: g ? declared.filter((x) => !(g.granted || []).includes(x)) : declared,
+        needsConfirm: !g,
+      };
+    }
+    return { ok: true, grants: out };
+  });
+
+  add('POST', '/api/plugins/grant', async (_req, body) => {
+    const id = String(body?.id || '');
+    const rec = host.records.get(id);
+    if (!rec) return { ok: false, error: '没有该插件' };
+    const declared = rec.manifest?.permissions || [];
+    const want = Array.isArray(body?.permissions) ? body.permissions.map(String) : declared;
+    // 只能授已声明的权限，防止前端乱传
+    const allow = want.filter((p) => declared.includes(p));
+    const g = grant(id, allow, rec.manifest.version || '');
+    log(`[plugins] ${id} 已授权：${allow.join(', ') || '（无）'}`);
+    return { ok: true, grant: g };
+  });
+
+  add('POST', '/api/plugins/revoke', (_req, body) => {
+    const id = String(body?.id || '');
+    if (!host.records.get(id)) return { ok: false, error: '没有该插件' };
+    revoke(id);
+    log(`[plugins] ${id} 授权已撤销`);
+    return { ok: true };
+  });
+
+  /** 安装前预演：这个包要什么权限，按风险分组 */
+  add('POST', '/api/plugins/permissions/preview', (_req, body) => {
+    const perms = Array.isArray(body?.permissions) ? body.permissions.map(String) : [];
+    return { ok: true, groups: describePermissions(perms) };
+  });
+
   // ── 导出（raw：直接吐 gzip 字节）──
   add('GET', '/api/plugins/export', async (_req, _body, url) => {
     const id = String(url?.searchParams?.get('id') || '');
@@ -358,6 +442,16 @@ export function registerPluginAdmin(host, { getConfig, log }) {
 
     const modeId = String(url?.searchParams?.get('mode') || 'config');
     const mode = EXPORT_MODES[modeId] || EXPORT_MODES.config;
+
+    // stripAssets=1：排除 assets/ 下的二进制素材（图片/音视频）
+    //
+    // 为什么需要：grail 的 assets 有 37MB（64 张立绘 + 场景图），
+    // 而代码只有 0.5MB。把素材塞进插件包导致：
+    //   · 市场下载慢、每次改代码都要重传 37MB
+    //   · 存储被图片吃掉
+    // 素材应该单独托管，插件包只带代码 + 清单。
+    const stripAssets = url?.searchParams?.get('stripAssets') === '1';
+    const ASSET_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.webm', '.mp3', '.wav', '.ogg']);
 
     // ① 代码与资源（永远带上，但跳过导出过程本身生成的元文件）
     const files = [];
@@ -376,7 +470,9 @@ export function registerPluginAdmin(host, { getConfig, log }) {
         if (!ent.isFile()) continue;
         if (r === 'config.json' || r === '_export.json') continue;   // 单独处理
         if (EXPORT_EXCLUDE_FILES.has(ent.name)) { skipped.push(r); continue; }
-        if (EXPORT_EXCLUDE_EXT.has(path.extname(ent.name).toLowerCase())) { skipped.push(r); continue; }
+        const ext = path.extname(ent.name).toLowerCase();
+        if (EXPORT_EXCLUDE_EXT.has(ext)) { skipped.push(r); continue; }
+        if (stripAssets && ASSET_EXT.has(ext)) { skipped.push(r); continue; }
 
         files.push([`${id}/${r}`, fs.readFileSync(full)]);
       }
@@ -462,6 +558,26 @@ export function registerPluginAdmin(host, { getConfig, log }) {
 
     const targetDir = path.join(PLUGINS_DIR, id);
     const existed = fs.existsSync(targetDir);
+
+    // ── 预演模式（2026-10-25）──
+    //
+    // dryRun=true 时只解析、不写盘，返回这个包的元信息。
+    // 为什么要它：插件能执行任意代码，安装前必须把
+    // 作者/版本/申请的权限摊给用户看，确认后才真的装。
+    // 没有预演就只能"点了才知道装的是什么"，那等于把风险藏起来。
+    if (body?.dryRun === true) {
+      return {
+        ok: true,
+        dryRun: true,
+        manifest: norm.manifest,
+        existed,
+        fileCount: entries.length,
+        hasData: entries.some(([n]) => n.startsWith(`${rootName}/data/`)),
+        permissions: norm.manifest.permissions || [],
+        size: Buffer.from(String(b64), 'base64').length,
+      };
+    }
+
     if (existed && !replaceMode) {
       return { ok: false, error: `插件 ${id} 已存在；如需覆盖请勾选「覆盖安装」` };
     }

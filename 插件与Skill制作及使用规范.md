@@ -238,6 +238,53 @@ export async function activate(ctx) {
 }
 ```
 
+### 4.0 给「管理类插件」的四个新能力（2026-10-24）
+
+如果你写的是**插件市场 / 插件管理器**这类要装卸别人的插件，别再去摸内核内部结构了，
+用下面这四个（都有稳定性契约）：
+
+```js
+// ① 插件宿主 API —— 装卸查
+ctx.pluginHost.list()                        // [{ id, version, status, dir, lastError }]
+await ctx.pluginHost.enableFromDir(dir)      // 内核自己读 manifest/归一化/校验
+await ctx.pluginHost.disable(id)
+await ctx.pluginHost.reload(id)
+const off = ctx.pluginHost.onChange(evt => { /* { type:'add'|'remove'|'change', id } */ })
+
+// ② 路径 —— 别再 path.resolve(HERE, '../..')
+ctx.paths.root          // 内核根
+ctx.paths.plugins       // plugins/ 目录
+ctx.paths.data          // data/ 目录
+ctx.paths.pluginData    // data/plugins/<本插件id>
+ctx.paths.store('x.json')  // 等价 ctx.data.file
+
+// ③ manifest 归一化 —— 别再 import '../../src/core/manifest.js'
+const r = ctx.normalizeManifest(rawJson, { dirName: 'my-plugin' });
+// → { ok: true, manifest } 或 { ok: false, error }
+
+// ④ 能力探测 —— 别再读源码文本找关键字
+ctx.capabilities = {
+  apiVersion, inlinePanel, hotLoad, pluginHostApi,
+  pathsApi, normalizeApi, kernelUpgrade, onChange, hooks: [...]
+}
+```
+
+**为什么不能用老办法**
+
+| 老做法 | 后果 |
+|:--|:--|
+| `host.records` 直接摸 Map | 内核重构（改名/换存储）就崩 |
+| `import '../../src/core/manifest.js'` | 插件装到别的布局 → `ERR_MODULE_NOT_FOUND` |
+| `path.resolve(HERE, '../..')` | 同上，数据可能写到不该写的地方 |
+| 读源码字符串猜能力（`kernelHas('xxx')`） | 内核改个注释就误判 |
+
+**降级约定**：这些能力可能存在也可能不存在（老内核），调用前先探测：
+
+```js
+if (ctx.capabilities?.pluginHostApi) { /* 用新 API */ }
+else { /* 退回自己读目录 + enable() */ }
+```
+
 | 成员 | 用途 |
 |:--|:--|
 | `ctx.id` / `ctx.version` / `ctx.manifest` / `ctx.dir` | 自身信息与插件目录绝对路径 |

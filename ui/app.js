@@ -1723,10 +1723,17 @@ async function syncPluginTabs() {
     }
   }
   // 清理已卸载插件的视图
+  //
+  // 🔴 2026-10-25 修：**内置视图必须列全**，漏一个就会被误删。
+  //    事故：加了 view-market（创造营核心页签）却忘了加进下面这个白名单，
+  //    结果每次刷新页面，这段清理逻辑都会把它 remove() 掉 ——
+  //    服务端 HTML 明明有，DOM 里却找不到，页签点开一片空白。
+  //
+  //    凡是 ui/index.html 里写死的 <section id="view-xxx">，都必须在这里列出。
   const alive = new Set(tabs.map((t) => t.id));
+  const builtin = ['sessions', 'chats', 'snowluma', 'plugins', 'skills', 'settings', 'market'];
   $$('[id^="view-"]').forEach((v) => {
     const id = v.id.slice(5);
-    const builtin = ['sessions', 'chats', 'snowluma', 'plugins', 'settings'];
     if (!builtin.includes(id) && !alive.has(id)) v.remove();
   });
 
@@ -1745,6 +1752,49 @@ async function syncPluginTabs() {
 }
 
 /** 统一的页签加载分发（新增页签只改这里） */
+// ── 市场页（核心页签，内容来自插件）──────────────────────────────
+//
+// 插件的 ui.js 通过 mountPluginUi 动态 import，
+// 和「内联插件面板」走同一条路 —— 不为市场单独写一套加载逻辑。
+async function loadMarketPage() {
+  const box = $('#market-page');
+  if (!box) return;
+
+  try {
+    // 确认插件存在且启用
+    const d = await api('/api/plugins');
+    const meta = (d.plugins || []).find((p) => p.id === 'plugin-market');
+    if (!meta) {
+      box.innerHTML = `<div class="card"><h3>创造营</h3>
+        <p class="muted">找不到 plugin-market 插件。它本该随内核一起提供 ——
+        如果被误删，从发布包里恢复 plugins/plugin-market/ 即可。</p></div>`;
+      return;
+    }
+    if (meta.status !== 'enabled') {
+      box.innerHTML = `<div class="card"><h3>创造营</h3>
+        <p class="muted">创造营已被停用（当前状态：${esc(meta.status)}）。</p>
+        <p class="muted" style="font-size:12.5px">它是核心功能，正常不该被关。
+        到「插件」页把它重新启用即可。</p></div>`;
+      return;
+    }
+
+    const mod = await loadPluginUi('plugin-market', meta.ui || 'ui.js');
+    const mount = mod?.mountPanel || mod?.mount;
+    if (typeof mount !== 'function') {
+      box.innerHTML = `<div class="card"><h3>创造营</h3>
+        <p class="muted">界面文件没有导出 mount / mountPanel。</p></div>`;
+      return;
+    }
+    box.innerHTML = '';
+    await mount(box, { ...pluginUiContext('plugin-market'), openPluginPanel });
+    box.dataset.mounted = '1';
+  } catch (e) {
+    box.innerHTML = `<div class="card"><h3>创造营</h3>
+      <p class="muted">加载失败：${esc(String(e?.message ?? e))}</p>
+      <p class="muted" style="font-size:12.5px">刷新页面重试；若持续失败，检查 /api/market/index 是否可达。</p></div>`;
+  }
+}
+
 function dispatchTabLoad(name) {
   // ── 内核自带的页签 ──
   if (name === 'sessions') return loadSessions();
@@ -1752,6 +1802,18 @@ function dispatchTabLoad(name) {
   if (name === 'snowluma') return loadSnowlumaPage();
   if (name === 'settings') return loadSettings();
   if (name === 'plugins') return loadPluginsPage();
+  // ── 插件市场（核心页签，2026-10-25）──
+  //
+  // 设计意图（用户要求「市场作为核心包功能」）：
+  //   · 页签是内核内置的 → 用户关不掉，市场永远可用
+  //   · 但界面代码仍在 plugins/plugin-market/ui.js → 可独立更新
+  //
+  // 为什么不把整套逻辑搬进内核：
+  //   内核现在很精简（依赖只有 4 个），塞一个市场进去会破坏这个优点。
+  //   这里是「内核给位置，插件给内容」—— 两者解耦。
+  //
+  // 插件被禁用时给出提示，而不是白屏。
+  if (name === 'market') return loadMarketPage();
   if (name === 'skills') { loadSkillsPage().then(bindSkillsEvents); return; }
 
   // ── 插件页签（2026-10-21）──
@@ -1777,6 +1839,7 @@ function renderAboutSection(c) {
   const name = String(k.name || '').trim();
   const intro = String(k.intro || '').trim();
   const repo = String(k.repo || '').trim();
+  const gitee = String(k.gitee || '').trim();
 
   return `
     <h3>关于</h3>
@@ -1801,11 +1864,36 @@ function renderAboutSection(c) {
       </div>
     </div>` : ''}
 
-    ${repo ? `
-    <h3 style="margin-top:24px">项目主页</h3>
-    <div class="muted" style="font-size:13px">
-      <a href="${esc(repo)}" target="_blank" rel="noopener">${esc(repo)}</a>
+    ${(repo || gitee) ? `
+    <h3 style="margin-top:24px">开源地址</h3>
+    <div style="padding:14px 16px;border:1px solid var(--line2);border-radius:var(--r);background:var(--panel)">
+      <div style="font-size:13px;margin-bottom:10px">
+        这个项目是开源的。如果它帮到了你，去点个 Star 就是最好的支持 ⭐
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        ${repo ? `<a class="btn tiny" href="${esc(repo)}" target="_blank" rel="noopener">GitHub · 点 Star</a>` : ''}
+        ${gitee ? `<a class="btn tiny" href="${esc(gitee)}" target="_blank" rel="noopener">Gitee · 点 Star</a>` : ''}
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:10px;line-height:1.7">
+        ${repo ? `GitHub：${esc(repo)}<br>` : ''}
+        ${gitee ? `Gitee：${esc(gitee)}<br>` : ''}
+        <span style="font-size:11.5px">国内访问 Gitee 更快，两边代码同步。</span>
+      </div>
     </div>` : ''}
+
+    <h3 style="margin-top:24px">内核版本</h3>
+    <div id="about-kernel" style="padding:14px 16px;border:1px solid var(--line2);border-radius:var(--r);background:var(--panel)">
+      <div class="row" style="gap:12px;align-items:center;flex-wrap:wrap">
+        <span style="font-size:13px">当前版本</span>
+        <code id="about-ver" style="font-size:14px">—</code>
+        <button class="btn tiny" id="about-check">检查更新</button>
+        <span id="about-update-msg" class="muted" style="font-size:12px"></span>
+      </div>
+      <div id="about-update-body" class="muted" style="font-size:12px;margin-top:10px;line-height:1.7"></div>
+    </div>
+
+    <div id="about-autocheck" style="margin-top:10px"></div>
+    <div id="about-publish" style="margin-top:14px"></div>
 
     <h3 style="margin-top:24px">运行环境</h3>
     <div class="muted" style="font-size:13px;line-height:1.9">
@@ -2016,6 +2104,160 @@ function renderSettings() {
           toast('复制失败，请手动选中');
         }
       });
+
+      // ── 内核版本 / 检查更新（2026-10-25）──
+      const verEl = $('#about-ver');
+      const msgEl = $('#about-update-msg');
+      const bodyEl = $('#about-update-body');
+      const setMsg = (s) => { if (msgEl) msgEl.textContent = s; };
+      const setBody = (h) => { if (bodyEl) bodyEl.innerHTML = h; };
+
+      api('/api/kernel/version').then((v) => {
+        if (verEl) verEl.textContent = v?.version || '未知';
+      }).catch(() => { if (verEl) verEl.textContent = '未知'; });
+
+      $('#about-check')?.addEventListener('click', async () => {
+        setMsg('检查中…'); setBody('');
+        try {
+          const r = await api('/api/kernel/check');
+          if (!r.ok) { setMsg('检查失败：' + (r.error || '未知')); return; }
+          if (!r.hasUpdate) { setMsg(`已是最新（${r.current}）`); return; }
+          const rel = r.release || {};
+          setMsg(`有新版本 ${rel.version}（当前 ${r.current}）`);
+          setBody(`
+            <div style="margin-bottom:8px">${esc(String(rel.notes || '').slice(0, 600)).replace(/\n/g, '<br>')}</div>
+            <div style="margin-top:8px">
+              <button class="btn tiny" id="about-dl">下载更新包</button>
+              <span class="muted" style="font-size:11.5px;margin-left:8px">只下载不覆盖，下载后给你安装指引</span>
+            </div>`);
+          $('#about-dl')?.addEventListener('click', async () => {
+            setMsg('下载中…');
+            try {
+              const d2 = await api('/api/kernel/download', { method: 'POST' });
+              if (!d2.ok) { setMsg('下载失败：' + (d2.error || '未知')); return; }
+              if (d2.upToDate) { setMsg('已是最新'); return; }
+              setMsg(`已下载 v${d2.version}（${(d2.bytes / 1024 / 1024).toFixed(1)}MB，校验${d2.verified ? '通过' : '跳过'}）`);
+              setBody(`
+                <div style="margin-bottom:6px">安装包：<code>${esc(d2.file)}</code></div>
+                <div style="margin-bottom:6px"><b>不会自动覆盖现有内核</b>，确认后按下面步骤手动装：</div>
+                <ol style="margin:6px 0 0 18px;line-height:1.8">
+                  ${(d2.steps || []).map((s) => `<li>${esc(s)}</li>`).join('')}
+                </ol>`);
+              toast('更新包已下载');
+            } catch (e) { setMsg('下载失败：' + e.message); }
+          });
+        } catch (e) { setMsg('检查失败：' + e.message); }
+      });
+
+      // ── 自动检查开关（2026-10-25）──
+      //
+      // 只做「查 + 提示 + 可选下载」，永远不自动安装。
+      (async () => {
+        const box = $('#about-autocheck');
+        if (!box) return;
+        let cfgNow = {};
+        try { cfgNow = (await api('/api/config'))?.kernelUpdate || {}; } catch { /* ignore */ }
+        const onCheck = cfgNow.autoCheck !== false;
+        const onDl = cfgNow.autoDownload === true;
+        const lastAt = cfgNow.lastCheckAt ? fmtTime(cfgNow.lastCheckAt) : '尚未检查';
+
+        box.innerHTML = `
+          <div style="padding:14px 16px;border:1px solid var(--line2);border-radius:var(--r);background:var(--panel)">
+            <div style="font-size:13px;font-weight:600;margin-bottom:8px">自动检查</div>
+            <label class="row" style="gap:6px;font-size:13px">
+              <input type="checkbox" id="kc-auto" ${onCheck ? 'checked' : ''}>
+              定期检查新版本（发现后在这里提示）
+            </label>
+            <label class="row" style="gap:6px;font-size:13px;margin-top:6px">
+              <input type="checkbox" id="kc-dl" ${onDl ? 'checked' : ''}>
+              发现新版后自动下载并校验（<b>不会自动安装</b>）
+            </label>
+            <div class="muted" style="font-size:12px;margin-top:8px">
+              上次检查：${esc(lastAt)} · 每 ${esc(String(cfgNow.checkIntervalHours || 24))} 小时一次
+            </div>
+            <div class="muted" style="font-size:12px;margin-top:4px">
+              内核替换永远需要你手动确认 —— 自动覆盖会把本机定制改动冲掉。
+            </div>
+          </div>`;
+
+        const save = async (patch) => {
+          try {
+            await api('/api/config', { method: 'POST', body: { kernelUpdate: { ...cfgNow, ...patch } } });
+            cfgNow = { ...cfgNow, ...patch };
+            toast('已保存');
+          } catch (e) { toast('保存失败：' + e.message); }
+        };
+        box.querySelector('#kc-auto')?.addEventListener('change', (ev) => save({ autoCheck: ev.target.checked }));
+        box.querySelector('#kc-dl')?.addEventListener('change', (ev) => save({ autoDownload: ev.target.checked }));
+      })();
+
+      // ── 作者发布区（2026-10-25）──
+      //
+      // 仅作者可见。复用创造营的作者账号（author.json），不另建一套认证。
+      (async () => {
+        const box = $('#about-publish');
+        if (!box) return;
+        let st;
+        try { st = await api('/api/kernel/can-publish'); } catch { return; }
+        if (!st?.ok) return;
+
+        // 未注册作者：不显示发布区（避免普通用户困惑）
+        if (!st.author?.verified) {
+          box.innerHTML = `
+            <div class="muted" style="font-size:12px;padding:10px 12px;border:1px dashed var(--line2);border-radius:var(--r)">
+              想发布自己的内核改版？先到「创造营」注册作者账号。
+            </div>`;
+          return;
+        }
+
+        const who = st.author.nickname || st.author.email || '作者';
+        box.innerHTML = `
+          <div style="padding:14px 16px;border:1px solid var(--acc);border-radius:var(--r);background:var(--panel)">
+            <div style="font-size:13px;font-weight:600;margin-bottom:8px">发布内核新版本</div>
+            <div class="muted" style="font-size:12px;margin-bottom:10px">
+              当前作者：<b>${esc(who)}</b>
+              ${st.hasCredentials ? '' : ' · ⚠ 本机没有发布凭据（R2），只能打包不能上传'}
+            </div>
+            <div class="field" style="margin-bottom:10px">
+              <label class="muted" style="font-size:12px">更新说明（会显示在别人的更新提示里）</label>
+              <textarea id="kp-notes" rows="3" style="width:100%;font-size:12.5px"
+                placeholder="这次改了什么？一两句话说清即可"></textarea>
+            </div>
+            <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
+              <button class="btn tiny" id="kp-dry">先看包大小</button>
+              <button class="btn primary tiny" id="kp-pub" ${st.hasCredentials ? '' : 'disabled'}>打包并发布</button>
+              <span id="kp-msg" class="muted" style="font-size:12px"></span>
+            </div>
+            <div class="muted" style="font-size:12px;margin-top:8px">
+              发布 = 把当前内核打成 tar.gz → 上传市场 → 更新版本清单。
+              别人在「检查更新」里就会看到这个版本。
+            </div>
+          </div>`;
+
+        const msg = (s) => { const el = box.querySelector('#kp-msg'); if (el) el.textContent = s; };
+        const notes = () => box.querySelector('#kp-notes')?.value || '';
+
+        box.querySelector('#kp-dry')?.addEventListener('click', async () => {
+          msg('打包中…');
+          try {
+            const r = await api('/api/kernel/publish', { method: 'POST', body: { dryRun: true } });
+            if (!r.ok) return msg('失败：' + (r.error || '未知'));
+            msg(`版本 ${r.version} · ${(r.bytes / 1024 / 1024).toFixed(2)}MB · ${r.filename}`);
+          } catch (e) { msg('失败：' + e.message); }
+        });
+
+        box.querySelector('#kp-pub')?.addEventListener('click', async () => {
+          if (!confirm('确定发布？这会更新市场里的内核版本清单。')) return;
+          msg('打包并上传中，请稍候…');
+          try {
+            const r = await api('/api/kernel/publish', { method: 'POST', body: { notes: notes() } });
+            if (!r.ok) return msg('发布失败：' + (r.error || '未知'));
+            msg(`✅ 已发布 v${r.version}（${(r.bytes / 1024 / 1024).toFixed(2)}MB，清单共 ${r.releases} 个版本）`);
+            toast('内核已发布');
+          } catch (e) { msg('发布失败：' + e.message); }
+        });
+      })();
+
     }).catch(() => { /* 取不到就保持空壳，不影响其它设置 */ });
   }
 }
@@ -3581,6 +3823,20 @@ function renderSkills(el, skills) {
       </p>
     </div>
 
+    <div class="card">
+      <h3>技能市场</h3>
+      <p class="muted" style="font-size:13px">
+        从市场装别人分享的 skill，或者把你的发上去。skill 是单个 md 文件，<b>装上即生效，不用重启</b>。
+      </p>
+      <div class="row" style="margin-top:10px;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn tiny" id="skm-browse">浏览市场</button>
+        <button class="btn tiny" id="skm-updates">检查更新</button>
+        <span id="skm-msg" class="muted" style="font-size:12px"></span>
+      </div>
+      <div id="skm-list" style="margin-top:12px"></div>
+      <div id="skm-publish" style="margin-top:14px"></div>
+    </div>
+
     <div class="card" id="sk-editor" style="display:none"></div>`;
 }
 
@@ -3669,6 +3925,121 @@ async function openSkillEditor(id) {
 /** 技能页事件绑定 */
 function bindSkillsEvents() {
   if (state.tab !== 'skills') return;
+
+  // ── Skill 市场（2026-10-25）──
+  const skmMsg = (s) => { const e = $('#skm-msg'); if (e) e.textContent = s; };
+  const skmList = () => $('#skm-list');
+
+  const renderMarket = (skills, installedIds) => {
+    const box = skmList();
+    if (!box) return;
+    if (!skills.length) {
+      box.innerHTML = '<div class="muted" style="font-size:12px">市场里还没有技能</div>';
+      return;
+    }
+    box.innerHTML = `
+      <table class="table">
+        <thead><tr><th>名称</th><th>版本</th><th>说明</th><th>何时用</th><th>操作</th></tr></thead>
+        <tbody>${skills.map((s) => `
+          <tr>
+            <td><strong>${esc(s.name)}</strong><div class="muted pl-meta"><span>${esc(s.id)}</span></div></td>
+            <td style="font-size:12px">${esc(s.version || '—')}</td>
+            <td class="pl-desc">${esc(s.summary || '—')}</td>
+            <td class="pl-desc">${esc(s.when || '—')}</td>
+            <td style="white-space:nowrap">
+              <button class="btn tiny" data-skm-install="${esc(s.id)}">
+                ${installedIds.has(s.id) ? '重装' : '安装'}
+              </button>
+            </td>
+          </tr>`).join('')}</tbody>
+      </table>`;
+  };
+
+  $('#skm-browse')?.addEventListener('click', async () => {
+    skmMsg('加载中…');
+    try {
+      const [mkt, local] = await Promise.all([api('/api/skill-market/index'), api('/api/skills')]);
+      if (!mkt.ok) { skmMsg('失败：' + (mkt.error || '未知')); return; }
+      const installed = new Set((local.skills || []).filter((x) => x.source === 'user').map((x) => x.id));
+      renderMarket(mkt.skills || [], installed);
+      skmMsg(`市场 ${mkt.skills?.length || 0} 个技能`);
+      // 重装 = 明确覆盖
+      $$('[data-skm-install]').forEach((b) => b.addEventListener('click', async () => {
+        const id = b.dataset.skmInstall;
+        const isRe = installed.has(id);
+        if (isRe && !confirm(`本地已有 ${id}，覆盖它？`)) return;
+        b.disabled = true; b.textContent = '安装中…';
+        try {
+          const r = await api('/api/skill-market/install', { method: 'POST', body: { id, overwrite: isRe } });
+          if (!r.ok) { toast('安装失败：' + r.error); b.disabled = false; b.textContent = '安装'; return; }
+          toast(`已安装 ${r.id} v${r.version}`);
+          loadSkillsPage().then(bindSkillsEvents);
+        } catch (e) { toast('安装失败：' + e.message); b.disabled = false; }
+      }));
+    } catch (e) { skmMsg('失败：' + e.message); }
+  });
+
+  $('#skm-updates')?.addEventListener('click', async () => {
+    skmMsg('检查中…');
+    try {
+      const r = await api('/api/skill-market/updates');
+      if (!r.ok) { skmMsg('失败：' + (r.error || '未知')); return; }
+      if (!r.updates?.length) { skmMsg(`已装 ${r.installed} 个，都是最新`); return; }
+      skmMsg(`${r.updates.length} 个可更新：` + r.updates.map((u) => `${u.id} ${u.local}→${u.remote}`).join('、'));
+    } catch (e) { skmMsg('失败：' + e.message); }
+  });
+
+  // 发布区：只对作者显示
+  (async () => {
+    const box = $('#skm-publish');
+    if (!box) return;
+    let st;
+    try { st = await api('/api/kernel/can-publish'); } catch { return; }
+    if (!st?.author?.verified) return;
+
+    const mine = (await api('/api/skills').catch(() => ({ skills: [] })))
+      .skills.filter((s) => s.source === 'user');
+    if (!mine.length) {
+      box.innerHTML = '<div class="muted" style="font-size:12px">你还没有自定义技能。先「新建技能」，再回来发布。</div>';
+      return;
+    }
+    box.innerHTML = `
+      <div style="padding:12px 14px;border:1px solid var(--acc);border-radius:var(--r)">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px">发布我的技能</div>
+        <div class="row" style="gap:8px;flex-wrap:wrap;align-items:flex-end">
+          <div class="field" style="min-width:160px">
+            <label class="muted" style="font-size:12px">选择技能</label>
+            <select id="skp-id" style="width:100%">
+              ${mine.map((s) => `<option value="${esc(s.id)}">${esc(s.name)}（${esc(s.id)}）</option>`).join('')}
+            </select>
+          </div>
+          <div class="field" style="min-width:100px">
+            <label class="muted" style="font-size:12px">版本</label>
+            <input id="skp-ver" value="1.0.0" style="width:100px" />
+          </div>
+          <button class="btn primary tiny" id="skp-go">发布到市场</button>
+          <span id="skp-msg" class="muted" style="font-size:12px"></span>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:8px">
+          发布前请确保技能文件里 frontmatter 有 <code>name</code> 和 <code>summary</code>。
+        </div>
+      </div>`;
+
+    $('#skp-go')?.addEventListener('click', async () => {
+      const id = $('#skp-id')?.value;
+      const ver = $('#skp-ver')?.value || '1.0.0';
+      const msg = (s) => { const e = $('#skp-msg'); if (e) e.textContent = s; };
+      if (!id) return;
+      if (!confirm(`发布技能 ${id} v${ver} 到市场？`)) return;
+      msg('发布中…');
+      try {
+        const r = await api('/api/skill-market/publish', { method: 'POST', body: { id, version: ver } });
+        if (!r.ok) return msg('失败：' + (r.error || '未知'));
+        msg(`✅ 已发布 v${r.version}（市场共 ${r.total} 个）`);
+        toast('技能已发布');
+      } catch (e) { msg('失败：' + e.message); }
+    });
+  })();
 
   $('#sk-new')?.addEventListener('click', () => openSkillEditor(''));
 

@@ -117,7 +117,17 @@ export function normalizeManifest(raw, { dirName = '' } = {}) {
       setup,
       // 分类与一句话简介：面板用来分组展示，纯展示字段
       category: asString(raw.category, '其他'),
-      summary: asString(raw.summary)
+      summary: asString(raw.summary),
+      // 🔴 核心插件标记（2026-10-25）
+      //
+      // core=true 的插件禁止停用/卸载（在 plugin-admin.js 里拦）。
+      // 用于「插件市场」这类一旦关掉就影响基础能力的插件。
+      //
+      // 为什么放 manifest 而不是硬编码 id：
+      //   硬编码会让内核认识具体插件，违背插件化原则。
+      //   这里只是一个通用开关，内核不知道谁用了它。
+      core: asBool(raw.core, false),
+      coreReason: asString(raw.coreReason)
     }
   };
 }

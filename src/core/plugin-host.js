@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ROOT, DATA_DIR } from '../config.js';
-import { normalizeManifest, PLUGIN_API_VERSION } from './manifest.js';
+import { normalizeManifest, PLUGIN_API_VERSION, HOOK_NAMES } from './manifest.js';
 import { createPluginConfig, resolveEnabled } from './plugin-config.js';
 import { registerPluginSkill, unregisterPluginSkills } from '../skill.js';
 
@@ -65,6 +65,9 @@ function createStateHandle(id) {
 }
 
 export class PluginHost {
+  /** 插件增删改订阅者（P1 公开 API） */
+  #changeListeners;
+
   constructor({ log = console.log, deps = {} } = {}) {
     this.log = log;
     this.deps = deps;                 // { store, sender, onebot, getConfig, ... }
@@ -76,6 +79,7 @@ export class PluginHost {
     this.promptSections = [];         // { id, name, fn }
     this.uiTabs = [];                 // { id, label, pluginId, file }
     this.schedulerTimers = new Map(); // key -> timer
+    this.#changeListeners = new Set();  // 装卸/重载订阅者（P1 公开 API 用）
     this.kbDeclared = new Map();      // pluginId -> Set(教学工具名)，供按身份过滤
   }
 
@@ -204,7 +208,17 @@ export class PluginHost {
     this.records.set(id, {
       id, manifest, status: 'enabled', lastError: null,
       handle: handle && typeof handle.dispose === 'function' ? handle : null,
-      config: priv, loadedAt: Date.now()
+      config: priv, loadedAt: Date.now(),
+      // 🔴 必须存 sub（2026-10-24 修）
+      //
+      // disable() 里靠 rec.sub 精确摘除钩子/路由/工具/定时器：
+      //   this.#rollback(rec.sub || 空清单, id)
+      // 原来这里漏了 sub → 永远拿到空清单 → 停用只改状态，资源全留着。
+      //
+      // 后果（实测）：面板每点一次「重载」就泄漏一整套定时器，
+      // 课程表会同一节课提醒两遍（两个实例各发一次）。
+      // 不只课程表 —— 任何插件的钩子都会重复执行。
+      sub
     });
     this.#sortHooks();
 
@@ -297,6 +311,27 @@ export class PluginHost {
     const host = this;
     const cfg = priv.get();
 
+    /**
+     * 权限守卫：未授权时返回 undefined，并记一条 warn 日志。
+     *
+     * 为什么不直接 throw：
+     *   插件在 activate 阶段可能只是"探测能力是否存在"（if (ctx.sender) ...），
+     *   抛错会让它整个起不来。返回 undefined 让插件自己决定怎么退让。
+     */
+    const permit = (perm, real) => {
+      const declared = Array.isArray(manifest.permissions) ? manifest.permissions : [];
+      // 没声明该权限 → 老插件，按兼容策略放行（见文件头说明）
+      if (!declared.includes(perm)) return real;
+      const g = host.deps.grantCheck
+        ? host.deps.grantCheck(id, perm)
+        : true;   // 宿主没接授权系统时默认放行（向后兼容）
+      if (!g) {
+        pluginLog(`缺少权限「${perm}」，相关能力不可用。到「插件」页重新授权。`);
+        return undefined;
+      }
+      return real;
+    };
+
     return {
       id,
       version: manifest.version,
@@ -355,21 +390,97 @@ export class PluginHost {
         };
       })(),
 
-      // 内核依赖（只暴露插件真正需要的，不把整个 app 递出去）
+      // ── 权限裁剪（2026-10-25，见 docs/PLUGIN_PROTOCOL.md 第三节）──
+      //
+      // 三关：声明 → 授权 → 强制。这里是第 ③ 关。
+      //
+      // 未授权时**不把该能力挂上去**，插件调用会得到 undefined 而不是
+      // 一个"看似能用但偷偷失败"的假对象 —— 后者最难调试。
+      // 需要明确报错的场合，用一个会抛函数替代（见 guarded）。
+      //
+      // 🔴 兼容策略：本机老插件没有授权记录时，**默认放行全部声明权限**。
+      //    原因：它们已经跑了很久，突然全部失效是灾难。
+      //    只对"新安装"走确认流程。这个妥协写在 plugin-grants.js 文件头。
       store: this.deps.store,
-      sender: this.deps.sender,
-      onebot: this.deps.onebot,
+      sender: permit('send', this.deps.sender),
+      onebot: permit('send', this.deps.onebot),
       // 表情库：sticker 插件要读它；对它做增删的能力只在这里暴露只读面 + 必要写方法
       stickers: this.deps.stickers,
       // 记忆库：memory 插件要读写它；prompt.js 也会直接读（属于内核共享数据）
       memory: this.deps.memory,
       log2: this.deps.log,
-      chatCompletion: this.deps.chatCompletion,
+      chatCompletion: permit('llm', this.deps.chatCompletion),
+
+      // ── 邮件（内核基础设施，2026-10-25）──
+      //
+      // 🔴 发信能力**必须在内核**，不能随插件分发。
+      //    插件包是公开的，把 send_mail.py 放进去等于把整套发信实现公开。
+      //    这里只暴露一个 sendMail 函数，插件看不到 SMTP 细节和凭据。
+      mail: {
+        ready: () => !!(host.deps.mailReady && host.deps.mailReady()),
+        send: (to, subject, body) => host.deps.sendMail
+          ? host.deps.sendMail(to, subject, body)
+          : Promise.resolve({ ok: false, error: '内核未提供邮件能力' }),
+      },
       // orchestrator 用于"主动唤醒"类能力（课程播报、定时提醒到点启动一次运行）。
       // 用 getter 是为了避开构造期循环依赖（宿主先建，orchestrator 后建再回填）。
       get orchestrator() { return host.deps.orchestrator; },
       root: ROOT,
       dataDir: DATA_DIR,
+
+      // ── P3：统一路径（2026-10-24）──
+      //
+      // 插件原来靠 path.resolve(HERE, '../..') 推路径 ——
+      // 装到别的布局就全错，数据甚至可能写到不该写的地方。
+      // 这里由内核给准，插件不用再猜。
+      paths: {
+        root: ROOT,
+        plugins: PLUGINS_DIR,
+        data: DATA_DIR,
+        get pluginData() { return pluginStateDir(id); },
+        /** 插件私有文件路径（等价于 ctx.data.file） */
+        store: (name) => path.join(pluginStateDir(id), String(name || ''))
+      },
+
+      // ── P2：manifest 归一化（2026-10-24）──
+      //
+      // 原来插件要 import '../../src/core/manifest.js' 自己归一化 ——
+      // 相对路径写死，换布局就 ERR_MODULE_NOT_FOUND。
+      // 现在内核直接给函数，插件不用碰内核源码。
+      normalizeManifest: (raw, opts = {}) => {
+        const r = normalizeManifest(raw, { dirName: opts.dirName || id });
+        return r.ok
+          ? { ok: true, manifest: r.manifest }
+          : { ok: false, error: r.error || 'manifest 校验失败' };
+      },
+
+      // ── P6：能力探测（2026-10-24）──
+      //
+      // 插件原来读内核源码文本找关键字（kernelHas('hideCard')）——
+      // 内核改个注释就误判。改成声明式：内核说自己有什么，插件照着判断。
+      capabilities: {
+        apiVersion: PLUGIN_API_VERSION,
+        inlinePanel: true,      // uiTab.inline 生效
+        hotLoad: true,          // enableFromDir 热装载
+        pluginHostApi: true,    // ctx.pluginHost 公开
+        pathsApi: true,         // ctx.paths
+        normalizeApi: true,     // ctx.normalizeManifest
+        kernelUpgrade: false,   // 内核不做整包自升级（有意为之，见需求文档 P4）
+        onChange: true,
+        hooks: [...HOOK_NAMES]
+      },
+
+      // ── P1：插件宿主公开 API（2026-10-24）──
+      //
+      // 市场类插件需要"装/卸/查"，但原来只能摸 host.records（内部 Map）。
+      // 这里给稳定契约，内核内部随便改都不影响插件。
+      pluginHost: {
+        list: () => host.listInstalled(),
+        enableFromDir: (dir) => host.enableFromDir(dir),
+        disable: (targetId) => host.disable(targetId),
+        reload: (targetId) => host.reload(targetId),
+        onChange: (cb) => host.onChange(cb)
+      },
 
       hooks: {
         on(name, fn) {
@@ -565,6 +676,73 @@ export class PluginHost {
   // ── 对外查询 ────────────────────────────────────────────────────────
 
   /** 面板列表用 */
+  // ── 公开插件管理 API（2026-10-24 · P1）──────────────────────
+  //
+  // 为什么要有这一层：插件市场（以及其他管理类插件）需要"装/卸/查"，
+  // 但原来只能直接摸 this.records（内部 Map）和 this.enable（要求调用方
+  // 自己先归一化 manifest）。内核一重构就崩，而且逼着插件抄内核的活。
+  //
+  // 这里给出的都是**稳定契约**：签名和语义保证不变，内部实现随便改。
+  // 全部失败返回 { ok:false, error }，不抛异常 —— 让调用方好处理。
+
+  /** 已装插件清单（市场用来判断"装没装/什么版本"） */
+  listInstalled() {
+    return [...this.records.values()].map((r) => ({
+      id: r.id,
+      name: r.manifest?.name || r.id,
+      version: r.manifest?.version || '?',
+      status: r.status,
+      dir: path.join(PLUGINS_DIR, r.id),
+      lastError: r.lastError || null
+    }));
+  }
+
+  /**
+   * 按目录装载：内核自己读 manifest、归一化、校验、enable。
+   *
+   * 与 enable(rawManifest) 的区别：调用方不需要懂 manifest 格式，
+   * 也不用自己归一化。传个目录路径就行。
+   */
+  async enableFromDir(dir) {
+    try {
+      const abs = path.resolve(String(dir || ''));
+      if (!fs.existsSync(path.join(abs, 'manifest.json'))) {
+        return { ok: false, error: '目录里没有 manifest.json' };
+      }
+      const dirName = path.basename(abs);
+      const raw = JSON.parse(fs.readFileSync(path.join(abs, 'manifest.json'), 'utf8'));
+      const norm = normalizeManifest(raw, { dirName });
+      if (!norm.ok) return { ok: false, error: norm.error || 'manifest 校验失败' };
+
+      // 🔴 目录必须在 plugins/ 下 —— 内核只从那里装载
+      const expect = path.join(PLUGINS_DIR, norm.manifest.id);
+      if (path.resolve(abs) !== path.resolve(expect)) {
+        return { ok: false, error: `插件目录必须是 ${expect}，实际是 ${abs}` };
+      }
+
+      const rec = await this.enable(norm.manifest);
+      if (!rec || rec.status !== 'enabled') {
+        return { ok: false, id: norm.manifest.id, error: rec?.lastError || '装载失败' };
+      }
+      this.#emitChange('add', norm.manifest.id);
+      return { ok: true, id: norm.manifest.id, version: norm.manifest.version };
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) };
+    }
+  }
+
+  /** 装卸/重载后通知订阅者（市场列表要跟着刷新） */
+  onChange(cb) {
+    if (typeof cb !== 'function') return () => {};
+    this.#changeListeners.add(cb);
+    return () => this.#changeListeners.delete(cb);
+  }
+  #emitChange(type, id) {
+    for (const cb of this.#changeListeners) {
+      try { cb({ type, id }); } catch (e) { this.log('[plugins] onChange 回调出错:', e?.message ?? e); }
+    }
+  }
+
   list() {
     return [...this.records.values()]
       .map((r) => ({

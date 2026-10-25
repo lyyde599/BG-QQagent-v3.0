@@ -1,0 +1,44 @@
+{
+  "id": "plugin-market",
+  "name": "BG-QQAgent 创造营",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "description": "浏览安装社区插件（下载后校验 sha256 再装），发布自己的插件包与技能。支持作者注册（邮箱验证码）、版本管理、改动说明、下架。**核心功能，不可停用**。",
+  "author": "白光",
+  "entry": "index.js",
+  "ui": "ui.js",
+  "priority": 18,
+  "defaultEnabled": true,
+  "hooks": [],
+  "tools": false,
+  "promptSections": [],
+  "config": {
+    "enabled": true,
+    "indexUrl": "https://market.baiguang211.top/index.json",
+    "mirrorUrl": "https://pub-01d4abacd76d41c6b0ea5f6b6bc1d36e.r2.dev/index.json",
+    "showUntrusted": false,
+    "autoCheckUpdate": true,
+    "checkIntervalHours": 24
+  },
+  "permissions": [
+    "network"
+  ],
+  "scopes": [
+    "all"
+  ],
+  "category": "工具",
+  "summary": "装插件、发技能的市场",
+  "uiTab": {
+    "id": "plugin-market",
+    "label": "BG创造营",
+    "inline": true
+  },
+  "indexUrl": "https://market.baiguang211.top/index.json",
+  "mirrorUrl": "https://pub-01d4abacd76d41c6b0ea5f6b6bc1d36e.r2.dev/index.json",
+  "core": true,
+  "coreReason": "创造营是核心功能，禁用后无法从云端安装插件或发布技能",
+  "license": "MIT",
+  "contact": {
+    "qq": "3170037984"
+  }
+}

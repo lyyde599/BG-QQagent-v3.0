@@ -30,41 +30,77 @@ const USER_SKILL_DIR = path.join(ROOT, 'skills');
  */
 const BUILTIN_SKILLS = [
   {
-    id: 'plugin-dev',
-    name: '插件与 Skill 开发规范',
-    summary: '写插件、注册 skill、工具与钩子的完整规范',
-    when: '主人要求新增/修改插件，或问"怎么做一个插件"时',
+    id: 'plugin-spec',
+    name: '插件开发规范',
+    summary: 'manifest 字段、权限分组、ctx 能力、打包发布与常见坑',
+    when: '主人要求新增/修改插件，或问"插件怎么写"时',
+    author: '白光',
     // 内容不内联：指向仓库里的文档，避免同一份规范维护两处
     file: '插件与Skill制作及使用规范.md'
   },
   {
-    id: 'config-tuning',
-    name: '配置调参指南',
-    summary: '主人说"改配置"时怎么改、哪些能改、哪些不能',
-    when: '主人要求调整机器人行为参数时',
-    body: `# 配置调参
+    id: 'skill-spec',
+    name: 'Skill 编写规范',
+    summary: 'frontmatter 怎么写、when 怎么描述、什么样的知识适合做成 skill',
+    when: '主人要求新增/修改 skill，或问"skill 怎么写"时',
+    author: '白光',
+    body: `# Skill 编写规范
 
-## 改配置的工具
-- master_get_config(path) 读当前值；不确定键名时省略 path 拿全量
-- master_set_config(path, value) 写入
+## 什么是 skill
+把"离开本产品就没意义、但机器人该知道"的知识写成 .md 放 skills/ 目录。
+文件放进目录即生效，**不用重启**，下一轮运行就能看到。
 
-## 常见路径
-| 想改什么 | 路径 |
-|:--|:--|
-| 语气活泼程度 | persona.participation（low / medium / high） |
-| 机器人名字 | persona.botName |
-| 模型温度 | api.temperature |
-| 单次工具轮数上限 | api.maxRounds |
-| 插件开关 | plugins.<插件id>.enabled |
-| 插件参数 | plugins.<插件id>.<参数名> |
+## 文件格式（极简 frontmatter）
 
-## 不能改的（会被拒绝）
-- allow / deny —— 白名单，改了陌生人就能操控机器人
-- persona.masterQQ —— 主人身份
-- 任何 apiKey / token —— 凭据
+\`\`\`
+---
+name: 技能名（必填，缺了会退回文件名）
+summary: 一句话说清这个技能是干什么的（必填）
+when: 什么时候该读它（越具体越好）
+author: 白光
+version: 1.0.0
+license: MIT
+---
 
-这几项只能由主人在面板里改。`
-  }
+正文：真正的知识内容。
+\`\`\`
+
+## 三个字段的作用
+| 字段 | 谁在看 | 写不好会怎样 |
+|:--|:--|:--|
+| name | 人 | 显示成文件名 |
+| summary | **模型** | 模型不知道这技能干什么，永远不会读 |
+| when | **模型** | 不知道什么时候该读，等于没写 |
+
+**summary 和 when 是给模型判断用的**，不是给人看的简介。写"XX 相关"等于没写。
+
+## 什么样的知识适合做成 skill
+✅ 适合：
+  · 操作步骤（"怎么改配置"、"怎么部署"）
+  · 领域规则（"圣杯战争的结算规则"）
+  · 排错手册（"出现 XXX 报错时怎么查"）
+
+❌ 不适合：
+  · 一次性的临时信息（写进对话就行）
+  · 能直接查到的事实（模型自己知道或能搜）
+  · 插件自己的私有逻辑（那该写在插件里）
+
+## 好的 when 长什么样
+- ❌ "需要时"              → 模型不知道什么时候算"需要"
+- ❌ "关于学习"            → 太宽，天天都像"关于学习"
+- ✅ "主人要求新增/修改插件，或问'插件怎么写'时"
+- ✅ "主人说'改配置'时怎么改、哪些能改、哪些不能"
+
+## 与插件的关系
+| | skill | 插件 |
+|:--|:--|:--|
+| 形态 | 单个 .md | 目录（manifest + index.js） |
+| 能力 | **只能被读取**（给模型知识） | 能执行代码、发消息、注册工具 |
+| 生效 | 放进目录即生效 | 需要 enable + 可能需要重启 |
+| 适用 | 知识、规范、步骤 | 功能、集成、外部交互 |
+
+**能用 skill 表达的，优先用 skill** —— 它更轻、更安全、改完不用重启。`
+  },
 ];
 
 /** 插件注册的 skill（运行时填充） */
@@ -107,6 +143,9 @@ function scanUserSkills() {
           name: meta.name || id,
           summary: meta.summary || '',
           when: meta.when || '',
+          version: meta.version || '',      // 市场用它比版本
+          author: meta.author || '',        // 作者归属
+          license: meta.license || '',
           body: body.trim(),
           source: 'user'
         });
@@ -153,6 +192,10 @@ export function listSkills() {
     name: s.name,
     summary: s.summary,
     when: s.when,
+    version: s.version || '',
+    // author 透出给界面（2026-10-25）：skill 也要能显示作者归属
+    author: s.author || '',
+    license: s.license || '',
     source: s.source || 'builtin'
   }));
 }

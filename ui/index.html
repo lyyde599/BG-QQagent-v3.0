@@ -50,6 +50,7 @@
     <!-- 插件自带的 tab 由 JS 按 manifest.uiTab 动态插入（插件卸载后自动消失）
          —— 原来写死在这里，导致"插件已卸载但页签还在，点进去报错" -->
     <span id="plugin-tabs"></span>
+    <button class="tab" data-tab="market">BG创造营</button>
     <button class="tab" data-tab="plugins">插件</button>
     <button class="tab" data-tab="skills">技能</button>
     <button class="tab" data-tab="settings">设置</button>
@@ -94,6 +95,19 @@
     </section>
 
     <!-- 插件管理 -->
+    <!-- 插件市场（核心功能，2026-10-25）
+         设计：市场是内核内置页签，但代码仍在 plugins/plugin-market/ 里 ——
+         这样既是"核心功能"（用户关不掉、永远可用），
+         又能独立更新（改插件不改内核）。 -->
+    <section id="view-market" class="view">
+      <!-- 🔴 2026-10-25 修：.view.active 是 display:flex，
+           子元素若不撑开就会塌成 0 高度 → 页面全白。
+           这里用 flex:1 + overflow:auto 让它正常铺满并可滚动。 -->
+      <div id="market-page" style="flex:1;min-height:0;overflow-y:auto;padding:8px 12px 40px">
+        <div class="muted" style="padding:16px">加载中…</div>
+      </div>
+    </section>
+
     <section id="view-plugins" class="view">
       <div id="plugins-page"></div>
     </section>

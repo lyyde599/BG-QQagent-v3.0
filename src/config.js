@@ -145,6 +145,18 @@ export const DEFAULT_CONFIG = {
       mode: 'cover'     // cover | contain | repeat
     }
   },
+  // 内核更新（2026-10-25）
+  //
+  // autoCheck  ：启动后定期查有没有新版本，有就在面板角标提示（不打扰）
+  // autoDownload：查到新版自动下载并校验（**不安装**）
+  // 真正的替换永远由人手动做 —— 见 src/kernel-update.js 顶部的说明。
+  kernelUpdate: {
+    autoCheck: true,
+    checkIntervalHours: 24,
+    autoDownload: false,
+    lastCheckAt: null,
+    lastSeenVersion: null
+  },
   // 预算保险丝：今日估算成本达到上限（元）自动暂停；0 = 不限制
   budget: {
     dailyCostYuan: 0
@@ -282,8 +294,11 @@ export const COMMUNITY = {
   intro: '插件开发、部署踩坑、模型接入，都在这里聊',
   // 加群链接：QQ 群的分享链接，手机点开可直接跳转
   joinUrl: 'https://qm.qq.com/q/RDq35J6PQu',   // 群分享短链（群号拼出来的 /q/<群号> 是无效的，实测 404）
-  // 项目主页
-  repo: 'https://github.com/lyyde599/BG-QQagent-v3.0'
+  // 项目主页（两个平台都放，国内访问 Gitee 更稳）
+  repo: 'https://github.com/lyyde599/BG-QQagent-v3.0',
+  gitee: 'https://gitee.com/liu-yuyu599/BG-QQagent-v3.0',
+  // 市场地址（插件 / skill / 内核更新都走这一套）
+  market: 'https://market.baiguang211.top'
 };
 
 export function getConfig() {

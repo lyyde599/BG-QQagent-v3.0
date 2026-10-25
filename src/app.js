@@ -12,6 +12,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { getConfig, updateConfig, ROOT, DATA_DIR, COMMUNITY } from './config.js';
+import { checkKernelUpdate, downloadKernelUpdate, localKernelVersion, listDownloaded, publishKernel, canPublishKernel } from './kernel-update.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments } from './onebot.js';
 import { ChatStore } from './store.js';
 import { MemoryStore } from './memory.js';
@@ -30,6 +31,7 @@ import { PluginHost } from './core/plugin-host.js';
 import { projectLegacyConfig, splitLegacyPatch } from './core/config-compat.js';
 import { registerPluginAdmin } from './core/plugin-admin.js';
 import { listSkills, getSkillBody, reloadUserSkills, userSkillDir } from './skill.js';
+import { fetchSkillIndex, publishSkill, installSkill, unpublishSkill, checkSkillUpdates } from './skill-market.js';
 
 /**
  * 把面板传来的值规范成字符串数组。
@@ -47,6 +49,8 @@ function toStrList(v, { keepEmpty = false } = {}) {
 import { OneBotHealth } from './onebot-health.js';
 import { ScheduledTaskRunner } from './scheduled-tasks.js';
 import { createEventBus, todayKey } from './util.js';
+import { getGrant } from './core/plugin-grants.js';
+import { sendMail, mailReady } from './core/mailer.js';
 
 // 全局 fetch（undici）默认连接建立超时只有 10 秒，openrouter.ai 这类海外端点
 // 握手慢时会直接报 "Connect Timeout Error ... timeout: 10000ms"（注意这不是
@@ -383,6 +387,16 @@ export function createApp({ log = console.log } = {}) {
       store, sender, onebot, stickers, memory, emit,
       chatCompletion,
       getConfig,
+      // 邮件通道（内核基础设施，2026-10-25）
+      mailReady,
+      sendMail,
+      // 权限守卫：插件 ctx 构建时按授权裁剪能力
+      grantCheck: (id, perm) => {
+        // 兼容策略：老插件没有授权记录时放行（见 plugin-grants.js 文件头 ②）
+        const g = getGrant(id);
+        if (!g) return true;
+        return Array.isArray(g.granted) && g.granted.includes(perm);
+      },
       // 回填时机：start() 里 orchestrator 建好后注入，避免构造期循环依赖
       get orchestrator() { return orchestrator; }
     }
@@ -712,6 +726,124 @@ export function createApp({ log = console.log } = {}) {
       if (!authorize(req)) return json(res, 401, { error: '未授权' });
       const method = req.method;
       const cfgNow = getConfig();
+
+      // ── Skill 市场（2026-10-25）──
+      //
+      // 与插件市场的区别：skill 是单个 .md，装上即生效，不用重启。
+      if (pathname === '/api/skill-market/index' && method === 'GET') {
+        const r = await fetchSkillIndex();
+        return json(res, 200, r);
+      }
+
+      if (pathname === '/api/skill-market/publish' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 2 }).catch(() => ({}));
+        // 只有作者能发布（与内核发布同一套判定）
+        let author = null;
+        try {
+          const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
+          if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch { /* ignore */ }
+        if (!author?.verifiedAt) {
+          return json(res, 403, { ok: false, error: '请先在「创造营」注册作者账号' });
+        }
+        const r = await publishSkill(String(body?.id || ''), {
+          version: String(body?.version || '1.0.0'),
+          notes: String(body?.notes || ''),
+          dryRun: body?.dryRun === true
+        });
+        return json(res, 200, r);
+      }
+
+      // ── skill 下架（2026-10-25）──
+      // 与插件下架同一套语义：从远端清单移除，本地 .md 保留。
+      if (pathname === '/api/skill-market/unpublish' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 2 }).catch(() => ({}));
+        let author = null;
+        try {
+          const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
+          if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch { /* ignore */ }
+        if (!author?.verifiedAt) {
+          return json(res, 403, { ok: false, error: '请先在「创造营」注册作者账号' });
+        }
+        const r = await unpublishSkill(String(body?.id || ''), {
+          reason: String(body?.reason || ''),
+        });
+        return json(res, 200, r);
+      }
+
+      if (pathname === '/api/skill-market/install' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 2 }).catch(() => ({}));
+        const r = await installSkill(String(body?.id || ''), { overwrite: body?.overwrite === true });
+        return json(res, 200, r);
+      }
+
+      if (pathname === '/api/skill-market/updates' && method === 'GET') {
+        // 先刷本地缓存 —— 用户可能刚在外面改过 skills/*.md，
+        // 不刷的话拿到的是进程启动时的旧快照，版本比对会失真。
+        reloadUserSkills();
+        const r = await checkSkillUpdates();
+        return json(res, 200, r);
+      }
+
+      // ── 内核升级（2026-10-25）──
+      //
+      // 只做「查 / 下 / 交」，不做自动覆盖。
+      // 原因见 src/kernel-update.js 顶部：整包替换第三方宿主出过真实事故。
+      if (pathname === '/api/kernel/version' && method === 'GET') {
+        return json(res, 200, { ok: true, version: localKernelVersion() });
+      }
+
+      if (pathname === '/api/kernel/check' && method === 'GET') {
+        const r = await checkKernelUpdate();
+        return json(res, 200, r);
+      }
+
+      if (pathname === '/api/kernel/download' && method === 'POST') {
+        const r = await downloadKernelUpdate();
+        return json(res, 200, r);
+      }
+
+      // 能不能发布（有没有 R2 凭据 + 是不是作者）
+      if (pathname === '/api/kernel/can-publish' && method === 'GET') {
+        let author = null;
+        try {
+          const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
+          if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch { /* 没有作者档案 */ }
+        return json(res, 200, {
+          ok: true,
+          hasCredentials: canPublishKernel(),
+          author: author ? { nickname: author.nickname || '', email: author.email || '', verified: !!author.verifiedAt } : null
+        });
+      }
+
+      // 发布内核新版本（打包 → 上传 → 更新清单）
+      if (pathname === '/api/kernel/publish' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 4 }).catch(() => ({}));
+        // 必须已注册作者，且昵称是白光（与创造营同一套归属判定）
+        let author = null;
+        try {
+          const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
+          if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch { /* ignore */ }
+        if (!author?.verifiedAt) {
+          return json(res, 403, { ok: false, error: '请先在「创造营」注册作者账号' });
+        }
+        const mine = String(author.nickname || '') === '白光' || String(author.qq || '') === '3170037984';
+        if (!mine) {
+          return json(res, 403, { ok: false, error: '只有内核作者能发布内核更新' });
+        }
+        const r = await publishKernel({
+          notes: String(body?.notes || ''),
+          dryRun: body?.dryRun === true
+        });
+        return json(res, 200, r);
+      }
+
+      if (pathname === '/api/kernel/downloaded' && method === 'GET') {
+        return json(res, 200, { ok: true, items: listDownloaded() });
+      }
 
       // 关于 / 交流群（2026-10-24）：只读，供控制台「关于」区展示
       if (pathname === '/api/about' && method === 'GET') {
@@ -1797,13 +1929,72 @@ export function createApp({ log = console.log } = {}) {
     orchestrator.startDshWatcher(); // DSH 任务完成汇报 watcher
     // 课程播报的启动逻辑在 schedule 插件里（插件启用且 notifyEnabled 才跑）
     scheduledRunner.start();   // 通用定时任务调度器
+
+    // ── 内核自动检查更新（2026-10-25）──
+    //
+    // 只查、只提示、可选自动下载 —— **绝不自动安装**。
+    // 理由见 src/kernel-update.js 顶部：整包替换第三方宿主出过真实事故。
+    startKernelAutoCheck();
+
     log(`控制台已就绪：http://127.0.0.1:${port}`);
     log(`OneBot（SnowLuma）: ws=${getConfig().snowluma?.wsUrl} http=${getConfig().snowluma?.httpUrl}`);
     log(`模型: ${getConfig().api.model || '（未设置，请在设置里选择）'} @ ${getConfig().api.baseUrl}`);
     return port;
   }
 
+  /**
+   * 内核更新自动检查（2026-10-25）
+   *
+   * 行为：
+   *   · 启动 60 秒后查一次（避开启动高峰）
+   *   · 之后按 config.kernelUpdate.checkIntervalHours 周期查（默认 24h）
+   *   · 查到新版 → 记进 config.lastSeenVersion，前端「关于」页显示提示
+   *   · autoDownload=true 时顺带下载并校验（仍不安装）
+   *   · 网络不通只记日志，不影响任何功能
+   */
+  let _kernelCheckTimer = null;
+  function startKernelAutoCheck() {
+    const cfgNow = getConfig().kernelUpdate || {};
+    if (cfgNow.autoCheck === false) return;
+
+    const runOnce = async () => {
+      try {
+        const r = await checkKernelUpdate();
+        if (!r.ok) {
+          // 网络问题不当错误刷日志，降级为 debug 级
+          log(`[内核更新] 检查失败（不影响运行）：${r.error}`);
+          return;
+        }
+        updateConfig({ kernelUpdate: { lastCheckAt: new Date().toISOString() } });
+        if (!r.hasUpdate) return;
+
+        log(`[内核更新] 发现新版本 ${r.latest}（当前 ${r.current}）`);
+        updateConfig({ kernelUpdate: { lastSeenVersion: r.latest } });
+
+        if (cfgNow.autoDownload === true) {
+          log('[内核更新] 已开启自动下载，开始下载…');
+          const d = await downloadKernelUpdate();
+          if (d.ok && !d.upToDate) {
+            log(`[内核更新] 已下载 v${d.version} → ${d.file}（校验${d.verified ? '通过' : '跳过'}），等待手动安装`);
+          } else {
+            log(`[内核更新] 下载失败：${d.error || '未知'}`);
+          }
+        }
+      } catch (e) {
+        log(`[内核更新] 自动检查异常：${e?.message ?? e}`);
+      }
+    };
+
+    // 启动 60 秒后首次检查
+    setTimeout(runOnce, 60000).unref?.();
+
+    const hours = Math.max(1, Number(cfgNow.checkIntervalHours) || 24);
+    _kernelCheckTimer = setInterval(runOnce, hours * 3600 * 1000);
+    _kernelCheckTimer.unref?.();
+  }
+
   async function stop() {
+    if (_kernelCheckTimer) { clearInterval(_kernelCheckTimer); _kernelCheckTimer = null; }
     onebotHealth.stop();
     qrGuard.stop();
     groupMemberCache.stop();
