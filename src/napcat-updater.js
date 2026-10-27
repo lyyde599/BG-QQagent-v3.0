@@ -935,7 +935,16 @@ export async function snowlumaAltStatus() {
   if (!installed) return { ok: true, installed: false, running: false, loggedIn: false };
 
   const running = await isServiceActive('snowluma');
-  if (!running) return { ok: true, installed: true, running: false, loggedIn: false, home };
+  if (!running) {
+    const en = await new Promise((resolve) => {
+      const p = spawn('systemctl', ['is-enabled', 'snowluma'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = '';
+      p.stdout.on('data', (d) => { out += String(d); });
+      p.on('error', () => resolve('unknown'));
+      p.on('close', () => resolve(out.trim() || 'unknown'));
+    });
+    return { ok: true, installed: true, running: false, enabled: en, loggedIn: false, home };
+  }
 
   // 用 WebUI 的 /api/qq-list 判断有没有登录 QQ
   // 需要先拿 WebUI token：用 .secrets/snowluma/password 登录
@@ -970,10 +979,20 @@ export async function snowlumaAltStatus() {
     }
   } catch { /* 查询失败就当未登录 */ }
 
+  // 开机自启状态（2026-10-27）
+  const enabled = await new Promise((resolve) => {
+    const p = spawn('systemctl', ['is-enabled', 'snowluma'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    p.stdout.on('data', (d) => { out += String(d); });
+    p.on('error', () => resolve('unknown'));
+    p.on('close', () => resolve(out.trim() || 'unknown'));
+  });
+
   return {
     ok: true,
     installed: true,
     running: true,
+    enabled,
     loggedIn,
     uin,
     qqCount,
@@ -1004,4 +1023,131 @@ export async function snowlumaCredentials() {
   } catch (e) {
     return { ok: false, error: '连不上 SnowLuma：' + String(e?.message ?? e).slice(0, 80), password };
   }
+}
+
+/**
+ * 修改 SnowLuma WebUI 密码（2026-10-27）
+ *
+ * 用户要求："SnowLuma 控制台新增改密功能吧，让用户自己可以改密码"
+ *
+ * 为什么要内核代劳：
+ *   · SnowLuma 的改密接口要 Bearer token，而拿到 token 需要先知道旧密码
+ *   · 改完后还要同步更新 .secrets/snowluma/password，
+ *     否则面板的「取访问令牌」会拿着旧密码去登，直接失败
+ *   这两件事打包在这里做，用户只填新旧密码就行。
+ *
+ * 强度校验交给 SnowLuma 自己（它会返回具体哪条不满足），不在这重复实现。
+ */
+export async function changeSnowlumaPassword({ oldPassword, newPassword } = {}) {
+  const oldPw = String(oldPassword || '');
+  const newPw = String(newPassword || '');
+  if (!oldPw) return { ok: false, error: '请填当前密码' };
+  if (!newPw) return { ok: false, error: '请填新密码' };
+  if (newPw.length < 10) return { ok: false, error: '新密码至少 10 位' };
+
+  let token = '';
+  try {
+    const lr = await fetch('http://127.0.0.1:5099/api/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: oldPw }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const ld = await lr.json().catch(() => ({}));
+    if (!ld?.success || !ld?.token) {
+      return { ok: false, error: '当前密码不正确，或 SnowLuma 未运行' };
+    }
+    token = ld.token;
+  } catch (e) {
+    return { ok: false, error: '连不上 SnowLuma：' + String(e?.message ?? e).slice(0, 80) };
+  }
+
+  try {
+    const r = await fetch('http://127.0.0.1:5099/api/auth/change-password', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({ oldPassword: oldPw, newPassword: newPw }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!d?.success) {
+      // SnowLuma 会返回 rules 数组说明哪条不满足
+      const rules = Array.isArray(d?.rules) ? d.rules.filter((x) => x.ok === false).map((x) => x.label) : [];
+      return {
+        ok: false,
+        error: d?.message || '修改失败',
+        rules,
+      };
+    }
+  } catch (e) {
+    return { ok: false, error: '改密请求失败：' + String(e?.message ?? e).slice(0, 80) };
+  }
+
+  // 同步本地密码文件，否则「取访问令牌」会用旧密码登不上
+  const pwFile = path.join(os.homedir(), '.secrets', 'snowluma', 'password');
+  try {
+    fs.mkdirSync(path.dirname(pwFile), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(pwFile, newPw, { mode: 0o600 });
+  } catch (e) {
+    return { ok: true, warning: '密码已改，但本地密码文件写入失败：' + String(e?.message ?? e).slice(0, 60) };
+  }
+  return { ok: true, message: '密码已修改，本地凭据已同步' };
+}
+
+/**
+ * SnowLuma 服务开关（2026-10-27 用户要求）
+ *
+ * 用户提问："SnowLuma 安装了后就一直后台运行吗？如果我们用了另一个通道，
+ * 请保持另一个关闭，不要同时打开，或者给一个开关，让我们可以自行选择关闭后台"
+ *
+ * 现实问题：两条通道同时跑，占双份内存，而且都没连到内核时纯属浪费。
+ *
+ * 提供两个维度：
+ *   ① 立即开关（start/stop）—— 现在就跑/不跑
+ *   ② 开机自启（enable/disable）—— 重启机器后要不要自己起来
+ * 这两个是独立的，用户可能想"手动开一次但不要自启"。
+ */
+export async function controlSnowluma(action) {
+  const act = String(action || '').trim();
+  const allowed = {
+    start: ['start', 'snowluma'],
+    stop: ['stop', 'snowluma'],
+    enable: ['enable', 'snowluma'],
+    disable: ['disable', 'snowluma'],
+  };
+  const cmd = allowed[act];
+  if (!cmd) return { ok: false, error: "action 只能是 start/stop/enable/disable" };
+
+  const pwFile = process.env.QQ_SUDO_PASSWORD_FILE
+    || path.join(os.homedir(), '.secrets', 'sudo', 'password');
+  let pw = '';
+  try { pw = fs.readFileSync(pwFile, 'utf8').trim(); } catch { /* 无密码文件 */ }
+
+  const r = await new Promise((resolve) => {
+    const p = spawn('sudo', ['-S', 'systemctl', ...cmd], {
+      stdio: pw ? ['pipe', 'pipe', 'pipe'] : 'ignore',
+    });
+    let err = '';
+    if (p.stderr) p.stderr.on('data', (d) => { err += String(d); });
+    if (pw && p.stdin) { try { p.stdin.write(pw + '\n'); p.stdin.end(); } catch { /* 已关 */ } }
+    const timer = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* ignore */ } resolve({ ok: false, error: '超时' }); }, 40000);
+    p.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, error: String(e?.message ?? e) }); });
+    p.on('close', (code) => {
+      clearTimeout(timer);
+      resolve(code === 0 ? { ok: true } : { ok: false, error: err.slice(0, 150) });
+    });
+  });
+  if (!r.ok) return r;
+
+  // 返回操作后的真实状态
+  const active = await isServiceActive('snowluma');
+  const enabled = await new Promise((resolve) => {
+    const p = spawn('systemctl', ['is-enabled', 'snowluma'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    p.stdout.on('data', (d) => { out += String(d); });
+    p.on('error', () => resolve('unknown'));
+    p.on('close', () => resolve(out.trim() || 'unknown'));
+  });
+
+  return { ok: true, action: act, active, enabled };
 }

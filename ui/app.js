@@ -809,6 +809,8 @@ function buildSnowlumaSkeleton() {
           <span class="muted" id="sl3-hint" style="font-size:11.5px"></span>
           <span style="flex:1"></span>
           <button class="btn btn-small" id="sl3-check">刷新状态</button>
+          <button class="btn btn-small" id="sl3-toggle" title="启动/停止 SnowLuma 服务">启动</button>
+          <button class="btn btn-small" id="sl3-autostart" title="是否随开机自动启动">设为自启</button>
           <button class="btn btn-small primary" id="sl3-open">打开</button>
           <button class="btn btn-small" id="sl3-close">收起</button>
           <button class="btn btn-small" id="sl3-newwin">新窗口</button>
@@ -823,6 +825,7 @@ function buildSnowlumaSkeleton() {
           · 走 <code>/snowluma/</code> 反代，已去掉 X-Frame-Options 与 frame-ancestors。<br>
           · 账号 <code>admin</code>　密码 <code id="sl3-pw">读取中…</code>
           <button class="btn tiny" id="sl3-getpw" style="margin-left:6px">取访问令牌</button>
+          <button class="btn tiny" id="sl3-chpw" style="margin-left:4px">改密码</button>
         </div>
       </div>
 
@@ -992,6 +995,84 @@ function bindSnowlumaEvents() {
     if (hint) hint.textContent = '已收起（iframe 保留，再点打开可恢复）';
   });
 
+  // SnowLuma 服务开关（2026-10-27 用户要求）
+  //
+  // 用户："如果我们用了另一个通道，请保持另一个关闭，不要同时打开，
+  //       或者给一个开关，让我们可以自行选择关闭后台"
+  const sl3Control = async (action, label, btn) => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const oldTxt = btn.textContent;
+    btn.textContent = '处理中…';
+    try {
+      const r = await api('/api/snowluma-alt/control', { method: 'POST', body: { action } });
+      if (r?.ok) {
+        toast(`${label}完成`);
+        await sl3Check();
+      } else {
+        alert(`${label}失败：` + (r?.error || '未知'));
+      }
+    } catch (e) {
+      alert(`${label}失败：` + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  };
+
+  slEl('sl3-toggle')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    const stopping = btn.textContent === '停止';
+    if (stopping && !confirm('停止 SnowLuma 服务？\n\n· 会释放它占用的内存\n· 「打开」内嵌控制台将不可用\n· 随时可以再启动')) return;
+    await sl3Control(stopping ? 'stop' : 'start', stopping ? '停止' : '启动', btn);
+  });
+
+  slEl('sl3-autostart')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    const disabling = btn.textContent === '取消自启';
+    await sl3Control(disabling ? 'disable' : 'enable', disabling ? '取消自启' : '设置自启', btn);
+  });
+
+  // 改 SnowLuma WebUI 密码（2026-10-27 用户要求）
+  //
+  // 需要旧密码（SnowLuma 自己校验），改完内核会同步 .secrets 里的凭据，
+  // 所以「取访问令牌」按钮不会因为密码变了而失效。
+  slEl('sl3-chpw')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    if (btn.disabled) return;
+    const oldPw = prompt('当前密码：');
+    if (!oldPw) return;
+    const newPw = prompt('新密码（至少 10 位，需含大写字母与特殊符号）：');
+    if (!newPw) return;
+    const again = prompt('再输一次新密码：');
+    if (again !== newPw) return alert('两次输入不一致');
+
+    btn.disabled = true;
+    const oldTxt = btn.textContent;
+    btn.textContent = '修改中…';
+    try {
+      const r = await api('/api/snowluma-alt/change-password', {
+        method: 'POST',
+        body: { oldPassword: oldPw, newPassword: newPw },
+      });
+      if (r?.ok) {
+        const pwEl = slEl('sl3-pw');
+        if (pwEl) pwEl.textContent = newPw;
+        toast('密码已修改，凭据已同步');
+        if (r.warning) setTimeout(() => alert(r.warning), 800);
+      } else {
+        let msg = r?.error || '修改失败';
+        if (Array.isArray(r?.rules) && r.rules.length) msg += '\n\n未满足：\n· ' + r.rules.join('\n· ');
+        alert(msg);
+      }
+    } catch (e) {
+      alert('修改失败：' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  });
+
   // SnowLuma 状态查询（2026-10-27）
   //
   // 合并到控制台区块 —— 原先单独一块「SnowLuma 登录」跟这里功能重复，
@@ -1006,8 +1087,16 @@ function bindSnowlumaEvents() {
       if (!d.installed) { el.textContent = '未安装'; return; }
       const parts = [d.running ? '运行中' : '未运行'];
       if (d.running) parts.push(d.loggedIn ? `已登录 ${d.uin || ''}`.trim() : '未登录 QQ');
+      // 自启状态标出来，避免用户以为"停了就不会再起来"
+      if (d.enabled === 'enabled') parts.push('开机自启');
       el.textContent = parts.join(' · ');
       el.style.color = d.running && d.loggedIn ? '#2f855a' : (d.running ? '#b7791f' : 'var(--muted)');
+
+      // 按钮文案跟着状态走
+      const tgl = slEl('sl3-toggle');
+      if (tgl) tgl.textContent = d.running ? '停止' : '启动';
+      const auto = slEl('sl3-autostart');
+      if (auto) auto.textContent = d.enabled === 'enabled' ? '取消自启' : '设为自启';
     } catch (e) { el.textContent = '读取失败'; }
   };
   slEl('sl3-check')?.addEventListener('click', sl3Check);

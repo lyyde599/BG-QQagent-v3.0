@@ -16,7 +16,7 @@ import { getConfig, updateConfig, ROOT, DATA_DIR, COMMUNITY } from './config.js'
 import { checkKernelUpdate, downloadKernelUpdate, localKernelVersion, listDownloaded, publishKernel, canPublishKernel, autoInstallKernel, readInstallLog, lastInstallResult, checkInstaller } from './kernel-update.js';
 import { checkAll as checkNapcatQQ, installNapcat, installQQ, restartNapcatService, listKnownAccounts, currentUin, setAutoLoginUin, deleteAccountState,
   checkAllWithSnowluma, installSnowluma, restartSnowlumaService, isSnowlumaInstalled, localSnowlumaVersion, snowlumaHome,
-  BACKENDS, currentBackend, switchBackend, isServiceActive, snowlumaAltStatus, snowlumaCredentials } from './napcat-updater.js';
+  BACKENDS, currentBackend, switchBackend, isServiceActive, snowlumaAltStatus, snowlumaCredentials, changeSnowlumaPassword, controlSnowluma } from './napcat-updater.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments } from './onebot.js';
 import { ChatStore } from './store.js';
 import { MemoryStore } from './memory.js';
@@ -1350,6 +1350,41 @@ export function createApp({ log = console.log } = {}) {
           return json(res, 200, await snowlumaCredentials());
         } catch (error) {
           return json(res, 200, { ok: false, error: String(error?.message ?? error).slice(0, 100) });
+        }
+      }
+
+      // 修改 SnowLuma WebUI 密码（2026-10-27 用户要求）
+      //
+      // 安全说明：必须提供**当前密码**才能改（SnowLuma 自己校验），
+      // 所以即使有人摸到这个接口，不知道旧密码也改不了。
+      if (pathname === '/api/snowluma-alt/change-password' && method === 'POST') {
+        try {
+          const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+          const r = await changeSnowlumaPassword({
+            oldPassword: body?.oldPassword,
+            newPassword: body?.newPassword,
+          });
+          if (r.ok) log('[snowluma] WebUI 密码已修改');
+          return json(res, r.ok ? 200 : 400, r);
+        } catch (error) {
+          return json(res, 500, { ok: false, error: String(error?.message ?? error).slice(0, 120) });
+        }
+      }
+
+      // SnowLuma 服务开关（2026-10-27 用户要求）
+      //
+      // 用户："如果我们用了另一个通道，请保持另一个关闭，不要同时打开，
+      //       或者给一个开关，让我们可以自行选择关闭后台"
+      //
+      // action: start / stop（立即生效）｜ enable / disable（开机自启）
+      if (pathname === '/api/snowluma-alt/control' && method === 'POST') {
+        try {
+          const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+          const r = await controlSnowluma(body?.action);
+          if (r.ok) log(`[snowluma] ${r.action} 完成（active=${r.active} enabled=${r.enabled}）`);
+          return json(res, r.ok ? 200 : 400, r);
+        } catch (error) {
+          return json(res, 500, { ok: false, error: String(error?.message ?? error).slice(0, 120) });
         }
       }
 

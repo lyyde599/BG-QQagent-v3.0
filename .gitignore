@@ -18,3 +18,16 @@ data/plugins/*/quota.json
 # 遗留备份（2026-10-25 清理）
 *.bak-*
 备份/
+
+# ── 防止插件被错放在仓库根目录（2026-10-27）──
+#
+# 背景：cy131/ 是 plugin-market 的旧副本（v1.3.1），被误提交到根目录。
+# 它有两个问题：
+#   ① 位置不对 —— 内核只认 plugins/ 下的插件，根目录的不会被加载
+#   ② id 冲突 —— 它的 id 也叫 plugin-market，万一被移进 plugins/ 会打架
+#
+# 插件必须待在 plugins/<id>/ 下。根目录出现以下文件说明放错了位置：
+/cy131/
+/manifest.json
+/index.js
+/ui.js
