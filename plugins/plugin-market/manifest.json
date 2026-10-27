@@ -1,7 +1,7 @@
 {
   "id": "plugin-market",
   "name": "BG-QQAgent 创造营",
-  "version": "1.5.0",
+  "version": "1.10.1",
   "apiVersion": 1,
   "description": "BG-QQAgent 创造营：装插件、发技能。支持作者注册（邮箱验证码走中心服务）、插件打包发布下架卸载、版本自动检查与覆盖更新、Skill 发布管理。核心功能，不可停用。",
   "author": "白光",
@@ -28,7 +28,7 @@
   "scopes": [
     "all"
   ],
-  "category": "系统工具",
+  "category": "工具",
   "summary": "装插件、发技能的市场",
   "uiTab": {
     "id": "plugin-market",

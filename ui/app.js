@@ -338,13 +338,13 @@ async function pollUntilReady() {
   const startedAt = Date.now();
   try {
     const status = await api('/api/status');
-    if (!status.onebot?.connected) setLoadingStatus('SnowLuma 已就绪，正在连接 OneBot…');
+    if (!status.onebot?.connected) setLoadingStatus('网关已就绪，正在连接 OneBot…');
     else setLoadingStatus(`OneBot 已连接${status.onebot.self ? `（${status.onebot.self.nickname}）` : ''}，即将进入控制台…`);
     // 服务已可达，无需等到 OneBot 完全连上即可进入控制台（体检卡会继续提示）
     return true;
   } catch (e) {
     if (Date.now() - startedAt > 45000) {
-      setLoadingStatus('启动超时。请确认项目内 snowluma 文件夹完整，或到设置页手动启动 SnowLuma。');
+      setLoadingStatus('连接超时。请确认 OneBot 网关已启动（NapCat / SnowLuma 均可），或到「登录」页签手动启动。');
       return false;
     }
     return false;
@@ -373,7 +373,7 @@ function assessReadiness(cfg, status) {
   const acct2 = status?.onebot?.account || {};
   const acctOffline2 = acct2.online === false;
   // 分两条报：WS 连接 / 账号在线。只报前者会把"账号掉线"判成健康（2026-09-14 事故）
-  checks.push({ ok: !!obOk, label: obOk ? `OneBot 已连接${status.onebot.self ? `（${status.onebot.self.nickname}）` : ''}` : 'OneBot（SnowLuma）未连接 —— 请到 SnowLuma 页签启动', fix: obOk ? null : 'snowluma-tab' });
+  checks.push({ ok: !!obOk, label: obOk ? `OneBot 已连接${status.onebot.self ? `（${status.onebot.self.nickname}）` : ''}` : 'OneBot 未连接 —— 请到「登录」页签启动', fix: obOk ? null : 'snowluma-tab' });
   if (obOk) {
     const mins2 = acct2.offlineMs ? Math.round(acct2.offlineMs / 60000) : 0;
     checks.push({
@@ -402,7 +402,7 @@ function renderBanner() {
     html = '⏸ 机器人已暂停，不会处理任何消息。';
   } else if (s && !s.onebot.connected && !s.onebot.everConnected) {
     show = true;
-    html = '🔌 OneBot（SnowLuma）还没连上：请确认 SnowLuma 已启动，且设置里的 WS/HTTP 地址正确。';
+    html = '🔌 OneBot 还没连上：请确认网关（NapCat / SnowLuma）已启动，且设置里的 WS/HTTP 地址正确。';
   }
   banner.classList.toggle('hidden', !show);
   if (show) {
@@ -467,7 +467,11 @@ async function refreshStatus() {
     }
     $('#model-label').textContent = `模型：${s.orchestrator.model || '未设置'}`;
     const u = s.usage;
-    $('#usage-label').textContent = `今日：${u.runs} 次运行 · ${fmtTokens(u.totalTokens)}${u.cost ? ` · ¥${u.cost.toFixed(2)}` : ''}`;
+    // 缓存命中率（2026-10-26）：有真实数据才显示，没有就不占位置
+    const cachePart = (u.cacheHitRate !== null && u.cacheHitRate !== undefined)
+      ? ` · 缓存 ${u.cacheHitRate}%`
+      : '';
+    $('#usage-label').textContent = `今日：${u.runs} 次运行 · ${fmtTokens(u.totalTokens)}${cachePart}${u.cost ? ` · ¥${u.cost.toFixed(2)}` : ''}`;
     // 显式展示时区（记忆系统 01 第六节：页面时间必须让用户看到北京时间）
     const tzEl = document.getElementById('tz-label');
     if (tzEl) {
@@ -636,6 +640,7 @@ function renderSessionDetail(s) {
         <span>开始 ${fmtClock(s.startedAt)}${s.endedAt ? ` · 结束 ${fmtClock(s.endedAt)}` : ' · 进行中'}</span>
         <span>模型 ${esc(s.model || '-')}</span>
         <span>${usage.calls || 0} 次调用 · ${fmtTokens(usage.promptTokens)} 入 / ${fmtTokens(usage.completionTokens)} 出 / ${fmtTokens(usage.totalTokens)} 总</span>
+        ${(usage.cachedTokens || usage.cacheMissTokens) ? `<span title="命中 ${fmtTokens(usage.cachedTokens || 0)} / 未命中 ${fmtTokens(usage.cacheMissTokens || 0)}">缓存命中 ${(() => { const c = usage.cachedTokens || 0; const m = usage.cacheMissTokens || 0; const b = c + m; return b > 0 ? Math.round(c / b * 1000) / 10 : 0; })()}%</span>` : ''}
         <span>${s.rounds || 0} 轮工具</span>
       </div>
     </div>`);
@@ -757,32 +762,168 @@ function buildSnowlumaSkeleton() {
   if (!box || SL.built) return;
   box.innerHTML = `
     <div class="snowluma-page-card">
-      <div class="snowluma-head">
-        <h2>SnowLuma（OneBot 网关）</h2>
-        <div class="snowluma-qr" id="sl-qr-panel"></div>
+      <div class="snowluma-head" style="align-items:flex-start;gap:20px">
+        <!-- 左侧：标题 + 状态速览（2026-10-27 优化：把原来散在下面的状态压到这里） -->
+        <div style="flex:1;min-width:0">
+          <h2 style="margin:0 0 10px">OneBot 网关</h2>
+          <div style="display:grid;gap:5px;font-size:12.5px;line-height:1.6">
+            <div><span class="dot" id="sl-dot-run2"></span> 网关进程：<strong id="sl-txt-run2">—</strong>
+              <span class="muted" id="sl-txt-pid2"></span></div>
+            <div><span class="dot" id="sl-dot-ob2"></span> OneBot：<strong id="sl-txt-ob2">—</strong>
+              <span class="muted" id="sl-txt-obws2"></span></div>
+            <div class="muted" id="sl-txt-dir2" style="font-size:11.5px;word-break:break-all"></div>
+          </div>
+          <!-- 账号密码登录移到这里（2026-10-27 用户要求），填满左侧空白 -->
+          <div class="sl-login" id="sl-login-panel" style="margin-top:14px"></div>
+        </div>
+        <!-- 右侧：二维码 -->
+        <div class="snowluma-qr" id="sl-qr-panel" style="flex:0 0 auto"></div>
       </div>
-      <div class="sl-login" id="sl-login-panel"></div>
+      <!-- 账号密码登录已上移到顶部左侧（2026-10-27） -->
       <!-- 账号总览与一键切号（2026-09-16 新增，见 renderAccountsPanel） -->
       <div class="sl-accounts" id="sl-accounts-panel"></div>
-      <div class="snowluma-state-row">
+      <!-- 原状态行已移到顶部左侧（2026-10-27），这里保留隐藏元素供旧代码写入 -->
+      <div style="display:none">
         <span class="dot" id="sl-dot-run"></span>
-        <span>SnowLuma：<strong id="sl-txt-run"></strong></span>
-        <span class="muted" id="sl-txt-pid"></span>
-        <span class="muted" id="sl-txt-mode"></span>
-      </div>
-      <div class="snowluma-state-row">
+        <strong id="sl-txt-run"></strong>
+        <span id="sl-txt-pid"></span>
+        <span id="sl-txt-mode"></span>
         <span class="dot" id="sl-dot-ob"></span>
-        <span>OneBot：<strong id="sl-txt-ob"></strong></span>
-        <span class="muted" id="sl-txt-obws"></span>
+        <strong id="sl-txt-ob"></strong>
+        <span id="sl-txt-obws"></span>
+        <span id="sl-txt-dir"></span>
       </div>
-      <div class="snowluma-state-row muted"><span id="sl-txt-dir"></span></div>
       <div class="snowluma-state-row">
         <span>WebUI：</span>
         <span id="sl-webui-slot"></span>
       </div>
+
+      <!-- ═══ SnowLuma 内嵌（2026-10-27）═══
+           通过 nginx /snowluma/ 反代嵌入，已去掉 x-frame-options 与
+           frame-ancestors 限制（本机自建备用通道，嵌进自家面板合理）。
+           点「打开」才创建 iframe —— 不点不加载，避免白占资源。 -->
+      <div class="snowluma-state-row" style="flex-direction:column;align-items:stretch;gap:8px">
+        <div class="row" style="align-items:center;gap:8px;flex-wrap:wrap">
+          <b>SnowLuma 控制台</b>
+          <span class="muted" id="sl3-state" style="font-size:12px">—</span>
+          <span class="muted" id="sl3-hint" style="font-size:11.5px"></span>
+          <span style="flex:1"></span>
+          <button class="btn btn-small" id="sl3-check">刷新状态</button>
+          <button class="btn btn-small primary" id="sl3-open">打开</button>
+          <button class="btn btn-small" id="sl3-close">收起</button>
+          <button class="btn btn-small" id="sl3-newwin">新窗口</button>
+        </div>
+        <div id="sl3-frame-wrap" style="display:none">
+          <div class="muted" style="font-size:11.5px;margin-bottom:6px">
+            下方是 SnowLuma 控制台。首次进入需要在里面输入<b>访问令牌</b>（用密码登录可换取）。
+          </div>
+          <div id="sl3-frame-slot"></div>
+        </div>
+        <div class="muted" style="font-size:11.5px;line-height:1.7">
+          · 走 <code>/snowluma/</code> 反代，已去掉 X-Frame-Options 与 frame-ancestors。<br>
+          · 账号 <code>admin</code>　密码 <code id="sl3-pw">读取中…</code>
+          <button class="btn tiny" id="sl3-getpw" style="margin-left:6px">取访问令牌</button>
+        </div>
+      </div>
+
+      <!-- ═══ 通道切换 NapCat ⇄ SnowLuma（2026-10-27）═══ -->
+      <div class="snowluma-state-row" style="flex-direction:column;align-items:stretch;gap:8px">
+        <div class="row" style="align-items:center;gap:8px">
+          <b>协议通道</b>
+          <span class="muted" id="be-current" style="font-size:12px"></span>
+          <span style="flex:1"></span>
+          <button class="btn btn-small" id="be-refresh">刷新</button>
+        </div>
+        <div id="be-list" style="font-size:12.5px">点「刷新」查看可用通道</div>
+
+        <!-- 选型建议（2026-10-27 用户要求）-->
+        <div style="border:1px solid var(--line);border-radius:7px;padding:9px 11px;
+                    background:var(--bg-soft,#faf9f7);font-size:11.5px;line-height:1.75">
+          <div style="font-weight:600;margin-bottom:5px">怎么选？按你的情况对号入座</div>
+          <div style="display:grid;gap:6px">
+            <div>
+              <b>NapCat</b> —— 需运行官方 QQ 客户端（Electron + 虚拟显示）
+              <div class="muted" style="font-size:11px">
+                ✅ <b>协议最真</b>：走真实客户端，行为与真人无异，抗风控能力最强<br>
+                ✅ <b>功能最全</b>：支持语音 silk 转码、合并转发等依赖客户端的特性<br>
+                ⚠️ <b>资源要求高</b>：要跑完整 QQ 客户端，需要图形环境（Xvfb），
+                   磁盘与内存开销明显大于协议端<br>
+                ⚠️ <b>部署较重</b>：装客户端 + 配虚拟显示 + 注入，步骤多、易出错<br>
+                👉 适合：<b>主力号、高等级号</b>，或需要语音等完整功能的场景
+              </div>
+            </div>
+            <div>
+              <b>SnowLuma</b> —— 独立协议端，不依赖 QQ 客户端
+              <div class="muted" style="font-size:11px">
+                ✅ <b>轻量</b>：无需客户端、无需图形环境，解压即用，内置 Node<br>
+                ✅ <b>部署简单</b>：一条命令装好，不吃 Xvfb 那套配置<br>
+                ⚠️ <b>协议非官方</b>：风控风险理论上高于客户端协议<br>
+                ⚠️ <b>生态较新</b>：遇到冷门问题可查资料比 NapCat 少<br>
+                👉 适合：<b>小号 / 新号 / 测试号</b>，或服务器资源紧张、想快速上手的场景
+              </div>
+            </div>
+          </div>
+          <div class="muted" style="margin-top:6px;font-size:11px">
+            两者都走标准 OneBot v11，插件完全通用，随时可换。
+          </div>
+          <div style="margin-top:8px;padding-top:7px;border-top:1px dashed var(--line)">
+            <b>⚠️ 信息安全提醒</b>
+            <div class="muted" style="font-size:11px;margin-top:3px;line-height:1.7">
+              SnowLuma 默认开启 <code>#sl</code> 命令，<b>任何群友</b>发这句就能查到
+              框架版本、平台（如 win32-x64）、运行时长 —— 等于把技术栈暴露给陌生人。<br>
+              本项目的安装脚本<b>已默认关闭</b>该命令。如果你手动装的 SnowLuma，
+              请编辑 <code>config/onebot.json</code> 把
+              <code>statusCommand.enabled</code> 设为 <code>false</code> 后重启。
+              NapCat 没有这类命令，无需处理。
+            </div>
+          </div>
+        </div>
+
+        <div class="muted" style="font-size:11.5px;line-height:1.7">
+          · 两个协议端都走标准 OneBot v11，插件无需改动。<br>
+          · <b>同一个 QQ 号不能同时在两边登录</b>（会互踢），切换时会自动停掉另一个。<br>
+          · 切换后内核要重连才生效，会提示你重启。
+        </div>
+      </div>
+
+      <!-- ═══ 账号切换（2026-10-27）═══
+           换号是排查"账号被限 vs 接口坏了"最快的办法。 -->
+      <div class="snowluma-state-row" style="flex-direction:column;align-items:stretch;gap:8px">
+        <div class="row" style="align-items:center;gap:8px">
+          <b>切换账号</b>
+          <span class="muted" id="acct-current" style="font-size:12px"></span>
+          <span style="flex:1"></span>
+          <button class="btn btn-small" id="acct-refresh">刷新账号</button>
+        </div>
+        <div class="row" style="align-items:center;gap:8px;flex-wrap:wrap">
+          <select id="acct-select" class="gr-select" style="min-width:220px">
+            <option value="">点「刷新账号」读取本地登录态</option>
+          </select>
+          <button class="btn btn-small primary" id="acct-switch">切换并重启</button>
+          <button class="btn btn-small" id="acct-delete" style="color:#c00">删除此号</button>
+        </div>
+        <div class="muted" style="font-size:11.5px;line-height:1.7">
+          · 列出的是<b>本地已有登录态</b>的号；没有登录态的号重启后会掉到扫码。<br>
+          · 切换会重启网关（约 60~90 秒），当前会话会断开重连。<br>
+          · 删除只移除登录态文件（先备份到 config/.deleted/），当前正在用的号删不掉。
+        </div>
+      </div>
+
+      <!-- ═══ 版本更新（2026-10-27）═══
+           NapCat 与 QQ 客户端分别检测、分别升级。
+           没安装的会显示「安装」而不是「更新」。 -->
+      <div class="snowluma-state-row" style="flex-direction:column;align-items:stretch;gap:8px">
+        <div class="row" style="align-items:center;gap:8px">
+          <b>版本更新</b>
+          <button class="btn btn-small" id="nq-check-btn">检测更新</button>
+          <span class="muted" id="nq-check-hint" style="font-size:12px"></span>
+        </div>
+        <div id="nq-list" class="muted" style="font-size:12px">点「检测更新」查看 NapCat 与 QQ 客户端的版本情况</div>
+      </div>
       <div class="snowluma-actions">
-        <button class="btn btn-primary" id="sl-start-btn">启动 SnowLuma</button>
-        <button class="btn btn-danger" id="sl-stop-btn">关闭 SnowLuma</button>
+        <button class="btn btn-primary" id="sl-start-btn">启动网关</button>
+        <button class="btn btn-danger" id="sl-stop-btn">关闭网关</button>
+        <button class="btn btn-small" id="sl-restart-btn" title="发不出图片/文件时点这个。NapCat 跑久了富媒体通道会退化，重启即恢复">重启网关</button>
         <button class="btn btn-small" id="sl-refresh-btn">刷新状态</button>
         <button class="btn btn-small" id="sl-open-folder-btn">打开文件夹</button>
         <span id="sl-hint" class="muted" style="font-size:12px"></span>
@@ -806,7 +947,7 @@ function bindSnowlumaEvents() {
     setText('sl-hint', '');
     try {
       const r = await api('/api/snowluma/launch', { method: 'POST', body: '{}' });
-      setText('sl-hint', r.alreadyRunning ? 'SnowLuma 已经在运行 ✓' : (r.ok ? '已启动，日志见下方。' : ('启动失败：' + r.error)));
+      setText('sl-hint', r.alreadyRunning ? '网关已经在运行 ✓' : (r.ok ? '已启动，日志见下方。' : ('启动失败：' + r.error)));
     } catch (e) { setText('sl-hint', '启动失败：' + e.message); }
     setTimeout(() => loadSnowlumaPage({ quiet: true }), 2500);
   });
@@ -817,12 +958,412 @@ function bindSnowlumaEvents() {
     setText('sl-hint', '');
     try {
       await api('/api/snowluma/stop', { method: 'POST', body: '{}' });
-      setText('sl-hint', '已请求关闭 SnowLuma。');
+      setText('sl-hint', '已请求关闭网关。');
     } catch (e) { setText('sl-hint', '关闭失败：' + e.message); }
     setTimeout(() => loadSnowlumaPage({ quiet: true }), 1500);
   });
 
   slEl('sl-refresh-btn')?.addEventListener('click', () => loadSnowlumaPage());
+
+  // ── SnowLuma 内嵌控制台（2026-10-27）──
+  //
+  // 通过 nginx /snowluma/ 反代（已去掉 X-Frame-Options / frame-ancestors）。
+  // 懒加载：点「打开」才建 iframe，不点不加载。
+  slEl('sl3-open')?.addEventListener('click', () => {
+    const wrap = slEl('sl3-frame-wrap');
+    const slot = slEl('sl3-frame-slot');
+    if (!wrap || !slot) return;
+    if (!slot.querySelector('iframe')) {
+      const f = document.createElement('iframe');
+      f.src = '/snowluma/';
+      f.style.cssText = 'width:100%;height:760px;border:1px solid var(--line);border-radius:8px;background:#fff';
+      f.setAttribute('referrerpolicy', 'no-referrer');
+      slot.appendChild(f);
+    }
+    wrap.style.display = 'block';
+    const hint = slEl('sl3-hint');
+    if (hint) hint.textContent = '已内嵌加载';
+  });
+
+  slEl('sl3-close')?.addEventListener('click', () => {
+    const wrap = slEl('sl3-frame-wrap');
+    if (wrap) wrap.style.display = 'none';
+    const hint = slEl('sl3-hint');
+    if (hint) hint.textContent = '已收起（iframe 保留，再点打开可恢复）';
+  });
+
+  // SnowLuma 状态查询（2026-10-27）
+  //
+  // 合并到控制台区块 —— 原先单独一块「SnowLuma 登录」跟这里功能重复，
+  // 已删除（用户指出"新窗口和打开登录页其实重复了"）。
+  const sl3Check = async () => {
+    const el = slEl('sl3-state');
+    if (!el) return;
+    el.textContent = '检查中…';
+    try {
+      const d = await api('/api/snowluma-alt/status');
+      if (!d?.ok) { el.textContent = '读取失败'; return; }
+      if (!d.installed) { el.textContent = '未安装'; return; }
+      const parts = [d.running ? '运行中' : '未运行'];
+      if (d.running) parts.push(d.loggedIn ? `已登录 ${d.uin || ''}`.trim() : '未登录 QQ');
+      el.textContent = parts.join(' · ');
+      el.style.color = d.running && d.loggedIn ? '#2f855a' : (d.running ? '#b7791f' : 'var(--muted)');
+    } catch (e) { el.textContent = '读取失败'; }
+  };
+  slEl('sl3-check')?.addEventListener('click', sl3Check);
+
+  // 取访问令牌（2026-10-27 用户要求把密码给大家用）
+  //
+  // SnowLuma 登录页要的是「访问令牌」而不是密码，
+  // 但令牌可以用密码换。这里自动换一次并复制到剪贴板，
+  // 省得每个人还要去敲 curl。
+  slEl('sl3-getpw')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const oldTxt = btn.textContent;
+    btn.textContent = '获取中…';
+    try {
+      const r = await api('/api/snowluma-alt/token', { method: 'POST', body: {} });
+      if (!r?.ok) { alert('获取失败：' + (r?.error || '未知')); return; }
+      const pwEl = slEl('sl3-pw');
+      if (pwEl) pwEl.textContent = r.password || '';
+      try {
+        await navigator.clipboard.writeText(r.token || '');
+        toast('访问令牌已复制到剪贴板，粘贴进下面的输入框即可');
+      } catch {
+        alert('访问令牌（手动复制）：\n\n' + (r.token || ''));
+      }
+    } catch (e) {
+      alert('获取失败：' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  });
+
+  // 新窗口用**相对路径**，跟着当前访问域名走：
+  //   从 qq.597457.xyz 打开 → https://qq.597457.xyz/snowluma/
+  //   从 127.0.0.1:3210 打开 → http://127.0.0.1:3210/snowluma/
+  // 原来写死 127.0.0.1:5099，公网用户根本打不开（2026-10-27 修）
+  slEl('sl3-newwin')?.addEventListener('click', () => {
+    window.open(location.origin + '/snowluma/', '_blank', 'noopener');
+  });
+
+  // ── 通道切换 NapCat ⇄ SnowLuma（2026-10-27）──
+  //
+  // 用户问："前端如何从napcat切换到snowluma？"
+  // 内核连谁取决于 config.snowluma.wsUrl/httpUrl，这里做的就是改它 + 启停服务。
+
+  const beRender = (d) => {
+    const box = slEl('be-list');
+    const cur = slEl('be-current');
+    if (!box) return;
+    if (cur) cur.textContent = d?.current ? `当前：${(d.backends || []).find((x) => x.current)?.label || d.current}` : '当前：未识别';
+    const rows = (d?.backends || []).map((b) => {
+      let btn = '';
+      if (!b.installed) {
+        btn = '<span class="muted">未安装</span>';
+      } else if (b.current) {
+        btn = '<span style="color:#2f855a">✓ 使用中</span>';
+      } else {
+        btn = `<button class="btn btn-small primary" data-be-switch="${esc(b.key)}">切到 ${esc(b.label)}</button>`;
+      }
+      const run = b.active
+        ? '<span style="color:#2f855a">运行中</span>'
+        : '<span class="muted">已停止</span>';
+      return `
+        <div class="row" style="align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--line)">
+          <span style="min-width:90px;font-weight:600">${esc(b.label)}</span>
+          ${run}
+          <span class="muted" style="font-size:11.5px">${esc(b.wsUrl)}</span>
+          <span style="flex:1"></span>
+          ${btn}
+        </div>`;
+    }).join('');
+    box.innerHTML = rows || '<span class="muted">没有可用通道</span>';
+
+    box.querySelectorAll('[data-be-switch]').forEach((btn) => {
+      btn.addEventListener('click', () => beSwitch(btn.dataset.beSwitch, btn));
+    });
+  };
+
+  const beLoad = async () => {
+    try {
+      const d = await api('/api/napcat-qq/backend');
+      if (d?.ok) beRender(d);
+    } catch (e) { toast('读取通道失败：' + e.message); }
+  };
+
+  const beSwitch = async (target, btn) => {
+    const label = target === 'snowluma' ? 'SnowLuma' : 'NapCat';
+    if (!confirm(`切换到 ${label}？\n\n`
+      + '· 会自动停掉另一个协议端（同一 QQ 号不能两处登录）\n'
+      + `· 然后启动 ${label}，并把内核连接地址改过去\n`
+      + '· 切换后内核需重连才生效（会再问你要不要重启）')) return;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const oldTxt = btn.textContent;
+    btn.textContent = '切换中…';
+    try {
+      const r = await api('/api/napcat-qq/switch-backend', { method: 'POST', body: { target } });
+      if (r?.ok) {
+        toast(`已切到 ${label}`);
+        await beLoad();
+        if (r.needKernelRestart) {
+          const doRestart = confirm(
+            `通道已切换为 ${label}。\n\n`
+            + '但内核还在连旧地址，需要重启主服务才会生效。\n'
+            + '重启会中断当前对话（约 20 秒）。\n\n'
+            + '现在重启吗？（选「取消」可以稍后自己重启）'
+          );
+          if (doRestart) {
+            toast('正在重启主服务…');
+            try { await api('/api/self-restart', { method: 'POST' }); } catch { /* 重启期间必然断 */ }
+            setTimeout(() => location.reload(), 25000);
+          }
+        }
+      } else {
+        alert('切换失败：' + (r?.error || '未知'));
+      }
+    } catch (e) {
+      alert('切换失败：' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  };
+
+  slEl('be-refresh')?.addEventListener('click', beLoad);
+
+  // ── 账号切换（2026-10-27）──
+  //
+  // 换号排查：同一个环境换个号，行为不同 → 账号问题；一样 → 环境/接口问题。
+
+  const acctLoad = async () => {
+    const sel = slEl('acct-select');
+    const cur = slEl('acct-current');
+    try {
+      const d = await api('/api/napcat-qq/accounts');
+      if (!d?.ok) { toast('读取账号失败'); return; }
+      const list = d.accounts || [];
+      if (cur) cur.textContent = d.current ? `当前配置：${d.current}` : '当前配置：未知';
+      if (!sel) return;
+      if (!list.length) {
+        sel.innerHTML = '<option value="">本地没有可用登录态</option>';
+        return;
+      }
+      sel.innerHTML = '<option value="">选择要切换的 QQ 号…</option>' + list.map((a) => {
+        const t = a.updatedAt ? a.updatedAt.slice(0, 10) : '';
+        return `<option value="${esc(a.uin)}"${a.isCurrent ? ' selected' : ''}>${esc(a.uin)}${a.isCurrent ? '（当前）' : ''} · ${esc(t)}</option>`;
+      }).join('');
+    } catch (e) {
+      toast('读取账号失败：' + e.message);
+    }
+  };
+
+  slEl('acct-refresh')?.addEventListener('click', acctLoad);
+
+  // 删除账号登录态（2026-10-27 用户要求："登录历史添加账号删除"）
+  slEl('acct-delete')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    const uin = String(slEl('acct-select')?.value || '').trim();
+    if (!uin) return toast('先选一个要删除的 QQ 号');
+    if (!confirm(`删除 QQ ${uin} 的历史登录态？\n\n`
+      + '· 删掉后这个号不会再出现在快速登录列表\n'
+      + '· 以后要用它需要重新扫码\n'
+      + '· 文件会先备份到 config/.deleted/')) return;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const oldTxt = btn.textContent;
+    btn.textContent = '删除中…';
+    try {
+      const r = await api('/api/napcat-qq/delete-account', { method: 'POST', body: { uin } });
+      if (r?.ok) {
+        toast(`已删除 ${uin}（${(r.removed || []).length} 个文件）`);
+        await acctLoad();
+      } else {
+        alert('删除失败：' + (r?.error || '未知'));
+      }
+    } catch (e) {
+      alert('删除失败：' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  });
+  slEl('acct-switch')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    const uin = String(slEl('acct-select')?.value || '').trim();
+    if (!uin) return toast('先选一个 QQ 号');
+    if (!confirm(`切换到 QQ ${uin} 并重启网关？\n\n· 约需 60~90 秒\n· 机器人在此期间离线\n· 若该号没有登录态，需要扫码`)) return;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const oldTxt = btn.textContent;
+    btn.textContent = '切换中…';
+    try {
+      const r = await api('/api/napcat-qq/switch', { method: 'POST', body: { uin, restart: true } });
+      if (r?.ok) {
+        toast(`已切换到 ${r.uin}，网关重启中…`);
+        // 🔴 立刻清掉「已登录」的残留状态（2026-10-27）
+        //
+        // 不清的话，界面右上角会一直显示旧账号的「✅ 已登录 3170037984」，
+        // 用户以为切换没生效（实际 autoLoginAccount 已经改了、二维码也在重新生成）。
+        SL.loggedIn = null;
+        const qrBox = slEl('sl-qr-panel');
+        if (qrBox) {
+          qrBox.innerHTML = '<div class="sl-qr-empty">切换中…<br>'
+            + '<span class="muted">网关重启后将显示新账号的登录状态</span></div>';
+        }
+        if (r.warn) setTimeout(() => alert(r.warn), 1200);
+        // 重启要 60~90 秒，分几次刷新，确保二维码一出来就能看到
+        [30000, 60000, 95000].forEach((ms) => setTimeout(() => loadSnowlumaPage(), ms));
+      } else {
+        alert('切换失败：' + (r?.error || '未知'));
+      }
+    } catch (e) {
+      alert('切换失败：' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  });
+
+  // ── NapCat / QQ 版本检测与一键升级（2026-10-27）──
+  //
+  // 用户要求："检测 napcat 和 QQ 客户端新版本（分别），登录 tab 页一键更新，
+  // 包括没安装的，直连最新版本通道"
+
+  const nqRender = (d) => {
+    const boxEl = slEl('nq-list');
+    if (!boxEl) return;
+    const rows = [];
+    for (const [key, label] of [['napcat', 'NapCat'], ['qq', 'QQ 客户端'], ['snowluma', 'SnowLuma']]) {
+      const x = (d && d[key]) || {};
+      const loc = x.local || '未安装';
+      const lat = x.latest || '未知';
+      let status = '';
+      let btn = '';
+      if (x.needInstall) {
+        status = '<span style="color:var(--acc)">未安装</span>';
+        btn = `<button class="btn btn-small primary" data-nq-install="${key}">安装 ${esc(lat)}</button>`;
+      } else if (x.needUpdate) {
+        status = `<span style="color:#b7791f">有新版 ${esc(lat)}</span>`;
+        btn = `<button class="btn btn-small primary" data-nq-install="${key}">更新到 ${esc(lat)}</button>`;
+      } else {
+        status = '<span style="color:#2f855a">已是最新</span>';
+      }
+      const err = x.error ? ` <span class="muted">（${esc(x.error)}）</span>` : '';
+      // SnowLuma 是备用通道，标出来免得用户困惑为什么有两套
+      const tag = key === 'snowluma'
+        ? ' <span class="muted" style="font-size:11px">备用通道</span>'
+        : '';
+      rows.push(`
+        <div class="row" style="align-items:center;gap:10px;padding:4px 0;border-bottom:1px solid var(--line)">
+          <span style="min-width:90px;font-weight:600">${label}${tag}</span>
+          <span>当前 <code>${esc(loc)}</code></span>
+          <span>最新 <code>${esc(lat)}</code></span>
+          <span style="flex:1"></span>
+          ${status}${err}
+          ${btn}
+        </div>`);
+    }
+    boxEl.innerHTML = rows.join('') || '读取失败';
+    boxEl.querySelectorAll('[data-nq-install]').forEach((b) => {
+      b.addEventListener('click', () => nqInstall(b.dataset.nqInstall, b));
+    });
+  };
+
+  const nqInstall = async (target, btn) => {
+    const label = target === 'napcat' ? 'NapCat' : 'QQ 客户端';
+    if (!confirm(`下载并安装最新的 ${label}？\n\n· 会先备份现有版本\n· 装完自动重启网关（约 60~90 秒）\n· 若登录态失效需要重新扫码`)) return;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const oldTxt = btn.textContent;
+    btn.textContent = '安装中…';
+    toast(`开始下载 ${label}，请稍候（大包可能要一两分钟）`);
+    try {
+      const r = await api('/api/napcat-qq/update', {
+        method: 'POST',
+        body: { target, restart: true },
+      });
+      if (r?.ok) {
+        toast(`${label} 已更新到 ${r.version || '最新版'}，网关重启中…`);
+        // 重启期间接口会断，等 90 秒后刷新
+        setTimeout(() => loadSnowlumaPage(), 90000);
+      } else {
+        alert(`${label} 安装失败：` + (r?.error || '未知'));
+      }
+    } catch (e) {
+      alert(`${label} 安装失败：` + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  };
+
+  slEl('nq-check-btn')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    const hint = slEl('nq-check-hint');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = '检测中…';
+    if (hint) hint.textContent = '';
+    try {
+      const d = await api('/api/napcat-qq/check');
+      if (d?.ok) {
+        nqRender(d);
+        if (hint) hint.textContent = `检测于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+      } else if (hint) hint.textContent = '检测失败：' + (d?.error || '未知');
+    } catch (e) {
+      if (hint) hint.textContent = '检测失败：' + e.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '检测更新';
+    }
+  });
+
+  // 重启网关（2026-10-26）
+  //
+  // 用户要求："加一个重启按钮在登录界面"
+  // 用途：NapCat 跑久了（实测 13 小时）富媒体通道退化 ——
+  //      文字能发、图片/文件 10 秒超时。重启即恢复。
+  slEl('sl-restart-btn')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    if (btn.disabled) return;
+    if (!confirm('重启 OneBot 网关？\n\n· 约需 40~60 秒\n· 期间机器人暂时离线\n· 若登录态失效，需要重新扫码')) return;
+    btn.disabled = true;
+    const oldTxt = btn.textContent;
+    btn.textContent = '重启中…';
+    try {
+      const r = await api('/api/snowluma/restart', { method: 'POST', body: {} });
+      if (r?.ok) {
+        toast('已发起重启，约 40~60 秒后恢复');
+        // 轮询状态：起来了就自动刷新面板
+        let tries = 0;
+        const iv = setInterval(async () => {
+          tries += 1;
+          try {
+            const s = await api('/api/status');
+            const ob = s?.onebot || {};
+            if (ob.connected) {
+              clearInterval(iv);
+              toast('网关已恢复');
+              loadSnowlumaPage();
+            }
+          } catch { /* 重启期间接口必然失败，忽略 */ }
+          if (tries > 30) { clearInterval(iv); loadSnowlumaPage(); }
+        }, 3000);
+      } else {
+        alert(r?.error || '重启失败');
+      }
+    } catch (e) {
+      alert('重启失败：' + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldTxt;
+    }
+  });
   slEl('sl-open-folder-btn')?.addEventListener('click', async () => {
     try { await api('/api/snowluma/open-folder', { method: 'POST', body: '{}' }); }
     catch (e) { setText('sl-hint', '失败：' + e.message); }
@@ -950,11 +1491,26 @@ async function loadQuickList() {
 async function doQuickLogin() {
   const uin = (slEl('sl-uin')?.value || '').trim();
   if (!uin) return slLoginMsg('请先填 QQ 号', 'err');
-  slLoginMsg('正在快速登录 ' + uin + ' …');
+  if (!/^\d{5,12}$/.test(uin)) return slLoginMsg('QQ 号格式不对', 'err');
+  if (!confirm(`用 ${uin} 快速登录？\n\n· 会重启网关（约 60~90 秒）\n· 该号需有历史登录态，否则要扫码`)) return;
+
+  slLoginMsg('正在设定并重启网关…');
   try {
-    const r = await api('/api/snowluma/login/set-quick', { method: 'POST', body: JSON.stringify({ uin }) });
+    const r = await api('/api/snowluma/login/set-quick', { method: 'POST', body: JSON.stringify({ uin, restart: true }) });
     if (!r.ok) return slLoginMsg('快速登录失败：' + r.error, 'err');
-    slLoginMsg('已请求快速登录，请稍候观察状态…', 'ok');
+
+    // 说清楚到底做了什么（原来只提示"已请求"，用户以为卡死）
+    if (r.restarted) {
+      slLoginMsg(`✅ 已设定 ${uin} 并重启网关，约 60~90 秒后完成登录`, 'ok');
+      SL.loggedIn = null;
+      const qrBox = slEl('sl-qr-panel');
+      if (qrBox) qrBox.innerHTML = '<div class="sl-qr-empty">网关重启中…<br>'
+        + '<span class="muted">稍后自动刷新登录状态</span></div>';
+      [30000, 60000, 95000].forEach((ms) => setTimeout(() => loadSnowlumaPage(), ms));
+      if (r.warn) setTimeout(() => alert(r.warn), 1500);
+    } else {
+      slLoginMsg('⚠️ 已设定 ' + uin + '，但重启失败，请手动点「重启网关」', 'warn');
+    }
   } catch (e) { slLoginMsg('失败：' + e.message, 'err'); }
 }
 
@@ -1243,12 +1799,15 @@ async function submitCaptcha(ticket, randstr) {
 }
 
 // ── 卡片右上角的登录二维码 ──
-async function renderSnowlumaQr(connectedHint, selfHint) {
+async function renderSnowlumaQr(connectedHint, selfHint, opts = {}) {
   const box = slEl('sl-qr-panel');
   if (!box) return;
 
-  const showLoggedIn = (nick, uid) => {
-    if (SL.loggedIn === true) return;
+  const showLoggedIn = (nick, uid, force = false) => {
+    // 🔴 force=true 用于账号切换后强制重绘（2026-10-27）
+    //    原来只要 SL.loggedIn 已是 true 就直接 return，
+    //    切换账号后界面停在"已登录旧账号"，看起来像没切成功。
+    if (SL.loggedIn === true && !force) return;
     SL.loggedIn = true;
     box.innerHTML = '<div class="sl-qr-done">✅ 已登录'
       + (nick ? '<br><strong>' + esc(nick) + '</strong>' : '')
@@ -1262,7 +1821,14 @@ async function renderSnowlumaQr(connectedHint, selfHint) {
   try {
     const r = await api('/api/snowluma/qr');
     if (r.loggedIn) return showLoggedIn(r.self?.nickname, r.self?.userId);
+    // 账号掉线/切换后：loggedIn 变 false，要把 SL 标记一起清掉，
+    // 否则下次真登录了 showLoggedIn 会因为「已是 true」而不重绘。
+    const wasLoggedIn = SL.loggedIn === true;
     SL.loggedIn = false;
+    if (wasLoggedIn) {
+      // 身份变了，强制把二维码区域重置，走下面的"显示二维码"流程
+      box.innerHTML = '';
+    }
 
     if (!r.exists) {
       if (box.querySelector('.sl-qr-img') || !box.querySelector('.sl-qr-empty')) {
@@ -1280,13 +1846,62 @@ async function renderSnowlumaQr(connectedHint, selfHint) {
     if (!img) {
       box.innerHTML = '<div class="sl-qr-title">扫码登录 QQ</div>'
         + '<img class="sl-qr-img" src="/api/snowluma/qr.png?t=' + Date.now() + '" alt="登录二维码">'
-        + '<div class="sl-qr-hint" id="sl-qr-hint"></div>';
+        + '<div class="sl-qr-hint" id="sl-qr-hint"></div>'
+        + '<div style="margin-top:6px"><button class="btn btn-small" id="sl-qr-refresh">刷新二维码</button></div>';
+      SL.qrAt = r.qrAt;
+    } else if (opts.forceReload === true) {
+      // 用户主动点刷新：不管换没换码，都重拉一次图
+      img.src = '/api/snowluma/qr.png?t=' + Date.now();
       SL.qrAt = r.qrAt;
     } else if (r.qrAt && r.qrAt !== SL.qrAt) {
       SL.qrAt = r.qrAt;                    // 仅在 NapCat 换码时换图，避免闪烁
       img.src = '/api/snowluma/qr.png?t=' + Date.now();
     }
     setText('sl-qr-hint', hint);
+
+    // 手动刷新二维码（2026-10-27 用户要求："加入刷新二维码功能，不点击不主动刷新"）
+    //
+    // 两种刷新语义：
+    //   ① 本地重载 — 只是重新拉一次 qr.png（NapCat 没换码时看到的是同一张）
+    //   ② 请求换码 — 调 refresh-qr 让 NapCat 生成新码（原码可能已过期）
+    // 这里默认只做 ①，因为 ② 会作废当前正在扫的码，容易让人白扫。
+    const rbtn = box.querySelector('#sl-qr-refresh');
+    if (rbtn && !rbtn.dataset.bound) {
+      rbtn.dataset.bound = '1';
+      rbtn.addEventListener('click', async () => {
+        if (rbtn.disabled) return;
+        if (!confirm('放弃当前二维码并重新生成一张？\n\n当前这张会立即作废，需要重新扫码。')) return;
+        rbtn.disabled = true;
+        const oldTxt = rbtn.textContent;
+        rbtn.textContent = '重新生成中…';
+        try {
+          // 🔴 真刷新 = 作废旧码 + 让 NapCat 生成新码（2026-10-27 用户澄清）
+          //
+          // 之前只做了"重拉一次图片"，NapCat 没换码时看到的是同一张，
+          // 倒计时也不重置 —— 那不是刷新，只是重新下载。
+          // 现在调 /api/snowluma/login/refresh-qr 让上游真的换码。
+          const r = await api('/api/snowluma/login/refresh-qr', { method: 'POST', body: {} });
+          if (!r?.ok) {
+            toast('重新生成失败：' + (r?.error || '未知'));
+            return;
+          }
+          // NapCat 换码后会写新的 qrcode.png，稍等一下再取图
+          await new Promise((z) => setTimeout(z, 1200));
+          // 清掉 qrAt + 清空容器 —— 让 renderSnowlumaQr 走"首图"分支
+          // 完整重建二维码块，倒计时才会从 0s 重新开始（用户明确要求）
+          SL.qrAt = '';
+          const qrBox = slEl('sl-qr-panel');
+          if (qrBox) qrBox.innerHTML = '';
+          await renderSnowlumaQr(false, null, { forceReload: true });
+          toast('已生成新二维码，请重新扫码');
+        } catch (e) {
+          toast('刷新失败：' + e.message);
+        } finally {
+          rbtn.disabled = false;
+          rbtn.textContent = oldTxt;
+        }
+      });
+    }
     startSnowlumaQrTimer();
   } catch (e) {
     if (!box.querySelector('.sl-qr-empty')) {
@@ -1296,15 +1911,16 @@ async function renderSnowlumaQr(connectedHint, selfHint) {
 }
 
 function startSnowlumaQrTimer() {
+  // 🔴 不做自动轮询（2026-10-27 用户要求："不点击不主动刷新二维码"）
+  //
+  // 原来每 5 秒自动重渲染一次，会不停请求 /api/snowluma/qr.png，
+  // 也没必要 —— NapCat 自己约 2 分钟才换一次码，5 秒刷是浪费。
+  // 现在改为：只在首次进入页面时渲染一次，之后由用户点「刷新二维码」触发。
   if (SL.qrTimer) return;
-  SL.qrTimer = setInterval(() => {
-    if (state.tab !== 'snowluma') return;
-    if (SL.loggedIn === true) { stopSnowlumaQrTimer(); return; }
-    renderSnowlumaQr(false, null);
-  }, 5000);
+  SL.qrTimer = true;   // 标记已初始化，避免重复
 }
 function stopSnowlumaQrTimer() {
-  if (SL.qrTimer) { clearInterval(SL.qrTimer); SL.qrTimer = null; }
+  SL.qrTimer = null;
 }
 
 // ── SnowLuma 独立页签 ──
@@ -1358,11 +1974,30 @@ async function loadSnowlumaPage({ quiet = false } = {}) {
         : (_s.onebot?.error ? ('WS ：' + _s.onebot.error) : ''));
       setText('sl-txt-dir', '目录：' + (dir || '（未找到项目内 snowluma/ 文件夹）'));
 
+      // 把同样的状态同步到顶部左侧的紧凑面板（2026-10-27 布局优化）
+      // 直接用 innerHTML 复制，避免再写一遍判断逻辑
+      const mirror = [
+        ['sl-txt-run2', 'sl-txt-run'],
+        ['sl-txt-pid2', 'sl-txt-pid'],
+        ['sl-txt-ob2', 'sl-txt-ob'],
+        ['sl-txt-obws2', 'sl-txt-obws'],
+        ['sl-txt-dir2', 'sl-txt-dir'],
+      ];
+      for (const [dst, src] of mirror) {
+        const a = slEl(src);
+        const b = slEl(dst);
+        if (a && b) b.innerHTML = a.innerHTML;
+      }
+      const d1 = slEl('sl-dot-run'); const d2 = slEl('sl-dot-run2');
+      if (d1 && d2) d2.className = d1.className;
+      const e1 = slEl('sl-dot-ob'); const e2 = slEl('sl-dot-ob2');
+      if (e1 && e2) e2.className = e1.className;
+
       const webSlot = slEl('sl-webui-slot');
       if (webSlot) {
         const want = _webui
-          ? ('<button class="btn btn-small" id="sl-open-webui-btn" title="在浏览器中打开 SnowLuma 控制台">' + esc(_webui) + '</button>')
-          : '<span class="muted">等待 SnowLuma 启动后自动识别…</span>';
+          ? ('<button class="btn btn-small" id="sl-open-webui-btn" title="在浏览器中打开网关控制台">' + esc(_webui) + '</button>')
+          : '<span class="muted">等待网关启动后自动识别…</span>';
         if (webSlot.innerHTML !== want) {
           webSlot.innerHTML = want;
           const b = slEl('sl-open-webui-btn');
@@ -1377,7 +2012,7 @@ async function loadSnowlumaPage({ quiet = false } = {}) {
 
       const startBtn = slEl('sl-start-btn');
       if (startBtn) {
-        const label = _running ? '已运行' : '启动 SnowLuma';
+        const label = _running ? '已运行' : '启动网关';
         if (startBtn.textContent !== label) startBtn.textContent = label;
         if (startBtn.disabled !== _running) startBtn.disabled = _running;
       }
@@ -1559,7 +2194,7 @@ function renderHealthCard() {
   const rows = checks.map((c) => {
     let extra = '';
     if (!c.ok && c.fix === 'snowluma-tab') {
-      extra = ' <button class="btn btn-small" id="hc-goto-snowluma">前往 SnowLuma 页签</button>';
+      extra = ' <button class="btn btn-small" id="hc-goto-snowluma">前往「登录」页签</button>';
     }
     return `
     <div class="h-item ${c.ok ? 'ok' : 'bad'}">
@@ -1853,16 +2488,22 @@ async function loadMarketPage() {
       //
       // 这里给一个 remount()：清空当前容器、重新 mount。
       // 效果上等价于"刷新这个窗口"，但不动整个页面。
-      remount: async () => {
-        const fresh = await loadPluginUi('plugin-market', meta.ui || 'ui.js');
-        const m2 = fresh?.mountPanel || fresh?.mount;
-        if (typeof m2 !== 'function') return;
-        box.innerHTML = '';
-        await m2(box, {
-          ...pluginUiContext('plugin-market'),
-          openPluginPanel,
-        });
-      },
+      // 🔴 递归注入 remount（2026-10-26 修）
+      //
+      // 原来重挂后的新 ctx 里**没有 remount** —— 第一次点刷新能用，
+      // 第二次就退化成 location.reload() 整页重载。
+      // 这里让重挂后的 ctx 也带上 remount（闭包，无需命名函数）。
+      remount: (function mountCycle() {
+        return async () => {
+          const fresh = await loadPluginUi('plugin-market', meta.ui || 'ui.js');
+          const m2 = fresh?.mountPanel || fresh?.mount;
+          if (typeof m2 !== 'function') return;
+          box.innerHTML = '';
+          const ctx2 = { ...pluginUiContext('plugin-market'), openPluginPanel };
+          ctx2.remount = mountCycle();     // ← 递归注入
+          await m2(box, ctx2);
+        };
+      })(),
     });
     box.dataset.mounted = '1';
   } catch (e) {
@@ -2354,7 +2995,7 @@ function renderSettingsSidebar() {
     ['chat', '聊天设置'],
     ['appearance', '外观'],
     ['desktop', '桌面端'],
-    ['onebot', 'OneBot（SnowLuma）'],
+    ['onebot', 'OneBot 连接'],
     ['about', '关于'],
     ['feedback', 'BUG 反馈']
   ];
@@ -2703,7 +3344,7 @@ function renderApiSection(c) {
     <div class="field-row">
       <div class="field"><label>当前 Base URL</label>
         <div style="display:flex;gap:8px">
-          <input type="text" id="cfg-baseurl" readonly value="${esc(c.api.baseUrl)}" style="flex:1" />
+          <input type="text" id="cfg-baseurl" value="${esc(c.api.baseUrl)}" placeholder="https://api.example.com/v1（可手动编辑）" style="flex:1" />
           <button class="btn btn-small" id="fetch-current-models-btn">获取列表</button>
         </div></div>
       <div class="field"><label>当前 API Key</label>
@@ -2969,21 +3610,21 @@ function renderDesktopSection(c) {
 
 function renderOnebotSection(c) {
   return `
-    <h3 id="settings-onebot">OneBot（SnowLuma）</h3>
-    <div class="hint" style="margin-bottom:10px">SnowLuma 的启动、关闭与日志已移动到顶部「SnowLuma」页签。此处只保留连接配置。</div>
-    <div class="field"><label>SnowLuma 程序目录（留空 = 自动使用项目内 snowluma/ 文件夹）</label>
+    <h3 id="settings-onebot">OneBot 连接</h3>
+    <div class="hint" style="margin-bottom:10px">网关的启动、关闭与日志在顶部「登录」页签。此处只保留连接配置。</div>
+    <div class="field"><label>网关程序目录（用 SnowLuma 时填；NapCat 部署留空即可）</label>
       <div style="display:flex;gap:8px">
         <input type="text" id="cfg-snowlumadir" value="${esc(c.snowluma.dir || '')}" style="flex:1" />
         <button class="btn btn-small" id="open-snowluma-btn">打开文件夹</button>
       </div>
       <div class="hint" id="snowluma-hint"></div></div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-snowlumalaunch" ${c.snowluma.autoLaunch ? 'checked' : ''} />
-      <label for="cfg-snowlumalaunch">QQ Agent 启动时自动拉起 SnowLuma（未运行时）</label></div>
+      <label for="cfg-snowlumalaunch">QQ Agent 启动时自动拉起网关（仅 SnowLuma 部署有效）</label></div>
     <div class="field-row">
       <div class="field"><label>WebSocket 地址（收消息）</label><input type="text" id="cfg-wsurl" value="${esc(c.snowluma.wsUrl)}" /></div>
       <div class="field"><label>HTTP 地址（发消息）</label><input type="text" id="cfg-httpurl" value="${esc(c.snowluma.httpUrl)}" /></div>
       <div class="field"><label>WebSocket 令牌</label><input type="password" id="cfg-obtoken" value="${esc(c.snowluma.accessToken || '')}" /></div>
-      <div class="field"><label>HTTP 令牌（与 WS 不同时填；SnowLuma 默认分开）</label><input type="password" id="cfg-obhttptoken" value="${esc(c.snowluma.httpAccessToken || '')}" /></div>
+      <div class="field"><label>HTTP 令牌（与 WS 不同时填）</label><input type="password" id="cfg-obhttptoken" value="${esc(c.snowluma.httpAccessToken || '')}" /></div>
     </div>
     <div class="hint">改完 OneBot 地址需要重启应用生效；模型/人设/白名单即时生效。</div>`;
 }
@@ -3911,7 +4552,7 @@ async function openWhitelistPicker(kind) {
     return;
   }
   if (!list?.length) {
-    $('#pick-result').textContent = isGroups ? '没拉到群列表（检查 SnowLuma）' : '没拉到好友列表';
+    $('#pick-result').textContent = isGroups ? '没拉到群列表（检查网关连接）' : '没拉到好友列表';
     return;
   }
   const inputEl = $(isGroups ? '#cfg-allowgroups' : '#cfg-allowprivate');
@@ -3965,11 +4606,23 @@ async function saveConfig({ quiet = false } = {}) {
   const patch = {};
 
   if (sec === 'api') {
+    // 🔴 2026-10-26 修：原来这里没读 baseUrl / apiKey，
+    //    导致用户手改后再保存会被旧值覆盖（看着像"强制改回"）。
+    //    baseUrl 之前还是 readonly，连改都改不了。
+    const baseUrlInput = val('#cfg-baseurl', c.api.baseUrl).trim();
+    const apiKeyInput = val('#cfg-apikey', c.api.apiKey);
     patch.api = {
       vision: chk('#cfg-vision', c.api.vision !== false),
       temperature: Number(val('#cfg-temperature', c.api.temperature)) || 0.8,
       maxRounds: Number(val('#cfg-maxrounds', c.api.maxRounds)) || 12
     };
+    // 只在用户真的改了才覆盖（避免空值把已有配置清掉）
+    if (baseUrlInput && baseUrlInput !== String(c.api.baseUrl || '')) {
+      patch.api.baseUrl = baseUrlInput;
+    }
+    if (apiKeyInput && apiKeyInput !== String(c.api.apiKey || '')) {
+      patch.api.apiKey = apiKeyInput;
+    }
     patch.webSearch = {
       ...c.webSearch,
       enabled: chk('#cfg-websearch', c.webSearch?.enabled !== false),
@@ -4184,7 +4837,11 @@ function renderSkills(el, skills) {
           <strong>${esc(s.name)}</strong>
           <div class="muted pl-meta"><span>${esc(s.id)}</span></div>
         </td>
-        <td><span class="skill-src skill-src-${esc(s.source || 'builtin')}">${esc(SKILL_SOURCE_LABEL[s.source] || s.source)}</span></td>
+        <td>
+          ${s.author
+            ? `<span class="skill-author">${esc(s.author)}</span>`
+            : `<span class="skill-src skill-src-${esc(s.source || 'builtin')}">${esc(SKILL_SOURCE_LABEL[s.source] || s.source)}</span>`}
+        </td>
         <td class="pl-desc">${esc(s.summary || '—')}</td>
         <td class="pl-desc">${esc(s.when || '—')}</td>
         <td style="white-space:nowrap">
@@ -4213,7 +4870,7 @@ function renderSkills(el, skills) {
     <div class="card">
       <h3>全部技能</h3>
       <table class="table">
-        <thead><tr><th>名称</th><th>来源</th><th>说明</th><th>何时用</th><th>操作</th></tr></thead>
+        <thead><tr><th>名称</th><th>作者</th><th>说明</th><th>何时用</th><th>操作</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="5" class="muted">还没有技能</td></tr>'}</tbody>
       </table>
       <p class="muted" style="font-size:12px;margin-top:10px">
@@ -4297,6 +4954,41 @@ async function openSkillEditor(id) {
     </div>`}`;
 
   $('#sk-close')?.addEventListener('click', () => { box.style.display = 'none'; box.innerHTML = ''; });
+
+  // 打开编辑器后滚到可见位置（2026-10-25）
+  //
+  // 编辑器在技能列表和技能市场下面，位置很靠下。之前渲染完不滚动，
+  // 用户点了「编辑」看着页面没反应 —— 其实面板已经打开，只是还在视口外。
+  // 这里用 requestAnimationFrame 等布局稳定后再滚，避免滚到旧位置。
+  // 滚动到可见：分两次做，因为编辑器刚插入时高度还没定下来
+  //   · 第一帧后先滚一次（让用户看到反应）
+  //   · 100ms 后内容和图片/字体都排好了，再精确滚一次
+  const scrollToEditor = () => {
+    try {
+      const page = $('#skills-page');
+      if (page) {
+        // 用相对容器的偏移，比 scrollIntoView 更可控（不依赖祖先滚动容器）
+        const top = box.offsetTop - 12;
+        page.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+      } else {
+        box.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      }
+    } catch {
+      try { box.scrollIntoView(); } catch { /* 忽略 */ }
+    }
+  };
+
+  requestAnimationFrame(scrollToEditor);
+  setTimeout(scrollToEditor, 120);
+
+  // 焦点给第一个**可编辑**的输入框（编辑已有技能时 #sk-id 是 disabled）
+  requestAnimationFrame(() => {
+    try {
+      const first = [...box.querySelectorAll('input, textarea')]
+        .find((el) => !el.disabled && !el.readOnly);
+      if (first) first.focus({ preventScroll: true });
+    } catch { /* 忽略 */ }
+  });
 
   $('#sk-save')?.addEventListener('click', async () => {
     const newId = (id || $('#sk-id')?.value || '').trim();
@@ -4761,6 +5453,29 @@ async function openPluginPanel(id) {
   const box = openPluginModal(title);
   box.innerHTML = '<div class="muted" style="padding:16px">加载中…</div>';
 
+  // ── 通用「局部重挂」工厂（2026-10-26）──
+  //
+  // 插件面板里点「刷新」时，希望只重挂自己那块，不要 location.reload()
+  // 把整个控制台白屏重载（会话列表、滚动位置全丢）。
+  //
+  // 🔴 关键：**重挂后的新 ctx 里必须还能拿到 remount**，
+  //    否则第二次点刷新又会退化成整页重载。所以这里递归注入自己。
+  const panelRemount = async (pid, entry, container) => {
+    try {
+      const fresh = await loadPluginUi(pid, entry || 'ui.js');
+      const m2 = fresh?.mountPanel || fresh?.mount;
+      if (typeof m2 !== 'function') return false;
+      container.innerHTML = '';
+      const ctx2 = { ...pluginUiContext(pid), openPluginPanel };
+      ctx2.remount = () => panelRemount(pid, entry, container);
+      await m2(container, ctx2);
+      return true;
+    } catch (e) {
+      console.warn('[plugin-ui] remount 失败', pid, e);
+      return false;
+    }
+  };
+
   // ① 优先用**插件自己提供的**配置面板（plugins/<id>/ui.js 的 mountPanel）
   //    这是插件化要求：插件的界面归插件，内核不认识具体插件。
   try {
@@ -4772,14 +5487,18 @@ async function openPluginPanel(id) {
       // ① 有 mountPanel 就用它（配置面板形态）
       if (mod && typeof mod.mountPanel === 'function') {
         box.innerHTML = '';
-        await mod.mountPanel(box, { ...pluginUiContext(id), openPluginPanel });
+        const ctx1 = { ...pluginUiContext(id), openPluginPanel };
+        ctx1.remount = () => panelRemount(id, entry, box);
+        await mod.mountPanel(box, ctx1);
         return;
       }
       // ② 只有 mount（顶栏页签形态，如 grail / ad-inject）—— 也允许在插件页内展开，
       //    这样用户在插件页也能直接调它的设置，不必切页签。
       if (mod && typeof mod.mount === 'function') {
         box.innerHTML = '<div id="pl-inline-mount"></div>';
-        await mod.mount($('#pl-inline-mount'), { ...pluginUiContext(id), openPluginPanel });
+        const ctx2 = { ...pluginUiContext(id), openPluginPanel };
+        ctx2.remount = () => panelRemount(id, entry, $('#pl-inline-mount'));
+        await mod.mount($('#pl-inline-mount'), ctx2);
         return;
       }
     }

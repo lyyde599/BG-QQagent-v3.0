@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QQAgent 管理后台</title>
+<style>
+  /* 纸墨灰 · 浅色（记忆系统铁律 0.8：白纸底/墨字/主色即黑） */
+  :root {
+    --bg: #fdfcfa;
+    --bg-soft: #f7f5f1;
+    --fg: #1f1d1a;
+    --muted: #8a857e;
+    --line: #e6e1d8;
+    --acc: #1f1d1a;
+    --on-acc: #fdfcfa;
+    --ok: #2f6b4a;
+    --warn: #9a6b1f;
+    --bad: #a83232;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 28px 24px 60px; }
+
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
+  h1 { font-size: 21px; font-weight: 650; margin: 0; letter-spacing: -.01em; }
+  .sub { color: var(--muted); font-size: 12.5px; }
+  .top-right { margin-left: auto; display: flex; align-items: center; gap: 14px; font-size: 12.5px; color: var(--muted); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); margin-right: 5px; vertical-align: 1px; }
+  .dot.on { background: var(--ok); }
+  .dot.off { background: var(--bad); }
+
+  .rule { height: 1px; background: var(--line); margin: 18px 0 22px; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 10px; margin-bottom: 26px; }
+  .stat { border: 1px solid var(--line); border-radius: 9px; padding: 14px 12px; background: var(--bg); }
+  .stat b { display: block; font-size: 24px; font-weight: 620; line-height: 1.15; font-variant-numeric: tabular-nums; }
+  .stat span { display: block; font-size: 11.5px; color: var(--muted); margin-top: 5px; }
+
+  h2 { font-size: 13.5px; font-weight: 640; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  h2 .count { font-weight: 400; color: var(--muted); font-size: 12px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.8px; }
+  thead th {
+    text-align: left; font-weight: 600; font-size: 11.5px; color: var(--muted);
+    padding: 8px 10px; border-bottom: 1px solid var(--line); background: var(--bg-soft);
+    position: sticky; top: 0;
+  }
+  tbody td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--bg-soft); }
+  .tbl-wrap { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; margin-bottom: 30px; }
+
+  code { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .name { font-weight: 550; }
+  .tag {
+    display: inline-block; font-size: 10.5px; padding: 1px 6px; border-radius: 9px;
+    background: var(--bg-soft); color: var(--muted); border: 1px solid var(--line); margin-left: 5px;
+  }
+  .s-ok { color: var(--ok); }
+  .s-warn { color: var(--warn); }
+  .s-bad { color: var(--bad); }
+  .s-muted { color: var(--muted); }
+
+  .author-cell { display: flex; align-items: center; gap: 10px; }
+  .avatar {
+    width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--acc); color: var(--on-acc); font-size: 14px; font-weight: 600;
+  }
+  .author-name { font-size: 13px; font-weight: 550; }
+  .author-meta { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+  .empty { padding: 26px; text-align: center; color: var(--muted); font-size: 12.5px; }
+  .err { padding: 14px 16px; border: 1px solid var(--bad); border-left: 3px solid var(--bad);
+         border-radius: 8px; color: var(--bad); font-size: 13px; margin-bottom: 20px; }
+
+  .rec-time { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .rec-log { color: var(--muted); font-size: 12px; }
+
+  footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--line);
+           font-size: 11.5px; color: var(--muted); display: flex; gap: 16px; flex-wrap: wrap; }
+
+  @media (max-width: 760px) {
+    .wrap { padding: 20px 14px 40px; }
+    .top-right { display: none; }
+    .tbl-wrap { overflow-x: auto; }
+    table { min-width: 620px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>QQAgent 管理后台</h1>
+    <span class="sub">运营视角 · 只读</span>
+    <div class="top-right" id="conn"></div>
+  </header>
+
+  <div class="rule"></div>
+
+  <div id="content">
+    <div class="empty">加载中…</div>
+  </div>
+
+  <footer>
+    <span id="generated"></span>
+    <span>仅只读 · 不转发任何写操作 · 不包含聊天内容</span>
+  </footer>
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+const fmtNum = (n) => (n === null || n === undefined) ? '—' : Number(n).toLocaleString('zh-CN');
+const fmtTime = (iso) => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return '—';
+  const p = (x) => String(x).padStart(2, '0');
+  // 北京时间
+  const bj = new Date(d.getTime() + 8 * 3600 * 1000);
+  return `${bj.getUTCFullYear()}-${p(bj.getUTCMonth()+1)}-${p(bj.getUTCDate())} ${p(bj.getUTCHours())}:${p(bj.getUTCMinutes())}`;
+};
+
+async function load() {
+  try {
+    const res = await fetch('/api/overview', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const d = await res.json();
+    render(d);
+  } catch (e) {
+    $('#content').innerHTML = `<div class="err">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function render(d) {
+  const s = d.stats || {};
+  const c = d.connection || {};
+
+  // 顶部连接状态
+  $('#conn').innerHTML = [
+    `<span><span class="dot ${c.onebot ? 'on' : 'off'}"></span>OneBot ${c.onebot ? '已连接' : '未连接'}</span>`,
+    `<span><span class="dot ${c.account ? 'on' : 'off'}"></span>账号 ${c.account ? '在线' : '离线'}</span>`,
+    c.model ? `<span>模型 ${esc(c.model)}</span>` : '',
+    c.todayRuns !== null ? `<span>今日 ${fmtNum(c.todayRuns)} 次 · ${fmtNum(c.todayTokens)} tok</span>` : '',
+  ].filter(Boolean).join('');
+
+  // 统计
+  const statCards = [
+    [s.plugins, '插件总数'],
+    [s.authors, '作者数'],
+    [s.published, '已上架'],
+    [s.offline, '已下架'],
+    [s.publishes, '累计发布'],
+  ].map(([v, label]) => `<div class="stat"><b>${fmtNum(v)}</b><span>${label}</span></div>`).join('');
+
+  // 作者
+  const authorRows = (d.authors || []).map((a) => `
+    <tr>
+      <td>
+        <div class="author-cell">
+          <div class="avatar">${esc(String(a.name).slice(0,1))}</div>
+          <div>
+            <div class="author-name">${esc(a.name)}${a.qq ? `<span class="tag">QQ ${esc(a.qq)}</span>` : ''}</div>
+            <div class="author-meta">${a.plugins} 个插件 · ${a.published || 0} 个已上架${a.license ? ' · ' + esc(a.license) : ''}</div>
+          </div>
+        </div>
+      </td>
+    </tr>`).join('');
+
+  // 插件
+  const pluginRows = (d.plugins || []).map((p) => {
+    let state;
+    if (p.offline) state = '<span class="s-bad">已下架</span>';
+    else if (p.publishedVersion) state = '<span class="s-ok">已上架</span>';
+    else state = '<span class="s-muted">未发布</span>';
+
+    return `
+      <tr>
+        <td>
+          <div class="name">${esc(p.name)}${p.core ? '<span class="tag">核心</span>' : ''}</div>
+          <code>${esc(p.id)}</code>
+        </td>
+        <td>${esc(p.author)}</td>
+        <td>v${esc(p.version)}</td>
+        <td>${state}</td>
+        <td style="color:var(--muted);font-size:12px">${esc(p.summary || '')}</td>
+        <td>${(p.permissions || []).length ? `<code>${esc(p.permissions.join(', '))}</code>` : '<span class="s-muted">—</span>'}</td>
+      </tr>`;
+  }).join('');
+
+  // 发布记录
+  const recRows = (d.records || []).map((r) => {
+    const isOff = r.action === 'unpublish';
+    return `
+      <tr>
+        <td class="rec-time">${fmtTime(r.at)}</td>
+        <td><code>${esc(r.id)}</code></td>
+        <td>${isOff ? '<span class="s-bad">下架</span>' : `<span class="s-ok">v${esc(r.version || '?')}</span>`}</td>
+        <td class="rec-log">${esc(isOff ? (r.reason || '') : (r.changelog || ''))}</td>
+      </tr>`;
+  }).join('');
+
+  $('#content').innerHTML = `
+    <div class="stats">${statCards}</div>
+
+    <h2>全部作者 <span class="count">${(d.authors || []).length} 位</span></h2>
+    <div class="tbl-wrap">
+      <table><tbody>${authorRows || '<tr><td class="empty">没有作者</td></tr>'}</tbody></table>
+    </div>
+
+    <h2>全部插件 <span class="count">${(d.plugins || []).length} 个</span></h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>插件</th><th>作者</th><th>版本</th><th>状态</th><th>功能说明</th><th>权限</th></tr></thead>
+        <tbody>${pluginRows || '<tr><td colspan="6" class="empty">没有插件</td></tr>'}</tbody>
+      </table>
+    </div>
+
+    <h2>最近发布记录 <span class="count">最近 ${(d.records || []).length} 条</span></h2>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>插件</th><th>版本</th><th>说明</th></tr></thead>
+        <tbody>${recRows || '<tr><td colspan="4" class="empty">没有记录</td></tr>'}</tbody>
+      </table>
+    </div>`;
+
+  $('#generated').textContent = `数据时间：${fmtTime(d.generatedAt)}`;
+}
+
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>

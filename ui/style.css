@@ -830,8 +830,10 @@ tbody tr:hover { background: var(--raised); color: var(--on-raised); }
 }
 
 /* 单列卡片流视图（插件页等）：给上下留白，不像贴边 */
-#plugins-page {
+#plugins-page,
+#skills-page {
   flex: 1;
+  min-height: 0;        /* flex 子项必须给 0，否则内容撑高后无法收缩 → 滚动失效 */
   overflow-y: auto;
   padding: 16px 18px 28px;
   display: flex;
@@ -1269,8 +1271,10 @@ html.has-user-bg select {
   max-width: 460px;
 }
 
-/* ── 技能管理页（2026-10-21）─────────────────────────────── */
-#skills-page { padding: 16px 18px 40px; display: flex; flex-direction: column; gap: 14px; }
+/* ── 技能管理页（2026-10-21 · 2026-10-25 修滚动）────────────── */
+/* 布局规则已并入 #plugins-page 那组（含 flex/overflow/min-height），
+   这里只留局部覆盖。重复声明 padding 会盖掉 overflow，导致页面无法滚动。 */
+#skills-page { padding-bottom: 40px; }
 #skills-page .card h3 { margin-top: 0; }
 
 /* 来源标签：三种来源用不同形态区分（不靠色相，纸墨灰体系） */
@@ -1281,6 +1285,15 @@ html.has-user-bg select {
   font-size: 11.5px;
   border: 1px solid var(--line2);
   color: var(--fg2);
+  white-space: nowrap;
+}
+
+/* 作者名（2026-10-25）：技能列表里「来源」列改显示作者。
+   不用胶囊底色 —— 作者是人名不是标签，保持纯文本更清楚。
+   内置/插件的技能没有作者，仍回退到 .skill-src 显示来源。 */
+.skill-author {
+  font-size: 12.5px;
+  color: var(--fg);
   white-space: nowrap;
 }
 .skill-src-user { border-color: var(--acc); color: var(--fg); font-weight: 600; }

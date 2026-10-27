@@ -498,8 +498,24 @@ export function buildUserPrompt(ctx) {
     ].join('\n'));
   }
 
-  // 参与度参考
-  parts.push(`【参与度参考】${participationText(persona.participation)}`);
+  // 参与度参考（私聊不注入，2026-10-26）
+  //
+  // 实测会话 mvphiick-9e650a75：private 私聊里说"画一只龙"，
+  // 模型只吐 100 token 就结束（sent:[]、没调工具），会话永远 running。
+  // 原因：userPrompt 里塞了群聊的【参与度参考】安静型——
+  // "只在被 @/点名/直接提问时才开口"。私聊里没有 @ 这回事，
+  // 模型据此判定"不该说话"，用户就看到卡死。
+  const __isPrivate = String(ctx.chatKey || '').startsWith('private:');
+  if (!__isPrivate) {
+    parts.push(`【参与度参考】${participationText(persona.participation)}`);
+  } else {
+    parts.push([
+      '【私聊】',
+      '这是对方**单独找你**说话，不是群聊，不需要判断"要不要插话"。',
+      '对方说了什么就回应什么：要你做事就做事（调用对应工具），问你问题就回答。',
+      '只有确实没内容可说时，才简短回一句，不要沉默。',
+    ].join(String.fromCharCode(10)));
+  }
 
   // 记忆
   const memText = ctx.memory.formatForPrompt(ctx.chatKey);

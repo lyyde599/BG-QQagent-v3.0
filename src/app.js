@@ -8,11 +8,15 @@ process.env.TZ = process.env.TZ || 'Asia/Shanghai';
 import http from 'node:http';
 import net from 'node:net';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { getConfig, updateConfig, ROOT, DATA_DIR, COMMUNITY } from './config.js';
 import { checkKernelUpdate, downloadKernelUpdate, localKernelVersion, listDownloaded, publishKernel, canPublishKernel, autoInstallKernel, readInstallLog, lastInstallResult, checkInstaller } from './kernel-update.js';
+import { checkAll as checkNapcatQQ, installNapcat, installQQ, restartNapcatService, listKnownAccounts, currentUin, setAutoLoginUin, deleteAccountState,
+  checkAllWithSnowluma, installSnowluma, restartSnowlumaService, isSnowlumaInstalled, localSnowlumaVersion, snowlumaHome,
+  BACKENDS, currentBackend, switchBackend, isServiceActive, snowlumaAltStatus, snowlumaCredentials } from './napcat-updater.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments } from './onebot.js';
 import { ChatStore } from './store.js';
 import { MemoryStore } from './memory.js';
@@ -80,6 +84,28 @@ const saveMarketUsers = (d) => {
     fs.mkdirSync(path.dirname(MARKET_USERS_FILE), { recursive: true });
     fs.writeFileSync(MARKET_USERS_FILE, JSON.stringify(d, null, 2), 'utf8');
   } catch { /* 落盘失败不该阻断注册 */ }
+};
+
+/**
+ * 同步用户档案到 R2 中心库（2026-10-25）
+ *
+ * 为什么需要：admin.json / market-users.json 是本机私有文件，
+ * 每个部署各一份 → 管理员名单和用户列表互相看不见。
+ * 这份写入让"注册走我们服务的人"自动进共享名单。
+ */
+const pushUserToRegistry = async (email, qq = '', nickname = '') => {
+  try {
+    const keyFile = '/home/lyy/.secrets/market-bridge/bridge.key';
+    let key = '';
+    try { key = fs.readFileSync(keyFile, 'utf8').trim(); } catch { return; }
+    if (!key) return;
+    await fetch('https://market.baiguang211.top/api/registry/users', {
+      method: 'POST',
+      headers: { 'x-bridge-key': key, 'content-type': 'application/json' },
+      body: JSON.stringify({ email, qq, nickname }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch { /* 同步失败不阻断注册 */ }
 };
 
 /** 记录/更新一个中心端用户 */
@@ -697,7 +723,80 @@ export function createApp({ log = console.log } = {}) {
   }
 
   // ── HTTP API ──
+  // ── SnowLuma WebUI 内嵌反代（2026-10-27）──
+  //
+  // 为什么在 node 里做而不是只靠 nginx：
+  //   面板本身监听 3210（node 直连，前面没有 nginx），
+  //   浏览器里的 iframe src="/snowluma/" 会打到 3210，
+  //   而 nginx 的反代在 8081 —— 路径对不上，直接 404。
+  //
+  // 这里把 /snowluma/* 透传到 127.0.0.1:5099/*，并：
+  //   · 去掉 x-frame-options 与 frame-ancestors（本机自建备用通道，嵌入自家面板）
+  //   · 改写 HTML/JS 里的根路径为 /snowluma/ 前缀（否则资源 404）
+  async function proxySnowluma(req, res) {
+    const PREFIX = '/snowluma';
+    const rest = req.url.slice(PREFIX.length) || '/';
+    const target = 'http://127.0.0.1:5099' + (rest.startsWith('/') ? rest : '/' + rest);
+
+    try {
+      const isBodyless = ['GET', 'HEAD', 'OPTIONS'].includes(req.method || 'GET');
+      let body;
+      if (!isBodyless) {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        body = Buffer.concat(chunks);
+      }
+      const headers = { ...req.headers };
+      delete headers.host;
+      delete headers['accept-encoding'];   // 关压缩，否则改写不了 body
+
+      const r = await fetch(target, { method: req.method, headers, body, redirect: 'manual' });
+
+      // 复制响应头，丢掉阻止嵌入的那几个
+      const out = {};
+      r.headers.forEach((v, k) => {
+        const lk = k.toLowerCase();
+        if (['x-frame-options', 'content-security-policy', 'content-encoding', 'content-length', 'transfer-encoding'].includes(lk)) return;
+        out[k] = v;
+      });
+      // 只放开 frame-ancestors，其余 CSP 限制不碰
+      out['content-security-policy'] = "frame-ancestors 'self'";
+
+      const ct = String(r.headers.get('content-type') || '');
+      const needRewrite = /text\/html|javascript|text\/css|application\/json/.test(ct);
+
+      if (needRewrite) {
+        let text = await r.text();
+        // 只改以 / 开头的绝对路径，避免重复加前缀（(?!snowluma\/) 防重复）
+        //
+        // 🔴 2026-10-27 修：原来只匹配了 ' 和 " 两种引号，
+        //    但 SnowLuma 前端用的是**模板字符串** src:`/logo.png`，
+        //    反引号没被覆盖 → logo 请求打到面板根路径 → 破图。
+        text = text
+          .replace(/(href|src)="\/(?!snowluma\/)/g, '$1="/snowluma/')
+          .replace(/(['"`])\/api\//g, '$1/snowluma/api/')
+          .replace(/(['"`])\/assets\//g, '$1/snowluma/assets/')
+          .replace(/(['"`])\/(logo|favicon|manifest|robots)/g, '$1/snowluma/$2');
+        out['content-length'] = String(Buffer.byteLength(text));
+        res.writeHead(r.status, out);
+        res.end(text);
+      } else {
+        const buf = Buffer.from(await r.arrayBuffer());
+        out['content-length'] = String(buf.length);
+        res.writeHead(r.status, out);
+        res.end(buf);
+      }
+    } catch (e) {
+      res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('SnowLuma 代理失败：' + String(e?.message ?? e).slice(0, 120) + '\n（SnowLuma 是否在运行？）');
+    }
+  }
+
   const server = http.createServer((req, res) => {
+    // 内嵌反代优先于其它路由（2026-10-27）
+    if ((req.url || '').startsWith('/snowluma')) {
+      return proxySnowluma(req, res);
+    }
     handleHttp(req, res).catch((error) => {
       log('[http] 处理出错:', error?.message ?? error);
       try {
@@ -889,6 +988,155 @@ export function createApp({ log = console.log } = {}) {
         return json(res, 200, r);
       }
 
+      // ── 角色卡市场（2026-10-25）──
+      //
+      // 用户要求："创作营支持上传自定义角色卡功能，同样保留作者信息，
+      //           走类似 skill 和插件的投稿和审核投稿"
+      //
+      // 结构与 skill-market 完全对应，只是路径换成 /api/persona-market。
+      if (pathname === '/api/persona-market/index' && method === 'GET') {
+        const pm = await import('./persona-market.js');
+        const r = await pm.fetchPersonaIndex();
+        return json(res, 200, r);
+      }
+
+      // 可导入的本地人设（config.customPersonas 里手写的）
+      if (pathname === '/api/persona-market/importable' && method === 'GET') {
+        const pm = await import('./persona-market.js');
+        return json(res, 200, { ok: true, items: pm.listImportable() });
+      }
+
+      // 把本地人设导出成 personas/<id>.md（一键，不用重填）
+      if (pathname === '/api/persona-market/export-local' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 2 }).catch(() => ({}));
+        const pm = await import('./persona-market.js');
+        const r = pm.exportLocalPersona({
+          key: String(body?.key || ''),
+          id: String(body?.id || ''),
+          name: String(body?.name || ''),
+          text: String(body?.text || ''),
+          author: String(body?.author || ''),
+          summary: String(body?.summary || ''),
+          version: String(body?.version || '1.0.0'),
+          group: String(body?.group || ''),
+        });
+        return json(res, 200, r);
+      }
+
+      // 导入本地 .md 文件（用户从电脑上选的）
+      if (pathname === '/api/persona-market/import-file' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 4 }).catch(() => ({}));
+        const pm = await import('./persona-market.js');
+        // 前端传 base64，避免 JSON 里的换行/编码问题
+        let raw = String(body?.content || '');
+        if (body?.base64) {
+          try { raw = Buffer.from(String(body.base64), 'base64').toString('utf8'); } catch { /* 用 content */ }
+        }
+        const r = pm.importPersonaFile(String(body?.id || ''), raw, {
+          name: String(body?.name || ''),
+          summary: String(body?.summary || ''),
+          author: String(body?.author || ''),
+          version: String(body?.version || '1.0.0'),
+        });
+        return json(res, 200, r);
+      }
+
+      // 本地自己写的角色卡（personas/*.md）
+      if (pathname === '/api/persona-market/local' && method === 'GET') {
+        const pm = await import('./persona-market.js');
+        return json(res, 200, { ok: true, personas: pm.listLocalPersonas() });
+      }
+
+      // 保存/新建一份本地角色卡（面板里直接写，或改已装的）
+      if (pathname === '/api/persona-market/save' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 2 }).catch(() => ({}));
+        const id = String(body?.id || '').trim();
+        if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(id)) {
+          return json(res, 400, { ok: false, error: 'id 只能用小写字母/数字/连字符（2~41 位）' });
+        }
+        const name = String(body?.name || '').trim().slice(0, 50);
+        const summary = String(body?.summary || '').trim().slice(0, 200);
+        const text = String(body?.text || '').trim();
+        const author = String(body?.author || '').trim().slice(0, 50);
+        if (!name) return json(res, 400, { ok: false, error: '角色名不能为空' });
+        if (!summary) return json(res, 400, { ok: false, error: '简介不能为空（市场列表要显示）' });
+        if (!text) return json(res, 400, { ok: false, error: '角色设定不能为空' });
+        if (!author) return json(res, 400, { ok: false, error: '作者不能为空（市场要显示作者）' });
+
+        const pm = await import('./persona-market.js');
+        const fm = [
+          '---',
+          `name: ${name}`,
+          `summary: ${summary}`,
+          body?.when ? `when: ${String(body.when).slice(0, 200)}` : '',
+          `author: ${author}`,
+          `version: ${String(body?.version || '1.0.0').trim()}`,
+          `license: ${String(body?.license || 'MIT').trim()}`,
+          body?.group ? `group: ${String(body.group).slice(0, 20)}` : '',
+          '---',
+          '',
+          `# ${name}`,
+          '',
+          text,
+          '',
+        ].filter((x) => x !== '').join('\n');
+        try {
+          fs.writeFileSync(path.join(pm.userPersonaDir(), `${id}.md`), fm, 'utf8');
+          return json(res, 200, { ok: true, id, path: `personas/${id}.md` });
+        } catch (e) {
+          return json(res, 500, { ok: false, error: '写入失败：' + String(e?.message ?? e).slice(0, 80) });
+        }
+      }
+
+      if (pathname === '/api/persona-market/publish' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 2 }).catch(() => ({}));
+        let author = null;
+        try {
+          const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
+          if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch { /* ignore */ }
+        if (!author?.verifiedAt) {
+          return json(res, 403, { ok: false, error: '请先在「创造营」注册作者账号' });
+        }
+        const pm = await import('./persona-market.js');
+        const r = await pm.publishPersona(String(body?.id || ''), {
+          version: String(body?.version || ''),
+          notes: String(body?.notes || ''),
+          dryRun: body?.dryRun === true,
+        });
+        return json(res, 200, r);
+      }
+
+      if (pathname === '/api/persona-market/unpublish' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 2 }).catch(() => ({}));
+        let author = null;
+        try {
+          const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
+          if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
+        } catch { /* ignore */ }
+        if (!author?.verifiedAt) {
+          return json(res, 403, { ok: false, error: '请先在「创造营」注册作者账号' });
+        }
+        const pm = await import('./persona-market.js');
+        const r = await pm.unpublishPersona(String(body?.id || ''), {
+          reason: String(body?.reason || ''),
+        });
+        return json(res, 200, r);
+      }
+
+      if (pathname === '/api/persona-market/install' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 2 }).catch(() => ({}));
+        const pm = await import('./persona-market.js');
+        const r = await pm.installPersona(String(body?.id || ''), { overwrite: body?.overwrite === true });
+        return json(res, 200, r);
+      }
+
+      if (pathname === '/api/persona-market/updates' && method === 'GET') {
+        const pm = await import('./persona-market.js');
+        const r = await pm.checkPersonaUpdates();
+        return json(res, 200, r);
+      }
+
       if (pathname === '/api/skill-market/updates' && method === 'GET') {
         // 先刷本地缓存 —— 用户可能刚在外面改过 skills/*.md，
         // 不刷的话拿到的是进程启动时的旧快照，版本比对会失真。
@@ -1003,7 +1251,11 @@ export function createApp({ log = console.log } = {}) {
             connected: onebot.connected,
             everConnected: onebot.everConnected,
             error: onebot.lastConnectError,
-            self: onebot.selfInfo ? { userId: onebot.selfId, nickname: onebot.selfNickname } : null,
+            // selfInfo 是 last-known 缓存，账号切换后不会自动清。
+            // 账号不在线时不该带身份，否则面板会显示成"已登录旧账号"（2026-10-27 修）。
+            self: onebotHealth.snapshot().online === true && onebot.selfInfo
+              ? { userId: onebot.selfId, nickname: onebot.selfNickname }
+              : null,
             // 账号级健康（与"WS 是否连上"不同：账号离线时 WS 仍可能连着）
             account: onebotHealth.snapshot(),
             // 综合结论：WS 连着 **且** 账号在线，才算真正可用
@@ -1018,7 +1270,16 @@ export function createApp({ log = console.log } = {}) {
           orchestrator: orchestrator.statusSummary(),
           usage: {
             ...usage,
-            cost: estimateCost(usage)
+            cost: estimateCost(usage),
+            // 缓存命中率（2026-10-26）：真实数字，不再是估算
+            // 分母用「命中+未命中」，而非 promptTokens —— 后者含非文本部分，
+            // 且部分上游不填，容易算出 >100%。
+            cacheHitRate: (() => {
+              const c = usage.cachedTokens || 0;
+              const m = usage.cacheMissTokens || 0;
+              const base = c + m;
+              return base > 0 ? Math.round((c / base) * 1000) / 10 : null;
+            })()
           },
           paused: orchestrator.paused,
           pauseReason: orchestrator.pauseReason ?? null
@@ -1032,6 +1293,241 @@ export function createApp({ log = console.log } = {}) {
           return json(res, result.ok ? 200 : 400, result);
         } catch (error) {
           return json(res, 500, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+
+      // ── 重启 NapCat（2026-10-26）──
+      //
+      // 用户要求："加一个重启按钮在登录界面"
+      //
+      // 背景（实测）：NapCat 长时间运行（本次 13 小时）后，
+      // 富媒体通道会退化 —— 图片/文件发不出去，10 秒超时，
+      // 但文字照常。重启进程即恢复（实测重启后 6/6 成功）。
+      //
+      // 因为这是个高频需要的运维动作，做成按钮比让人 SSH 敲命令强。
+      //
+      // 实现要点：
+      //   · sudo 密码只走 stdin（铁律 0.6），绝不进命令行参数
+      //   · systemctl restart 是阻塞的（要等旧进程退出），
+      //     所以用 detached spawn，立刻返回"已发起"，让前端轮询状态
+      //   · 重启后需要重新登录 —— 除非快速登录（-q）有效，
+      //     接口会提示这一点，前端据此决定是否展示二维码
+      // ── NapCat / QQ 版本检测与一键升级（2026-10-27）──
+      //
+      // 用户要求："给核心包也做一个检测 napcat 和 QQ 客户端新版本的功能（分别），
+      // 可以在登录 tab 页点击一键更新 napcat 和 QQ 客户端（包括没安装的，
+      // 提供安装脚本，直连最新版本通道）"
+      // 重启主服务自身（2026-10-27，通道切换后让内核重连）
+      //
+      // 用 detached 的 systemctl restart，接口立刻返回，前端自己轮询恢复。
+      if (pathname === '/api/self-restart' && method === 'POST') {
+        try {
+          const pwFile = process.env.QQ_SUDO_PASSWORD_FILE
+            || path.join(os.homedir(), '.secrets', 'sudo', 'password');
+          let pw = '';
+          try { pw = fs.readFileSync(pwFile, 'utf8').trim(); } catch { /* 无密码文件 */ }
+          const child = spawn('sudo', ['-S', 'systemctl', 'restart', 'qq-agent-v2'], {
+            detached: true,
+            stdio: pw ? ['pipe', 'ignore', 'ignore'] : 'ignore',
+          });
+          if (pw && child.stdin) {
+            try { child.stdin.write(pw + '\n'); child.stdin.end(); } catch { /* 已关 */ }
+          }
+          child.unref();
+          log('[kernel] 已发起主服务自重启');
+          return json(res, 200, { ok: true, message: '主服务重启中，约 20 秒后恢复' });
+        } catch (error) {
+          return json(res, 500, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+
+      // 取 SnowLuma 的密码与访问令牌（2026-10-27 用户要求：给大家一个默认密码）
+      //
+      // 安全性说明：本面板已在 Basic Auth 之后，且此接口返回的是
+      // 本机自建备用通道的凭据（非生产密钥）。用户明确要求公开给团队使用。
+      if (pathname === '/api/snowluma-alt/token' && method === 'POST') {
+        try {
+          return json(res, 200, await snowlumaCredentials());
+        } catch (error) {
+          return json(res, 200, { ok: false, error: String(error?.message ?? error).slice(0, 100) });
+        }
+      }
+
+      // SnowLuma 备用通道运行状态（2026-10-27）
+      // 只查状态，不碰它的 WebUI 页面（它禁止 iframe 嵌入）
+      if (pathname === '/api/snowluma-alt/status' && method === 'GET') {
+        try {
+          return json(res, 200, await snowlumaAltStatus());
+        } catch (error) {
+          return json(res, 200, { ok: false, error: String(error?.message ?? error).slice(0, 100) });
+        }
+      }
+
+      // ── 通道切换 NapCat ⇄ SnowLuma（2026-10-27）──
+      //
+      // 用户问："前端如何从napcat切换到snowluma？"
+      // 原理：内核连谁取决于 config.snowluma 的 wsUrl/httpUrl，
+      // 所以切换 = 停另一个 + 改地址 + 启目标 + 让内核重连。
+      if (pathname === '/api/napcat-qq/backend' && method === 'GET') {
+        const cur = currentBackend(getConfig().snowluma || {});
+        const items = [];
+        for (const [key, b] of Object.entries(BACKENDS)) {
+          items.push({
+            key,
+            label: b.label,
+            service: b.service,
+            installed: b.installed(),
+            active: await isServiceActive(b.service),
+            current: key === cur,
+            wsUrl: b.wsUrl,
+            httpUrl: b.httpUrl,
+          });
+        }
+        return json(res, 200, { ok: true, current: cur, backends: items });
+      }
+
+      if (pathname === '/api/napcat-qq/switch-backend' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const target = String(body?.target || '').trim();
+        const logs = [];
+        const r = await switchBackend(target, {
+          writeConfig: (patch) => updateConfig(patch),
+          onLog: (s) => { logs.push(String(s)); log('[backend]', s); },
+        });
+        return json(res, r.ok ? 200 : 400, { ...r, logs });
+      }
+
+      // ── 账号切换（2026-10-27）──
+      //
+      // 用户要求："加一个切换账号的功能，我准备换号测试看看是账号问题还是接口问题"
+      //
+      // 换号是排查"账号被限 vs 接口坏了"最快的办法：同一个环境换个号，
+      // 行为不同 → 账号问题；行为一样 → 环境/接口问题。
+      if (pathname === '/api/napcat-qq/accounts' && method === 'GET') {
+        return json(res, 200, {
+          ok: true,
+          current: currentUin(),
+          accounts: listKnownAccounts(),
+        });
+      }
+
+      // 删除某账号的历史登录态（2026-10-27 用户要求："登录历史添加账号删除"）
+      if (pathname === '/api/napcat-qq/delete-account' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const uin = String(body?.uin || '').trim();
+        const r = deleteAccountState(uin);
+        if (r.ok) log(`[napcat] 已删除账号 ${uin} 的登录态：${r.removed.join(', ')}`);
+        return json(res, r.ok ? 200 : 400, r);
+      }
+
+      if (pathname === '/api/napcat-qq/switch' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const uin = String(body?.uin || '').trim();
+        const r = setAutoLoginUin(uin);
+        if (!r.ok) return json(res, 400, r);
+
+        // 改完要重启才生效（pick-qq-uin.sh 在启动时读这个值）
+        let restarted = false;
+        if (body?.restart !== false) {
+          const rs = restartNapcatService();
+          restarted = rs.ok;
+          if (rs.ok) log(`[napcat] 账号切换为 ${r.uin}（原 ${r.previous}），已发起重启`);
+        }
+        return json(res, 200, {
+          ...r,
+          restarted,
+          // 没有登录态的话，重启后会掉到扫码 —— 明确告诉前端
+          warn: r.hadState ? '' : `本地没有 ${r.uin} 的登录态，重启后需要扫码登录`,
+        });
+      }
+
+      if (pathname === '/api/napcat-qq/check' && method === 'GET') {
+        try {
+          // 三方：NapCat / QQ / SnowLuma（2026-10-27）
+          const r = await checkAllWithSnowluma();
+          return json(res, 200, r);
+        } catch (error) {
+          return json(res, 500, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+
+      // 一键更新/安装 NapCat（可选 QQ）
+      //
+      // 参数：{ target: 'napcat' | 'qq', url?, version?, restart? }
+      // 不给 url 就现取最新（直连官方通道）
+      if (pathname === '/api/napcat-qq/update' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 2 }).catch(() => ({}));
+        const target = String(body?.target || '').trim();
+        if (!['napcat', 'qq', 'snowluma'].includes(target)) {
+          return json(res, 400, { ok: false, error: "target 只能是 'napcat' / 'qq' / 'snowluma'" });
+        }
+        const logs = [];
+        const onLog = (s) => { logs.push(String(s)); log('[napcat-update]', s); };
+
+        try {
+          const cur = await checkAllWithSnowluma();
+          let url = String(body?.url || '');
+          let version = String(body?.version || '');
+
+          if (target === 'napcat') {
+            if (!url) url = cur?.napcat?.url || '';
+            if (!version) version = cur?.napcat?.latest || '';
+          } else if (target === 'qq') {
+            if (!url) url = cur?.qq?.url || '';
+            if (!version) version = cur?.qq?.latest || '';
+          } else {
+            if (!url) url = cur?.snowluma?.url || '';
+            if (!version) version = cur?.snowluma?.latest || '';
+          }
+          if (!url) return json(res, 400, { ok: false, error: '拿不到下载地址（检测失败？）', logs });
+
+          const r = target === 'napcat' ? await installNapcat({ url, version, onLog })
+            : target === 'qq' ? await installQQ({ url, version, onLog })
+            : await installSnowluma({ url, version, onLog });
+
+          // 装完自动重启对应服务（用户可传 restart:false 跳过）
+          if (r.ok && body?.restart !== false) {
+            const rs = target === 'snowluma' ? restartSnowlumaService() : restartNapcatService();
+            if (rs.ok) { onLog(`已发起 ${target} 服务重启`); r.restarted = true; }
+            else onLog('重启失败：' + (rs.error || ''));
+          }
+          return json(res, 200, { ...r, logs });
+        } catch (error) {
+          return json(res, 500, { ok: false, error: String(error?.message ?? error), logs });
+        }
+      }
+
+      if (pathname === '/api/snowluma/restart' && method === 'POST') {
+        const { spawn } = await import('node:child_process');
+        const pwFile = process.env.QQ_SUDO_PASSWORD_FILE
+          || path.join(os.homedir(), '.secrets', 'sudo', 'password');
+        let sudoPw = '';
+        try { if (fs.existsSync(pwFile)) sudoPw = fs.readFileSync(pwFile, 'utf8').trim(); } catch { /* 无密码文件 */ }
+
+        // 先探一下当前运行时长，返回给前端做提示（跑了多久才坏的）
+        let uptimeSec = 0;
+        try {
+          const st = fs.readFileSync('/proc/uptime', 'utf8'); // 占位，真实值下面用 systemctl 拿
+        } catch { /* ignore */ }
+
+        try {
+          // -S 从 stdin 读密码；detached 让它脱离本进程，restart 完成后不受影响
+          const child = spawn('sudo', ['-S', 'systemctl', 'restart', 'napcat-qq'], {
+            detached: true,
+            stdio: sudoPw ? ['pipe', 'ignore', 'ignore'] : 'ignore',
+          });
+          if (sudoPw && child.stdin) {
+            try { child.stdin.write(sudoPw + '\n'); child.stdin.end(); } catch { /* 已关闭 */ }
+          }
+          child.unref();
+          log('[snowluma] 已发起 NapCat 重启');
+          return json(res, 200, {
+            ok: true,
+            message: '正在重启网关（约 40~60 秒）。重启后若需要扫码，二维码会自动出现在上方。',
+            relaunchAfter: 5000,
+          });
+        } catch (error) {
+          return json(res, 500, { ok: false, error: '重启失败：' + String(error?.message ?? error).slice(0, 120) });
         }
       }
 
@@ -1051,7 +1547,18 @@ export function createApp({ log = console.log } = {}) {
         //    用 connected 会让面板以为已登录、从而不显示二维码（2026-09-16 事故）。
         loggedIn: onebotHealth.snapshot().online === true,
           onebotError: onebot.lastConnectError || '',
-          self: onebot.selfInfo ? { userId: onebot.selfId, nickname: onebot.selfNickname } : null
+          // 🔴 未登录时不能带 self（2026-10-27 修）
+          //
+          // 用户反馈："切换后登录二维码没有重出，还是显示旧账号状态"
+          //
+          // 根因：selfInfo 是 last-known 缓存，账号切换/掉线后不会自动清。
+          // 于是 loggedIn=false（对）但 self 仍是上一个号（错），
+          // 前端右上角拿 self 渲染「已登录 3170037984」，看起来像没切换。
+          //
+          // 正确语义：**没登录就没有身份**。loggedIn 为 false 时 self 必须是 null。
+          self: onebotHealth.snapshot().online === true && onebot.selfInfo
+            ? { userId: onebot.selfId, nickname: onebot.selfNickname }
+            : null
         });
       }
 
@@ -1265,12 +1772,66 @@ export function createApp({ log = console.log } = {}) {
         }
       }
 
+      // 该账号在本地有没有历史登录态（决定重启后是免扫码还是得扫码）
+      // 放在路由里定义不方便，提到这里也没必要 —— 用内联函数即可
+      var fileExistsForAccount = (uin) => {
+        try {
+          const d = snowlumaDir();
+          if (!d) return false;
+          return fs.existsSync(path.join(d, 'config', `napcat_${uin}.json`));
+        } catch { return false; }
+      };
+
       if (pathname === '/api/snowluma/login/set-quick' && method === 'POST') {
+        // 🔴 快速登录要「设定 + 重启」才真正生效（2026-10-27 修）
+        //
+        // 用户反馈（截图）：点「快速登录（已登录过的号）」后提示
+        //   "已请求快速登录，请稍候观察状态…"
+        // 然后永远没反应 —— 因为 SetQuickLoginQQ **只是设定下次用哪个号**，
+        // 完全不触发登录动作。代码注释里早写过这个坑，但界面仍按"会登录"来提示，
+        // 用户自然以为坏了。
+        //
+        // 现在：设定成功后**主动重启 NapCat**，让它真的用这个号登录。
         try {
           const body = await readBody(req);
-          if (!body?.uin) return json(res, 400, { ok: false, error: '需要 uin' });
-          await napcatWebui.setQuickLogin(body.uin, snowlumaDir());
-          return json(res, 200, { ok: true });
+          const uin = String(body?.uin || '').trim();
+          if (!/^\d{5,12}$/.test(uin)) {
+            return json(res, 400, { ok: false, error: 'QQ 号格式不对（5~12 位数字）' });
+          }
+
+          // ① 先落到 webui.json（pick-qq-uin.sh 启动时读它）
+          setAutoLoginUin(uin);
+          // ② 再同步给 NapCat 自己的快速登录设定（两处一致，避免下次启动选到别的号）
+          let quickSet = false;
+          try {
+            await napcatWebui.setQuickLogin(uin, snowlumaDir());
+            quickSet = true;
+          } catch (e) {
+            log('[snowluma] setQuickLogin 失败（不影响重启登录）：', String(e?.message ?? e).slice(0, 80));
+          }
+
+          // ③ 重启让它真的登进去
+          const restart = body?.restart !== false;
+          let restarted = false;
+          if (restart) {
+            const rs = restartNapcatService();
+            restarted = rs.ok;
+          }
+
+          // 本地有没有这个号的登录态？没有就得扫码
+          const hasState = fileExistsForAccount(uin);
+
+          return json(res, 200, {
+            ok: true,
+            uin,
+            quickSet,
+            restarted,
+            hadState: hasState,
+            message: restarted
+              ? `已设定 ${uin} 并重启网关，约 60~90 秒后完成登录`
+              : `已设定 ${uin}，但重启失败，需手动重启网关`,
+            warn: hasState ? '' : `本地没有 ${uin} 的历史登录态，重启后会显示二维码，需要扫码登录`,
+          });
         } catch (error) {
           return json(res, 200, { ok: false, error: String(error?.message ?? error) });
         }
@@ -1661,17 +2222,45 @@ export function createApp({ log = console.log } = {}) {
         authIpLog.set(ip, arr);
 
         const code = String(crypto.randomInt(100000, 1000000));
-        authCodes.set(email, { code, at: now });
 
-        const r = await sendMail(email, '【QQAgent 创造营】注册验证码',
-          `你好，\n\n你正在注册 QQAgent 创造营的作者账号。\n\n验证码：${code}\n\n10 分钟内有效。若不是你本人操作，忽略这封邮件。\n\n—— QQAgent 创造营`);
+        // 🔴 按用途区分邮件文案（2026-10-25 修）
+        //
+        // 用户反馈："他说授权验证码发过去是注册验证码"
+        //
+        // 完全正确 —— 原来只有一套文案，标题写死「注册验证码」，
+        // 正文也写「你正在注册...」。但验证码有三个用途：
+        //   register  注册新作者账号
+        //   submit    获取投稿凭证（已注册的人）
+        //   reset     重置密码
+        // 场景不同却发同一封邮件，收件人当然懵。
+        const purpose = String(body?.purpose || 'register').trim();
+        const MAIL_TPL = {
+          register: {
+            subject: '【QQAgent 创造营】注册验证码',
+            body: (c) => `你好，\n\n你正在注册 QQAgent 创造营的作者账号。\n\n验证码：${c}\n\n10 分钟内有效。若不是你本人操作，忽略这封邮件。\n\n—— QQAgent 创造营`,
+          },
+          submit: {
+            subject: '【QQAgent 创造营】投稿凭证验证码',
+            body: (c) => `你好，\n\n你正在获取「投稿到插件市场」的凭证，用于上传插件包。\n\n验证码：${c}\n\n10 分钟内有效。若不是你本人操作，请忽略这封邮件，你的账号没有变化。\n\n—— QQAgent 创造营`,
+          },
+          reset: {
+            subject: '【QQAgent 创造营】重置密码验证码',
+            body: (c) => `你好，\n\n你正在重置 QQAgent 创造营的登录密码。\n\n验证码：${c}\n\n10 分钟内有效。若不是你本人操作，请立即修改密码。\n\n—— QQAgent 创造营`,
+          },
+        };
+        const tpl = MAIL_TPL[purpose] || MAIL_TPL.register;
+
+        // 把用途一起存下来，验证时校验（防止拿注册码去换投稿凭证）
+        authCodes.set(email, { code, at: now, purpose });
+        const r = await sendMail(email, tpl.subject, tpl.body(code));
         if (!r.ok) {
           authCodes.delete(email);
           return json(res, 500, { ok: false, error: '发信失败' });
         }
         authSendLog.set(email, now);
-        log(`[auth] 验证码已发往 ${email.replace(/^(.{3}).*(@.*)$/, '$1***$2')}`);
-        return json(res, 200, { ok: true, message: '验证码已发送' });
+        const PURPOSE_CN = { register: '注册', submit: '投稿凭证', reset: '重置密码' };
+        log(`[auth] ${PURPOSE_CN[purpose] || purpose}验证码已发往 ${email.replace(/^(.{3}).*(@.*)$/, '$1***$2')}`);
+        return json(res, 200, { ok: true, message: `验证码已发送（${PURPOSE_CN[purpose] || purpose}）` });
       }
 
       // ── 补偿上报（2026-10-25）──
@@ -1688,6 +2277,60 @@ export function createApp({ log = console.log } = {}) {
       //   · 只接受 email + qq + nickname，不接受任意字段
       //   · 已有记录就只更新 lastSeenAt，不覆盖（防篡改邮箱归属）
       //   · 带限流（同 IP 每小时 20 次），防止被拿来刷数据
+      // ── 为已登录作者换市场凭证（2026-10-25）──
+      //
+      // 用户反馈：作者已登录，投稿区仍要收验证码，点发送报 Failed to fetch。
+      //
+      // 根因：/api/bridge/token 要 bridge 密钥，普通作者机器没有。
+      // 但中心端（这台）有 —— 所以让作者凭"已登录的邮箱"来这里换。
+      //
+      // 安全设计：
+      //   · 只接受已在 market-users.json 里登记过的邮箱（真注册过的）
+      //   · 限流：同 IP 每小时 30 次
+      //   · 只发 token，不泄露任何其他用户信息
+      if (pathname === '/api/auth/market-token' && method === 'POST') {
+        const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
+        const email = String(body?.email || '').trim().toLowerCase();
+        if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) {
+          return json(res, 400, { ok: false, error: '邮箱格式不对' });
+        }
+
+        const ip = String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress || '');
+        const now = Date.now();
+        const arr = (authIpLog.get(ip) || []).filter((x) => now - x < 3600 * 1000);
+        if (arr.length >= 30) return json(res, 429, { ok: false, error: '太频繁了' });
+        arr.push(now);
+        authIpLog.set(ip, arr);
+
+        // 必须是登记过的用户（防陌生人拿邮箱白嫖 token）
+        const known = (loadMarketUsers().users || []).find((u) => u.email === email);
+        if (!known) {
+          return json(res, 403, { ok: false, error: '这个邮箱还没在本站注册过，请先注册' });
+        }
+
+        try {
+          const keyFile = '/home/lyy/.secrets/market-bridge/bridge.key';
+          let bk = '';
+          try { bk = fs.readFileSync(keyFile, 'utf8').trim(); } catch { /* ignore */ }
+          if (!bk) return json(res, 503, { ok: false, error: '服务端未配置签发密钥' });
+
+          const tr = await fetch('https://market.baiguang211.top/api/bridge/token', {
+            method: 'POST',
+            headers: { 'x-bridge-key': bk, 'content-type': 'application/json' },
+            body: JSON.stringify({ email, qq: known.qq || '', nickname: known.nickname || '' }),
+            signal: AbortSignal.timeout(15000),
+          });
+          const td = await tr.json().catch(() => ({}));
+          if (!td?.ok || !td.token) {
+            return json(res, 502, { ok: false, error: '签发失败：' + (td?.error || '未知错误') });
+          }
+          log(`[auth] 为 ${email.replace(/^(.{3}).*(@.*)$/, '$1***$2')} 签发市场凭证`);
+          return json(res, 200, { ok: true, token: td.token, email });
+        } catch (e) {
+          return json(res, 502, { ok: false, error: '连不上市场服务：' + String(e?.message ?? e).slice(0, 60) });
+        }
+      }
+
       if (pathname === '/api/auth/register-report' && method === 'POST') {
         const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
         const email = String(body?.email || '').trim().toLowerCase();
@@ -1741,8 +2384,41 @@ export function createApp({ log = console.log } = {}) {
           verified: true,
         });
         log(`[auth] 新用户登记：${email.replace(/^(.{3}).*(@.*)$/, '$1***$2')}`);
+        // 同步到共享库，让所有实例都能看到这个用户
+        pushUserToRegistry(email, u.qq || '', u.nickname || '');
 
-        return json(res, 200, { ok: true, user: { email: u.email, firstSeenAt: u.firstSeenAt } });
+        // 🔴 顺手签一张市场 token 返回（2026-10-25）
+        //
+        // 用户反馈：作者已登录，投稿区还是要收验证码，点发送报 Failed to fetch。
+        //
+        // 根因：换 token 的 /api/bridge/token 需要 bridge 密钥，
+        // 而普通作者机器上没有 —— 那是市场所有者才有的东西。
+        //
+        // 但中心端（这台）有密钥。用户注册/登录本来就要经过这里，
+        // 顺手把 token 签好发回去，客户端就不用再单独换一次。
+        let marketToken = '';
+        try {
+          const keyFile = '/home/lyy/.secrets/market-bridge/bridge.key';
+          let bk = '';
+          try { bk = fs.readFileSync(keyFile, 'utf8').trim(); } catch { /* 没密钥就跳过 */ }
+          if (bk) {
+            const tr = await fetch('https://market.baiguang211.top/api/bridge/token', {
+              method: 'POST',
+              headers: { 'x-bridge-key': bk, 'content-type': 'application/json' },
+              body: JSON.stringify({ email, qq: u.qq || '', nickname: u.nickname || '' }),
+              signal: AbortSignal.timeout(15000),
+            });
+            const td = await tr.json().catch(() => ({}));
+            if (td?.ok && td.token) marketToken = td.token;
+          }
+        } catch { /* 签不出也不影响注册本身 */ }
+
+        return json(res, 200, {
+          ok: true,
+          user: { email: u.email, firstSeenAt: u.firstSeenAt },
+          // 客户端拿到后直接存起来，投稿不用再验证
+          marketToken,
+        });
       }
 
       if (pathname === '/api/mail' && method === 'GET') {
@@ -2138,6 +2814,47 @@ export function createApp({ log = console.log } = {}) {
               .replace('src="/app.js"', 'src="./app.js?v=' + stamp('/app.js') + '"'),
             'utf8'
           );
+
+          // ── 插件全局资源注入（headAssets，2026-10-25）──────────
+          //
+          // 「手机版界面」这类纯前端插件要在页面加载的第一时间
+          // 判断宽度、接管整页 —— uiTab / 顶栏页签都要求用户先点进去，不够用。
+          // 没有这个口子就只能靠安装脚本硬改 ui/index.html，内核一升级就没了。
+          //
+          // 安全：文件名白名单在 manifest.js 归一化时就校验过（平铺、无路径、
+          //      只收 css/js/mjs），这里再挡一次路径字符，双保险。
+          // 范围：只有 enabled 的插件才注入；按 priority 升序，顺序可预期。
+          try {
+            const recs = [...(pluginHost?.records?.values?.() || [])]
+              .filter((r) => r.status === 'enabled')
+              .sort((a, b) => (a.manifest?.priority ?? 100) - (b.manifest?.priority ?? 100));
+
+            let extra = '';
+            for (const rec of recs) {
+              const assets = rec.manifest?.headAssets;
+              if (!Array.isArray(assets) || !assets.length) continue;
+              for (const raw of assets) {
+                const name = String(raw || '').trim();
+                // 再挡一次：只允许平铺文件名
+                if (!name || name.includes('..') || /[\\/]/.test(name)) continue;
+                if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name)) continue;
+                // 相对路径：/qqbot/ 下反代也能正确解析（与上面 app.js 同理）
+                const url = './plugin-ui/' + encodeURIComponent(rec.id) + '/' + encodeURIComponent(name);
+                extra += name.toLowerCase().endsWith('.css')
+                  ? '<link rel="stylesheet" href="' + url + '">\n'
+                  : '<script src="' + url + '"></script>\n';
+              }
+            }
+            if (extra) {
+              const html = data.toString('utf8');
+              data = Buffer.from(
+                html.includes('</head>') ? html.replace('</head>', extra + '</head>') : html + extra,
+                'utf8'
+              );
+            }
+          } catch (e) {
+            log('[headAssets] 注入失败：' + (e?.message ?? e));
+          }
         }
         res.writeHead(200, { 'content-type': types[ext] ?? 'application/octet-stream', 'cache-control': 'no-cache' });
         res.end(data);

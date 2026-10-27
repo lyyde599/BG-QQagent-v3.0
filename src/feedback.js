@@ -187,3 +187,142 @@ export function setFeedbackStatus(id, status, by = '') {
   }
   return { ok: false, error: '没有这条反馈' };
 }
+
+// ── 多附件反馈（2026-10-25）──────────────────────────────────────
+//
+// 用户要求："注册用户点击反馈按钮，出弹窗，可以提交 0-3 张图片
+// 和 0-3 个日志或 md 文件，及文字描述内容"
+//
+// 与 submitFeedback 的区别：那个只支持单个任意附件。
+// 这个专门支持两类：
+//   images  —— 最多 3 张（png/jpg/webp/gif），单张 ≤ 5MB
+//   files   —— 最多 3 个（.log/.txt/.md/.json），单个 ≤ 2MB
+//
+// 分开存目录，方便管理端按类型展示。
+
+const MAX_IMAGES = 3;
+// 日志与文档**分开计数**（2026-10-26）
+// 用户要求："3图 + 3日志 + 3md 上限"
+// 原来混在一个 files 数组里共 3 个名额，日志多了就没法再传 md。
+const MAX_LOG_FILES = 3;
+const MAX_DOC_FILES = 3;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_FILE_BYTES = 2 * 1024 * 1024;
+
+const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+const FILE_EXT = new Set(['.log', '.txt', '.md', '.json']);
+
+/** 安全文件名：只保留字母数字下划线连字符点与中文 */
+const safeName = (n) => String(n || 'file')
+  .replace(/[^\w.\-\u4e00-\u9fa5]/g, '_')
+  .replace(/^\.+/, '')
+  .slice(0, 80) || 'file';
+
+/**
+ * 提交带多附件的反馈
+ *
+ * @param {{email,nickname,qq}} author 已登录作者
+ * @param {object} payload { type, title, body, images:[{name,base64}], files:[{name,base64}] }
+ */
+export function submitFeedbackRich(author, payload = {}) {
+  const email = String(author?.email || '').trim().toLowerCase();
+  if (!email) return { ok: false, error: '需要先登录（创造营作者账号）' };
+
+  const rl = rateCheck(email);
+  if (!rl.ok) return rl;
+
+  const type = ['bug', 'feature', 'other'].includes(payload.type) ? payload.type : 'bug';
+  const title = String(payload.title || '').trim().slice(0, 120);
+  if (!title) return { ok: false, error: '请填标题' };
+
+  const body = String(payload.body || '');
+  if (body.length > MAX_BODY) return { ok: false, error: `正文太长（上限 ${MAX_BODY / 1024}KB）` };
+
+  const images = Array.isArray(payload.images) ? payload.images : [];
+  // 兼容两种入参：
+  //   payload.files        —— 老格式，混在一起
+  //   payload.logFiles / payload.docFiles —— 新格式，日志与文档分开
+  const rawFiles = [
+    ...(Array.isArray(payload.logFiles) ? payload.logFiles : []),
+    ...(Array.isArray(payload.docFiles) ? payload.docFiles : []),
+    ...(Array.isArray(payload.files) ? payload.files : []),
+  ];
+  if (images.length > MAX_IMAGES) return { ok: false, error: `图片最多 ${MAX_IMAGES} 张` };
+
+  // 先全部解码校验，任何一项不合格就整体拒绝（不留半成品目录）
+  const decodedImages = [];
+  for (const it of images) {
+    const b64 = String(it?.base64 || '');
+    if (!b64) continue;
+    let buf;
+    try { buf = Buffer.from(b64, 'base64'); } catch { return { ok: false, error: '图片 base64 解码失败' }; }
+    if (buf.length > MAX_IMAGE_BYTES) {
+      return { ok: false, error: `图片太大（${(buf.length / 1024 / 1024).toFixed(1)}MB，上限 ${MAX_IMAGE_BYTES / 1024 / 1024}MB）` };
+    }
+    const name = safeName(it?.name || 'image.png');
+    const ext = path.extname(name).toLowerCase();
+    if (!IMAGE_EXT.has(ext)) return { ok: false, error: `不支持的图片类型：${ext || '(无扩展名)'}` };
+    decodedImages.push({ name, bytes: buf.length, buf });
+  }
+
+  // 日志与文档分开校验、分开计数（2026-10-26）
+  const LOG_EXT = new Set(['.log', '.txt', '.json']);
+  const DOC_EXT = new Set(['.md']);
+
+  const decodedLogs = [];
+  const decodedDocs = [];
+  for (const it of rawFiles) {
+    const b64 = String(it?.base64 || '');
+    if (!b64) continue;
+    let buf;
+    try { buf = Buffer.from(b64, 'base64'); } catch { return { ok: false, error: '附件 base64 解码失败' }; }
+    if (buf.length > MAX_FILE_BYTES) {
+      return { ok: false, error: `附件太大（${(buf.length / 1024 / 1024).toFixed(1)}MB，上限 ${MAX_FILE_BYTES / 1024 / 1024}MB）` };
+    }
+    const name = safeName(it?.name || 'log.txt');
+    const ext = path.extname(name).toLowerCase();
+    const target = LOG_EXT.has(ext) ? decodedLogs : (DOC_EXT.has(ext) ? decodedDocs : null);
+    if (!target) {
+      return { ok: false, error: `不支持的附件类型：${ext || '(无扩展名)'}（日志收 .log/.txt/.json，文档收 .md）` };
+    }
+    target.push({ name, bytes: buf.length, buf });
+  }
+
+  if (decodedLogs.length > MAX_LOG_FILES) return { ok: false, error: `日志最多 ${MAX_LOG_FILES} 个` };
+  if (decodedDocs.length > MAX_DOC_FILES) return { ok: false, error: `文档（.md）最多 ${MAX_DOC_FILES} 个` };
+
+  const decodedFiles = [...decodedLogs, ...decodedDocs];
+
+  const id = 'fb-' + Date.now().toString(36) + '-' + crypto.randomBytes(3).toString('hex');
+  const dir = ensureDir(itemDir(id));
+
+  // 针对具体插件的反馈（2026-10-26）
+  const pluginId = String(payload?.pluginId || '').trim().slice(0, 64);
+  const pluginName = String(payload?.pluginName || '').trim().slice(0, 64);
+  const pluginVersion = String(payload?.pluginVersion || '').trim().slice(0, 32);
+
+  const record = {
+    id,
+    type,
+    title,
+    body,
+    // 从哪个插件卡片点的「反馈」；null 表示通用反馈
+    plugin: pluginId ? { id: pluginId, name: pluginName, version: pluginVersion } : null,
+    submittedAt: new Date().toISOString(),
+    submitter: { email, nickname: String(author?.nickname || ''), qq: String(author?.qq || '') },
+    env: collectEnv(),
+    // 附件清单（实际文件落在同目录）
+    images: decodedImages.map((x) => ({ name: x.name, bytes: x.bytes })),
+    // 分开存：日志 / 文档，便于管理端按类型展示
+    logFiles: decodedLogs.map((x) => ({ name: x.name, bytes: x.bytes })),
+    docFiles: decodedDocs.map((x) => ({ name: x.name, bytes: x.bytes })),
+    files: decodedFiles.map((x) => ({ name: x.name, bytes: x.bytes })),
+    status: 'open',
+  };
+
+  fs.writeFileSync(path.join(dir, 'feedback.json'), JSON.stringify(record, null, 2), 'utf8');
+  decodedImages.forEach((x) => fs.writeFileSync(path.join(dir, x.name), x.buf));
+  decodedFiles.forEach((x) => fs.writeFileSync(path.join(dir, x.name), x.buf));
+
+  return { ok: true, id, dir, record };
+}

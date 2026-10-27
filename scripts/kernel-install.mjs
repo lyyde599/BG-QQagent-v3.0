@@ -206,33 +206,106 @@ function runCtl(args, timeout = 60000) {
   r = spawnSync('systemctl', args, { timeout, encoding: 'utf8' });
   if (r.status === 0) return { ok: true, via: 'direct' };
 
-  return { ok: false, via: 'none', err: String(r.stderr || '').slice(0, 200) };
+  // 🔴 诊断增强（2026-10-25 事故教训）
+  //    上次出事时 err 是空字符串，status/signal 全没记 ——
+  //    「出事了但没留下任何线索」，完全无法定位是哪一层骗了返回值。
+  return {
+    ok: false,
+    via: 'none',
+    status: r.status,
+    signal: r.signal,
+    errCode: r.error?.code || '',
+    err: String(r.stderr || '').slice(0, 200)
+  };
 }
 
+/**
+ * 重启服务：同样以实际状态为准，不看返回码
+ */
 function restartService() {
   const u = detectUnit();
   if (!u) { LOG('⚠️ 识别不到服务名，跳过重启'); return false; }
+  const before = servicePid();
   const r = runCtl(['restart', u]);
-  if (!r.ok) { LOG(`⚠️ 重启服务失败：${r.err}`); return false; }
-  return true;
+  if (!r.ok) {
+    LOG(`⚠️ systemctl restart 返回异常（status=${r.status} signal=${r.signal} code=${r.errCode} err=${r.err || '空'}），改为验证状态…`);
+  }
+  // 等它起来（restart 会换 PID，这里只确认 active）
+  for (let i = 0; i < 30; i++) {
+    const s = spawnSync('systemctl', ['is-active', u], { timeout: 10000, encoding: 'utf8' });
+    if (String(s.stdout || '').trim() === 'active') {
+      const after = servicePid();
+      LOG(`   重启完成：PID ${before || '无'} → ${after || '无'}`);
+      return true;
+    }
+    sleepSync(1000);
+  }
+  return false;
 }
 
 /** 停服务（替换文件前必须停，否则文件被占用） */
+/**
+ * 同步睡眠（脚本是同步流程，这里不做异步等待）
+ */
+function sleepSync(ms) {
+  const sab = new SharedArrayBuffer(4);
+  const arr = new Int32Array(sab);
+  Atomics.wait(arr, 0, 0, ms);
+}
+
+/**
+ * 停服务：**不看返回码，看进程是否真的没了**
+ *
+ * 🔴 2026-10-25 事故（第二次同类）：
+ *   systemctl 明明记了 "Deactivated successfully"，runCtl 却返回 ok:false，
+ *   于是脚本判定「停不下」→ fail() 退出 → 但服务其实已经停了 → 控制台 502。
+ *
+ *   根因不是返回值本身，而是**用返回值代表状态**这件事本身不可靠。
+ *   进程表不会说谎 —— 所以改成「调用后轮询确认」。
+ *
+ * @returns {boolean} 进程是否真的没了
+ */
 function stopService() {
   const u = detectUnit();
   if (!u) { LOG('⚠️ 识别不到服务名，跳过停止'); return false; }
+
   const r = runCtl(['stop', u]);
-  if (!r.ok) LOG(`⚠️ 停止服务失败：${r.err}`);
-  return r.ok;
+  if (!r.ok) {
+    // 不急着判失败 —— 返回值可能骗人，下面按进程状态为准
+    LOG(`⚠️ systemctl stop 返回异常（status=${r.status} signal=${r.signal} code=${r.errCode} err=${r.err || '空'}），改为验证进程状态…`);
+  }
+
+  // 轮询确认：最多等 30 秒
+  for (let i = 0; i < 30; i++) {
+    if (!servicePid()) return true;          // 进程没了 = 真的停了
+    sleepSync(1000);
+  }
+  LOG('⚠️ 等待 30 秒后进程仍在，判定停止失败');
+  return false;
 }
 
 /** 启动服务 */
+/**
+ * 启服务：**不看返回码，看 is-active**
+ *
+ * 与 stopService 同理 —— 返回值不可靠，实际状态才可信。
+ */
 function startService() {
   const u = detectUnit();
   if (!u) { LOG('⚠️ 识别不到服务名，跳过启动'); return false; }
+
   const r = runCtl(['start', u]);
-  if (!r.ok) LOG(`⚠️ 启动服务失败：${r.err}`);
-  return r.ok;
+  if (!r.ok) {
+    LOG(`⚠️ systemctl start 返回异常（status=${r.status} signal=${r.signal} code=${r.errCode} err=${r.err || '空'}），改为验证状态…`);
+  }
+
+  for (let i = 0; i < 30; i++) {
+    const s = spawnSync('systemctl', ['is-active', u], { timeout: 10000, encoding: 'utf8' });
+    if (String(s.stdout || '').trim() === 'active') return true;
+    sleepSync(1000);
+  }
+  LOG('⚠️ 等待 30 秒后服务仍未 active，判定启动失败');
+  return false;
 }
 
 /** 备份：把内核文件拷到 .bak-<时间戳>/ */
@@ -437,6 +510,93 @@ function syncInstallerFromPackage(newDir) {
   }
 }
 
+/**
+ * 把替换后的文件属主还给服务运行用户（2026-10-26）
+ *
+ * 问题：安装脚本可能以 root 身份运行（sudo systemd-run / sudo node）。
+ *   cpSync 复制出来的文件属主就是 root，之后普通用户编辑会 Permission denied，
+ *   更糟的是 git checkout / 打包都会失败。
+ *
+ * 做法：
+ *   ① 从 systemd 查服务实际以哪个用户跑（最权威）
+ *   ② 查不到就看 ROOT 目录本身的属主（通常是部署者）
+ *   ③ 把替换过的那几项递归 chown 回去
+ *
+ * 以 root 跑的话还要 chown 自己的 sudo 权限才做得到；不是 root 且属主本来就对 → 什么都不用做。
+ */
+function restoreOwnership() {
+  const items = ['src', 'ui', 'skills', 'scripts', 'test', 'electron', 'docs',
+    'package.json', 'package-lock.json',
+    'README.md', 'PLUGIN-ARCH.md', 'VOICE-RESEARCH.md',
+    '插件与Skill制作及使用规范.md', '内核发布说明.md', '安装说明.md',
+    '.gitignore', 'LICENSE'];
+
+  // ① 查服务用户
+  let targetUser = '';
+  try {
+    const u = detectUnit();
+    if (u) {
+      const r = spawnSync('systemctl', ['show', u, '-p', 'User', '--value'], { timeout: 10000, encoding: 'utf8' });
+      targetUser = String(r.stdout || '').trim();
+    }
+  } catch { /* 忽略 */ }
+
+  // ② 退而求其次：用 ROOT 目录本身的属主
+  if (!targetUser) {
+    try {
+      const st = fs.statSync(ROOT);
+      const uid = st.uid;
+      // 用 id 把 uid 翻成用户名
+      const r = spawnSync('id', ['-nu', String(uid)], { timeout: 5000, encoding: 'utf8' });
+      targetUser = String(r.stdout || '').trim();
+    } catch { /* 忽略 */ }
+  }
+
+  if (!targetUser || targetUser === 'root') {
+    LOG('   属主检查：目标用户是 root 或无法确定，跳过');
+    return;
+  }
+
+  // ③ 已经对了就不用改
+  let needFix = [];
+  for (const it of items) {
+    const p = path.join(ROOT, it);
+    try {
+      if (!fs.existsSync(p)) continue;
+      const st = fs.statSync(p);
+      const r = spawnSync('stat', ['-c', '%U', p], { timeout: 5000, encoding: 'utf8' });
+      const owner = String(r.stdout || '').trim();
+      if (owner && owner !== targetUser) needFix.push(it);
+    } catch { /* 跳过 */ }
+  }
+
+  if (!needFix.length) {
+    LOG(`   属主检查：已全部属于 ${targetUser}，无需调整`);
+    return;
+  }
+
+  LOG(`   发现 ${needFix.length} 项属主不是 ${targetUser}，正在修正…`);
+  for (const it of needFix) {
+    const p = path.join(ROOT, it);
+    // 优先直接用 chown（本来就是该用户就不用 sudo）
+    let r = spawnSync('chown', ['-R', `${targetUser}:${targetUser}`, p], { timeout: 60000, encoding: 'utf8' });
+    if (r.status !== 0) {
+      // 权限不够时走 sudo（沿用 runCtl 同样的密码策略）
+      const pwFile = process.env.QQ_SUDO_PASSWORD_FILE
+        || path.join(os.homedir(), '.secrets', 'sudo', 'password');
+      try {
+        if (fs.existsSync(pwFile)) {
+          const pw = fs.readFileSync(pwFile, 'utf8').trim();
+          r = spawnSync('sudo', ['-S', 'chown', '-R', `${targetUser}:${targetUser}`, p], {
+            timeout: 120000, encoding: 'utf8', input: pw + '\n'
+          });
+        }
+      } catch { /* 忽略 */ }
+    }
+    LOG(r.status === 0 ? `   ${it} 属主已改为 ${targetUser}` : `   ⚠️ ${it} 属主修正失败`);
+  }
+}
+
 /** 回滚 */
 function rollback(bakDir) {
   LOG('⏪ 开始回滚…');
@@ -598,23 +758,62 @@ process.on('unhandledRejection', (e) => {
   emergencyRestart('unhandledRejection');
   process.exit(1);
 });
+// 阶段标记：用来区分「自己停服务时收到的 SIGTERM」和「外部误杀」
+// 如果安装脚本还在内核的 cgroup 里（老版本 / 非 systemd-run 场景），
+// systemctl stop 会连带把脚本自己也 SIGTERM 掉。
+// 这种情况不能直接退出 —— 要先把服务拉起来，否则就是 502。
+let phase = 'init';   // init | stopping | replacing | starting | done
+
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-  process.on(sig, () => { LOG(`⚠️ 收到 ${sig}`); emergencyRestart(sig); process.exit(1); });
+  process.on(sig, () => {
+    LOG(`⚠️ 收到 ${sig}（阶段：${phase}）`);
+    if (sig === 'SIGTERM' && (phase === 'stopping' || phase === 'replacing')) {
+      // 典型的「被 systemctl stop 连带」场景：服务已经被停了，
+      // 自己也被打了信号。此时必须把服务拉回来再退出。
+      LOG('   这是停服务阶段的连带信号，拉起服务后退出');
+      try { startService(); } catch { /* 尽力而为 */ }
+    } else {
+      emergencyRestart(sig);
+    }
+    process.exit(1);
+  });
 }
+
 
 // 记下停服务前的 PID —— 后面用它判断「进程到底换没换」
 const pidBefore = servicePid();
+phase = 'stopping';
 LOG(`⑤ 停止服务…（服务名 ${detectUnit() || '未识别'}，当前 PID ${pidBefore || '无'}）`);
-if (!stopService()) {
-  releaseLock();
-  fail('停不下服务（权限不足？），已中止。服务仍保持运行。', 6);
+
+// 🔴 2026-10-25 事故修复（两件事缺一不可）：
+//   ① 真正调用 stopService()（它按进程状态判定，不信返回码）
+//   ② 不论结果如何，退出前按**实际进程状态**设置 serviceStopped，
+//      否则 fail() 的 exit 钩子会被 !serviceStopped 挡掉，服务裸停。
+const stopped = stopService();
+
+if (!servicePid()) {
+  // 进程确实没了 —— 不管 stopService 返回什么，都置位让兜底能接管
+  serviceStopped = true;
+  if (!stopped) LOG('⚠️ 停止判定失败，但进程确实已停 → 交给兜底拉起');
+} else {
+  serviceStopped = false;   // 进程还在，兜底别动它
 }
-serviceStopped = true;
+
+if (!stopped) {
+  releaseLock();
+  fail('停不下服务，已中止。服务仍在运行。', 6);
+}
+if (serviceStopped && !servicePid()) {
+  LOG('⚠️ 停止判定与实际状态不一致（已停），由兜底负责拉起');
+}
 await new Promise((r) => setTimeout(r, 2000));
 
+phase = 'replacing';
 replace(newDir);
 syncInstallerFromPackage(newDir);
+restoreOwnership();          // 把 root 属主还回去，否则用户后续编辑/打包会失败
 
+phase = 'starting';
 LOG('⑥ 启动服务…');
 startService();
 
@@ -653,6 +852,7 @@ if (!ok || !pidChanged) {
 // 成功：清理临时目录，保留备份供手动回退
 finished = true;
 fs.rmSync(tmp, { recursive: true, force: true });
+phase = 'done';
 LOG(`🎉 安装成功，备份保留在 ${path.basename(bakDir)}（确认无误后可删）`);
 
 // 把备份路径写到文件，方便前端展示

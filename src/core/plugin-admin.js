@@ -54,6 +54,23 @@ const EXPORT_EXCLUDE_DIRS = new Set([
 const EXPORT_EXCLUDE_FILES = new Set([
   '.DS_Store', 'Thumbs.db', '.gitignore', '.env', '.env.local'
 ]);
+// 开发备份不打包（2026-10-26）
+//
+// 🔴 外部报告实测：某插件目录里 48 个 .bak 备份被一起打包，
+//    实际代码 67KB，打出来 963KB —— 膨胀 14 倍。
+//    对每几天发一版的插件来说，上传时间与用户下载都白付。
+//
+// 按**后缀模式**排除，而不是精确文件名（备份名五花八门：
+//   index.js.bak / index.js.bak-20261026 / ui.js.bak-sportsui / 文件~）
+const EXPORT_EXCLUDE_PATTERNS = [
+  /\.bak($|[.\-])/i,      // *.bak / *.bak-xxx / *.bak.xxx
+  /\.old($|[.\-])/i,      // *.old
+  /\.orig$/i,              // *.orig
+  /\.rej$/i,               // *.rej（patch 冲突残留）
+  /~$/,                    // vim/emacs 备份
+  /\.swp$/i,               // vim swap
+  /\.tmp$/i,               // 临时文件
+];
 // 这些扩展名是构建产物/字节码，跨平台无意义
 const EXPORT_EXCLUDE_EXT = new Set(['.pyc', '.pyo', '.so', '.dylib', '.dll', '.log', '.map']);
 const ID_RE = /^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/;
@@ -471,6 +488,11 @@ export function registerPluginAdmin(host, { getConfig, log }) {
         if (!ent.isFile()) continue;
         if (r === 'config.json' || r === '_export.json') continue;   // 单独处理
         if (EXPORT_EXCLUDE_FILES.has(ent.name)) { skipped.push(r); continue; }
+        // 开发备份（2026-10-26）：*.bak / *~ / *.tmp / *.orig 等不进包
+        if (EXPORT_EXCLUDE_PATTERNS.some((re) => re.test(ent.name))) {
+          skipped.push(r);
+          continue;
+        }
         const ext = path.extname(ent.name).toLowerCase();
         if (EXPORT_EXCLUDE_EXT.has(ext)) { skipped.push(r); continue; }
         if (stripAssets && ASSET_EXT.has(ext)) { skipped.push(r); continue; }
@@ -608,15 +630,35 @@ export function registerPluginAdmin(host, { getConfig, log }) {
       fs.writeFileSync(dest, buf);
     }
 
-    // 配置：包内有就整体写入（这是"作者的设置"或"默认值"）
+    // 配置：包内有就写入（这是"作者的设置"或"默认值"）
+    //
+    // 🔴 关键修正（2026-10-26）：
+    //   原来是**无条件整体覆盖**。结果是——
+    //   作者点「发布」→ 自动装回本地 → 包里的 config.json 是 clean 默认值
+    //   → **把自己机器上的真实配置（API Key 等）清空了**。
+    //
+    //   实测踩到：image-gen 发布 1.2.0 后 apiKey 变空，生图全部报"还没配置 Key"。
+    //
+    //   现在分两种情况：
+    //     keepLocalConfig=true  → 只补缺失的键，不覆盖已有的（发布后装回 / 自更新）
+    //     否则                  → 整体覆盖（装别人的包，按包里的默认值来）
     const cfgEntry = entries.find(([n]) => n === `${rootName}/config.json`);
     if (cfgEntry) {
       try {
         const restored = JSON.parse(cfgEntry[1].toString('utf8'));
         const { createPluginConfig } = await import('./plugin-config.js');
-        // 用 replace 语义：先用包里的配置整体覆盖该插件段落
         const handle = createPluginConfig(id, {});
-        handle.set(restored);
+        if (body?.keepLocalConfig === true) {
+          // 只补包里声明了、但本地还没有的键（给插件升级新增配置项用）
+          const cur = handle.get() || {};
+          const patch = {};
+          for (const [k, v] of Object.entries(restored)) {
+            if (!(k in cur)) patch[k] = v;
+          }
+          if (Object.keys(patch).length) handle.set({ ...cur, ...patch });
+        } else {
+          handle.set(restored);
+        }
       } catch { /* 配置坏不影响装插件 */ }
     }
 

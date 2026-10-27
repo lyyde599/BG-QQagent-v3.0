@@ -102,6 +102,17 @@ export async function activate(ctx) {
     };
   };
 
+  // 版本比较（提升到前面，市场排序要用）
+  const cmpVer = (a, b) => {
+    const pa = String(a || '0').split('.').map((x) => parseInt(x, 10) || 0);
+    const pb = String(b || '0').split('.').map((x) => parseInt(x, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const x = pa[i] || 0, y = pb[i] || 0;
+      if (x !== y) return x > y ? 1 : -1;
+    }
+    return 0;
+  };
+
   // ── 统一请求头（2026-10-25）──
   //
   // 🔴 实测踩坑：Cloudflare R2 的 r2.dev 公开域名会**拦截默认 UA**。
@@ -117,6 +128,8 @@ export async function activate(ctx) {
 
   // ── 内存缓存：避免每次打开面板都拉网络 ──
   let cache = { at: 0, data: null, source: '', error: null };
+  // 下载数缓存（2026-10-26）：展示性数据，5 分钟一次足够
+  let dlCache = { at: 0, data: null };
   const CACHE_MS = 5 * 60 * 1000;
 
   /**
@@ -223,32 +236,43 @@ export async function activate(ctx) {
     return String(c.authUrl || 'https://auth.597457.xyz/api/auth');
   };
 
-  const sendVerifyCode = async (email) => {
+  // 邮件文案模板（2026-10-25）：按用途区分，别让收件人以为点错了
+  const MAIL_TPL = {
+    register: {
+      subject: '【QQAgent 创造营】注册验证码',
+      lines: (c) => ['你好，', '', '你正在注册 QQAgent 创造营的作者账号。', '',
+        `验证码：${c}`, '', '10 分钟内有效。若不是你本人操作，忽略这封邮件。', '', '—— QQAgent 创造营'],
+    },
+    submit: {
+      subject: '【QQAgent 创造营】投稿凭证验证码',
+      lines: (c) => ['你好，', '', '你正在获取「投稿到插件市场」的凭证，用于上传插件包。', '',
+        `验证码：${c}`, '', '10 分钟内有效。若不是你本人操作，请忽略这封邮件，你的账号没有变化。', '', '—— QQAgent 创造营'],
+    },
+    reset: {
+      subject: '【QQAgent 创造营】重置密码验证码',
+      lines: (c) => ['你好，', '', '你正在重置 QQAgent 创造营的登录密码。', '',
+        `验证码：${c}`, '', '10 分钟内有效。若不是你本人操作，请立即修改密码。', '', '—— QQAgent 创造营'],
+    },
+  };
+
+  const sendVerifyCode = async (email, purpose = 'register') => {
+    const tpl = MAIL_TPL[purpose] || MAIL_TPL.register;
+
     // ① 本机有 SMTP 就自己发
     if (ctx.mail?.ready?.()) {
       const code = String(crypto.randomInt(100000, 1000000));
-      const body = [
-        '你好，',
-        '',
-        '你正在注册 QQAgent 创造营的作者账号。',
-        '',
-        `验证码：${code}`,
-        '',
-        '10 分钟内有效。若不是你本人操作，忽略这封邮件。',
-        '',
-        '—— QQAgent 创造营',
-      ].join('\n');
-      const r = await ctx.mail.send(email, '【QQAgent 创造营】注册验证码', body);
+      const body = tpl.lines(code).join('\n');
+      const r = await ctx.mail.send(email, tpl.subject, body);
       if (!r.ok) return { ok: false, error: '发信失败：' + r.error };
       return { ok: true, local: true, code };
     }
 
-    // ② 没配 SMTP → 请求中心服务
+    // ② 没配 SMTP → 请求中心服务（带上用途）
     try {
       const res = await fetch(`${CENTER_URL()}/send`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'User-Agent': UA },
-        body: JSON.stringify({ email }),
+        body: JSON.stringify({ email, purpose }),
         signal: AbortSignal.timeout(30000),
       });
       const d = await res.json().catch(() => ({}));
@@ -297,7 +321,7 @@ export async function activate(ctx) {
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return { ok: false, error: '邮箱格式不对' };
 
     // 🔴 防枚举：无论邮箱是否存在，都尝试发码并返回同样的提示
-    const r = await sendVerifyCode(email);
+    const r = await sendVerifyCode(email, 'reset');
     if (!r.ok) {
       // 发信失败要如实报（否则用户以为发了在等）
       return { ok: false, error: r.error };
@@ -353,6 +377,16 @@ export async function activate(ctx) {
         const d = await res.json().catch(() => ({}));
         if (!res.ok || d?.ok === false) {
           return { ok: false, error: d?.error || `验证失败（HTTP ${res.status}）` };
+        }
+        // 中心端顺手签好的市场 token（2026-10-25）
+        // 存下来，前端拿去做投稿凭证，不用再单独换一次
+        if (d?.marketToken) {
+          try {
+            fs.mkdirSync(ctx.data.dir, { recursive: true });
+            fs.writeFileSync(path.join(ctx.data.dir, 'market-token.txt'), d.marketToken, 'utf8');
+            ctx.log('[市场] 已从中心获取投稿凭证');
+          } catch { /* ignore */ }
+          marketTokenFromCenter = d.marketToken;
         }
       } catch (e) {
         return { ok: false, error: '连不上验证服务：' + String(e?.message ?? e).slice(0, 60) };
@@ -509,6 +543,7 @@ export async function activate(ctx) {
   }, { absolute: true });
 
   ctx.http.route('POST', '/api/market/register/verify', async (_req, body) => {
+    let marketTokenFromCenter = '';
     const email = String(body?.email || '').trim().toLowerCase();
     const input = String(body?.code || '').trim();
     const qq = String(body?.qq || '').trim();
@@ -577,7 +612,25 @@ export async function activate(ctx) {
     fs.mkdirSync(ctx.data.dir, { recursive: true });
     fs.writeFileSync(path.join(ctx.data.dir, 'author.json'), JSON.stringify(author, null, 2), 'utf8');
     ctx.log(`[市场] 作者注册成功：${email}${pwSet ? '（已设密码）' : ''}`);
-    return { ok: true, author, hasPassword: author.hasPassword };
+
+    // 🔴 同步到中心用户库（2026-10-25 修）
+    //
+    // 用户反馈："这个作者注册了账号为什么我们没有拉取到数据呢"
+    //
+    // 根因：注册只写了本地 author.json，**从不推送到中心**。
+    // 所以他自己机器上有完整档案（昵称「源」），我们这边只有一条
+    // 迁移时补录的空壳记录（nickname 为空）。
+    //
+    // 现在不管走本地验证码还是中心验证码，注册成功都推一次。
+    await pushUserToRegistry(email, author.qq || '', author.nickname || '').catch(() => {});
+
+    return {
+      ok: true,
+      author,
+      hasPassword: author.hasPassword,
+      // 有就带给前端，直接存进 localStorage
+      marketToken: marketTokenFromCenter,
+    };
   }, { absolute: true });
 
   // ── 接口：拿清单 ──
@@ -602,6 +655,39 @@ export async function activate(ctx) {
       return true;
     });
 
+    // 下载次数（2026-10-25）：批量拉一次，附在每个插件上
+    //
+    // 🔴 必须带缓存（2026-10-26 修）
+    //
+    // 这是**跨公网**请求，实测 1~2 秒。原来每次打开市场都实时拉，
+    // 把本来 6ms 的 /api/market/index 拖成了 1~2 秒 ——
+    // 用户反馈的"进去会卡顿"有一半是这个造成的。
+    //
+    // 下载数是展示性数据，晚 5 分钟更新完全无所谓，
+    // 所以照插件清单那套做：TTL 300 秒 + 失败回落旧值。
+    let downloads = new Map();
+    const DL_TTL = 300 * 1000;
+    if (dlCache.data && Date.now() - dlCache.at < DL_TTL) {
+      downloads = dlCache.data;                       // 命中缓存，0 网络开销
+    } else {
+      try {
+        const dr = await fetch('https://market.baiguang211.top/api/stats/downloads', {
+          headers: { 'User-Agent': UA },
+          signal: AbortSignal.timeout(3000),         // 3 秒封顶，别拖死首屏
+        });
+        const dd = await dr.json().catch(() => ({}));
+        if (dd?.ok && Array.isArray(dd.items)) {
+          const m = new Map();
+          for (const it of dd.items) m.set(it.id, it.total || 0);
+          downloads = m;
+          dlCache = { at: Date.now(), data: m };
+        }
+      } catch {
+        // 拿不到就用上次的（可能为空），不影响列表本身
+        if (dlCache.data) downloads = dlCache.data;
+      }
+    }
+
     // 已安装的标出来（内核 records 里有）
     let installed = new Map();
     try {
@@ -610,6 +696,29 @@ export async function activate(ctx) {
       for (const p of (d.plugins || [])) installed.set(p.id, p.version);
     } catch { /* 拿不到就当没装 */ }
 
+    // ── 排序（2026-10-25）──
+    //
+    // 用户要求："有新版本发布的插件，在创作营里自动排前位，方便看见"
+    //
+    // 优先级：
+    //   ① 可更新且已安装（本地有旧版，市场有新版本）→ 最该让人看见
+    //   ② 未安装的新插件（从没装过）
+    //   ③ 已安装且已是最新
+    // 同档内按 id 字母序保持稳定，避免每次刷新顺序乱跳。
+    const makeList = (arr) => {
+      const rank = (p) => {
+        const inst = installed.has(p.id);
+        if (!inst) return 1;                                    // 未安装
+        const local = installed.get(p.id);
+        return cmpVer(p.version, local) > 0 ? 0 : 2;            // 可更新 / 已最新
+      };
+      return [...arr].sort((a, b) => {
+        const ra = rank(a), rb = rank(b);
+        if (ra !== rb) return ra - rb;
+        return String(a.id).localeCompare(String(b.id));
+      });
+    };
+
     return {
       ok: true,
       source: r.source,
@@ -617,7 +726,7 @@ export async function activate(ctx) {
       warning: r.error || null,
       updatedAt: r.data.updatedAt || '',
       total: list.length,
-      plugins: list.map((p) => ({
+      plugins: makeList(list).map((p) => ({
         ...p,
         // 分类以**本地 manifest** 为准（远程清单可能是旧分类）
         // 本地没有这个插件时，退回远端给的 category
@@ -633,7 +742,12 @@ export async function activate(ctx) {
         })(),
         installed: installed.has(p.id),
         installedVersion: installed.get(p.id) || null,
-        updatable: installed.has(p.id) && installed.get(p.id) !== p.version,
+        // 🔴 用版本比较，不是字符串不等（2026-10-25 修）
+        //    原来 `installedVersion !== version` —— 本地版本比市场新时
+        //    （作者自己改过还没发）也会显示"可更新"，反而提示降级。
+        updatable: installed.has(p.id) && cmpVer(p.version, installed.get(p.id)) > 0,
+        // 下载人次（0 也返回，界面自己决定显不显示）
+        downloads: downloads.get(p.id) || 0,
       })),
     };
   }, { absolute: true });
@@ -706,6 +820,31 @@ export async function activate(ctx) {
   ctx.http.route('POST', '/api/market/package', async (_req, body) => {
     const id = String(body?.id || '');
     if (!id) return { ok: false, error: '缺少插件 id' };
+
+    // 分类（2026-10-26）：作者在发布页手动选，只接受 5 个固定值。
+    //   选了就写进 manifest（打包时会带进去），没选就沿用现有的。
+    //   这样市场里不会出现"内容能力/扩展/界面"这类野生分类。
+    // 六类（2026-10-26 重新规划）：把原来过大的「运营」拆成群管理 / 群运营
+    //   群管理 = 管人管秩序（禁言、黑名单、限流、迎新）
+    //   群运营 = 产出内容（日报、福利、题库、逛逛）
+    const STD_CATS = ['群管理', '群运营', '能力', '娱乐', '工具', '主人'];
+    const pickedCat = String(body?.category || '').trim();
+    if (pickedCat) {
+      if (!STD_CATS.includes(pickedCat)) {
+        return { ok: false, error: `分类只能是：${STD_CATS.join(' / ')}` };
+      }
+      try {
+        const mfPath = path.join(ctx.root, 'plugins', id, 'manifest.json');
+        const mf = JSON.parse(fs.readFileSync(mfPath, 'utf8'));
+        if (mf.category !== pickedCat) {
+          mf.category = pickedCat;
+          fs.writeFileSync(mfPath, JSON.stringify(mf, null, 2), 'utf8');
+          ctx.log(`[市场] ${id} 分类设为「${pickedCat}」`);
+        }
+      } catch (e) {
+        return { ok: false, error: '写 manifest 失败：' + String(e?.message ?? e).slice(0, 60) };
+      }
+    }
     // stripAssets=true：把 assets/ 里的图片音视频排除掉（素材单独托管）
     const stripAssets = body?.stripAssets === true;
 
@@ -979,6 +1118,48 @@ export async function activate(ctx) {
     return { role: isAdmin ? 'admin' : 'author', me };
   };
 
+  /**
+   * 把用户档案推到中心库（2026-10-25）
+   *
+   * 注册成功、心跳、手动同步都走这条。
+   * 失败静默 —— 不影响注册流程，下次心跳会补。
+   */
+  const pushUserToRegistry = async (email, qq = '', nickname = '') => {
+    const key = readBridgeKey();
+    if (!key || !email) return { ok: false };
+    try {
+      const r = await fetch('https://market.baiguang211.top/api/registry/users', {
+        method: 'POST',
+        headers: { 'x-bridge-key': key, 'content-type': 'application/json', 'User-Agent': UA },
+        body: JSON.stringify({ email, qq, nickname }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const d = await r.json().catch(() => ({}));
+      return { ok: r.ok && d?.ok !== false, total: d?.total };
+    } catch { return { ok: false }; }
+  };
+
+  // ── 中心化数据读取（2026-10-25）──
+  //
+  // admin.json / market-users.json 原来是本机私有文件，
+  // 导致每台机器各有一份名单 —— 用户在自己机器上 auto 成管理员，
+  // 你看不到他，他也看不到你加的管理员。
+  //
+  // 现在优先读中心（R2 的 registry/），读不到才退回本地。
+  const fetchRegistry = async (kind) => {
+    const key = readBridgeKey();
+    if (!key) return null;
+    try {
+      const r = await fetch(`https://market.baiguang211.top/api/registry/${kind}`, {
+        headers: { 'x-bridge-key': key, 'User-Agent': UA },
+        signal: AbortSignal.timeout(20000),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d?.ok) return null;
+      return kind === 'admins' ? (d.admins || []) : (d.users || []);
+    } catch { return null; }
+  };
+
   /** 管理员专用守卫 */
   const requireAdmin = () => {
     const w = whoAmI();
@@ -1137,11 +1318,18 @@ export async function activate(ctx) {
     const me = guard.me;
 
     // 中心端用户档案（谁在我们这里注册过）
+    //
+    // 优先读中心（所有实例共享），读不到才退回本地文件。
     let marketUsers = [];
-    try {
-      const uf = path.join(ctx.root, 'data', 'market-users.json');
-      if (fs.existsSync(uf)) marketUsers = JSON.parse(fs.readFileSync(uf, 'utf8')).users || [];
-    } catch { /* 读不到就空着 */ }
+    const remoteUsers = await fetchRegistry('users');
+    if (remoteUsers) {
+      marketUsers = remoteUsers;
+    } else {
+      try {
+        const uf = path.join(ctx.root, 'data', 'market-users.json');
+        if (fs.existsSync(uf)) marketUsers = JSON.parse(fs.readFileSync(uf, 'utf8')).users || [];
+      } catch { /* 读不到就空着 */ }
+    }
     const userByEmail = new Map(marketUsers.map((u) => [u.email, u]));
 
     // 先把远端市场清单拉下来（作者邮箱、contact 都在那儿）
@@ -1309,12 +1497,52 @@ export async function activate(ctx) {
       if (!isOwner) return { ok: false, error: '只有市场所有者能标 official' };
     }
 
+    // ── 优先走 Worker 代写（2026-10-25）──
+    //
+    // 🔴 用户反馈：管理端点「审核通过」弹「没有 R2 凭据，无法修改线上清单」
+    //
+    // 根因：这里直接调 loadR2() 写 R2，而普通管理员（非市场所有者）
+    // 机器上没有 R2 密钥 —— 那不该是他们的负担。
+    //
+    // 现在先试 Worker：有 bridge 密钥或作者 token 就能改。
+    // 失败再退回直连 R2（本机所有者场景）。
+    const bridgeKeyT = readBridgeKey();
+    let selfToken = '';
+    try {
+      const tkFile = path.join(ctx.data.dir, 'market-token.txt');
+      if (fs.existsSync(tkFile)) selfToken = fs.readFileSync(tkFile, 'utf8').trim();
+    } catch { /* ignore */ }
+
+    if (bridgeKeyT || selfToken) {
+      try {
+        const headers = { 'content-type': 'application/json', 'User-Agent': UA };
+        if (bridgeKeyT) headers['x-bridge-key'] = bridgeKeyT;
+        if (selfToken) headers['authorization'] = 'Bearer ' + selfToken;
+        const res = await fetch('https://market.baiguang211.top/api/admin/trust', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ id, trust }),
+          signal: AbortSignal.timeout(30000),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok && d?.ok) {
+          cache = { at: 0, data: null, source: '', error: null };
+          ctx.log(`[市场] ${id} trust → ${trust}（Worker）`);
+          return { ok: true, id, trust, viaWorker: true };
+        }
+        // 非 401/404 才当作硬失败，否则往下走直连
+        if (res.status !== 401 && res.status !== 404) {
+          return { ok: false, error: d?.error || `Worker 返回 HTTP ${res.status}` };
+        }
+      } catch { /* 网络失败，往下走 */ }
+    }
+
     const env = loadR2();
     if (!env) {
       return {
         ok: false,
-        error: '没有 R2 凭据，无法修改线上清单',
-        hint: '把 r2.env 放到 <项目根>/.secrets/market-r2/ 或配置 BG_R2_ENV'
+        error: '无法修改线上清单：既没有 R2 凭据，也无法通过市场服务修改',
+        hint: '请确认本机已登录作者账号（创造营 → 发布），或把 r2.env 放到 .secrets/market-r2/'
       };
     }
 
@@ -1336,11 +1564,96 @@ export async function activate(ctx) {
   }, { absolute: true });
 
   /** 管理员名单（2026-10-25） */
-  ctx.http.route('GET', '/api/market/admin/list', () => {
+  /**
+   * 市场写操作统一代理（2026-10-25）
+   *
+   * 🔴 用户反馈：作者点「发验证码」报 Failed to fetch。
+   *
+   * 根因：前端直连 https://market.baiguang211.top。
+   * 但市场列表走的是本机代理（/api/market/index），所以作者平时感觉不到；
+   * 一旦浏览器真要跨域直连，在某些网络环境下就直接失败
+   * （域名解析、CORS 预检、混合内容拦截都可能）。
+   *
+   * 修法：全部改走本机代理 —— 浏览器只跟本机说话，
+   * 由 Node 去连外部服务。这样任何网络环境都能用。
+   */
+  const proxyToCenter = async (path, payload, timeout = 30000) => {
+    try {
+      const r = await fetch(`https://market.baiguang211.top${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'User-Agent': UA },
+        body: JSON.stringify(payload || {}),
+        signal: AbortSignal.timeout(timeout),
+      });
+      const d = await r.json().catch(() => ({}));
+      return { ok: r.ok && d?.ok !== false, status: r.status, data: d };
+    } catch (e) {
+      return { ok: false, status: 0, data: { error: '连不上市场服务：' + String(e?.message ?? e).slice(0, 70) } };
+    }
+  };
+
+  /** 发验证码（代理） */
+  ctx.http.route('POST', '/api/market/send-code', async (_req, body) => {
+    const email = String(body?.email || '').trim().toLowerCase();
+    if (!email) return { ok: false, error: '缺少邮箱' };
+    const purpose = String(body?.purpose || 'submit');   // 默认投稿凭证
+    const r = await proxyToCenter('/api/send-code', { email, purpose });
+    return r.data?.ok === false ? { ok: false, error: r.data.error } : { ok: true, message: r.data?.message || '验证码已发送' };
+  }, { absolute: true });
+
+  /** 用验证码换 token（代理） */
+  ctx.http.route('POST', '/api/market/login-email', async (_req, body) => {
+    const email = String(body?.email || '').trim().toLowerCase();
+    const code = String(body?.code || '').trim();
+    if (!email || !code) return { ok: false, error: '邮箱和验证码都要填' };
+    const r = await proxyToCenter('/api/login', { email, code });
+    if (!r.ok || !r.data?.token) {
+      return { ok: false, error: r.data?.error || '验证失败' };
+    }
+    // 顺手存下来，发布时后端直接用
+    try {
+      fs.mkdirSync(ctx.data.dir, { recursive: true });
+      fs.writeFileSync(path.join(ctx.data.dir, 'market-token.txt'), r.data.token, 'utf8');
+    } catch { /* ignore */ }
+    return { ok: true, token: r.data.token };
+  }, { absolute: true });
+
+  /** 投稿上传（代理） */
+  ctx.http.route('POST', '/api/market/submit-via-center', async (_req, body) => {
+    const r = await proxyToCenter('/api/submit', body, 120000);
+    return r.ok ? r.data : { ok: false, error: r.data?.error || `提交失败（HTTP ${r.status}）` };
+  }, { absolute: true });
+
+  /** 下载统计代理（2026-10-25）：转发到 Worker，避开浏览器跨域 */
+  ctx.http.route('GET', '/api/market/stats/downloads', async (_req, _b, url) => {
+    const g = requireAdmin();
+    if (!g.ok) return g;
+    const id = String(url?.searchParams?.get('id') || '');
+    try {
+      const qs = id ? `?id=${encodeURIComponent(id)}` : '';
+      const r = await fetch(`https://market.baiguang211.top/api/stats/downloads${qs}`, {
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(25000),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d?.ok === false) {
+        return { ok: false, error: d?.error || `HTTP ${r.status}` };
+      }
+      return d;
+    } catch (e) {
+      return { ok: false, error: '连不上统计服务：' + String(e?.message ?? e).slice(0, 60) };
+    }
+  }, { absolute: true });
+
+  ctx.http.route('GET', '/api/market/admin/list', async () => {
     const guard = requireAdmin();
     if (!guard.ok) return guard;
 
-    const adm = loadAdmin() || { admins: [] };
+    // 优先读中心；读不到退回本地
+    const remoteAdmins = await fetchRegistry('admins');
+    const adm = remoteAdmins
+      ? { admins: remoteAdmins }
+      : (loadAdmin() || { admins: [] });
     const users = (() => {
       try {
         const uf = path.join(ctx.root, 'data', 'market-users.json');
@@ -1358,8 +1671,17 @@ export async function activate(ctx) {
         return {
           email: a.email,
           since: a.since || '',
-          // 市场所有者（启用时自动设的），不能删
-          isOwner: a.auto === true,
+          // 市场所有者判定（2026-10-25 修）
+          //
+          // 中心 registry 里没有 auto 标记（那是本机旧概念的遗留）。
+          // 现在用更可靠的判断：谁是市场所有者 = ADMIN_EMAIL 的第一位，
+          // 也就是本机 whoAmI() 里 auto:true 的那位。
+          isOwner: (() => {
+            if (a.auto === true) return true;
+            const localAdm = loadAdmin() || { admins: [] };
+            const owner = (localAdm.admins || []).find((x) => x.auto === true);
+            return !!owner && owner.email === a.email;
+          })(),
           // 邮箱是否合法（历史脏数据：有人把 QQ 号填进邮箱框）
           valid: /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(String(a.email || '')),
           // 关联的用户档案（如果有）
@@ -1371,7 +1693,7 @@ export async function activate(ctx) {
     };
   }, { absolute: true });
 
-  ctx.http.route('POST', '/api/market/admin/set', (_req, body) => {
+  ctx.http.route('POST', '/api/market/admin/set', async (_req, body) => {
     const guard = requireAdmin();
     if (!guard.ok) return guard;
 
@@ -1390,27 +1712,55 @@ export async function activate(ctx) {
       return { ok: false, error: '请填邮箱（如 name@qq.com），不是 QQ 号' };
     }
 
-    const adm = loadAdmin() || { admins: [] };
-    if (remove) {
-      const before = (adm.admins || []).length;
-      adm.admins = (adm.admins || []).filter((a) => a.email !== email);
-      if (adm.admins.length === before) {
-        return { ok: false, error: `名单里没有 ${email}` };
-      }
-      // 不允许删掉最后一个管理员，否则没人能管市场
-      if (!adm.admins.length) {
-        return { ok: false, error: '不能删掉最后一个管理员（否则没人能管市场了）' };
-      }
-      saveAdmin(adm);
-      ctx.log(`[市场] 已取消管理员：${email}`);
-      return { ok: true, admins: adm.admins };
+    // 🔴 写中心名单（2026-10-25 修）
+    //
+    // 用户反馈：加 1934364876 报"已经是管理员了"，但列表里没有他。
+    //
+    // 根因：这里只读写**本机 admin.json**，而列表读的是**中心 registry**。
+    // 本机那份里确实有他（历史遗留），中心没有 —— 两边打架。
+    //
+    // 现在以中心为准：直接调 Worker 的 /api/registry/admins 增删。
+    const bridgeKeyA = readBridgeKey();
+    let adminToken = '';
+    try {
+      const tkFile = path.join(ctx.data.dir, 'market-token.txt');
+      if (fs.existsSync(tkFile)) adminToken = fs.readFileSync(tkFile, 'utf8').trim();
+    } catch { /* ignore */ }
+
+    if (!bridgeKeyA && !adminToken) {
+      return { ok: false, error: '需要登录作者账号后再操作（无法连接市场服务）' };
     }
-    if ((adm.admins || []).some((a) => a.email === email)) {
-      return { ok: false, error: '已经是管理员了' };
+    try {
+      const headers = { 'content-type': 'application/json', 'User-Agent': UA };
+      if (bridgeKeyA) headers['x-bridge-key'] = bridgeKeyA;
+      if (adminToken) headers['authorization'] = 'Bearer ' + adminToken;
+      const res = await fetch('https://market.baiguang211.top/api/registry/admins', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ email, remove }),
+        signal: AbortSignal.timeout(30000),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok || d?.ok === false) {
+        return { ok: false, error: d?.error || `市场服务返回 HTTP ${res.status}` };
+      }
+      // 顺手同步到本机文件，保持离线也能判断身份
+      try {
+        const adm2 = loadAdmin() || { admins: [] };
+        if (remove) {
+          adm2.admins = (adm2.admins || []).filter((a) => a.email !== email);
+        } else if (!(adm2.admins || []).some((a) => a.email === email)) {
+          adm2.admins = [...(adm2.admins || []), { email, since: new Date().toISOString() }];
+        }
+        saveAdmin(adm2);
+      } catch { /* 本地同步失败不影响主流程 */ }
+      ctx.log(`[市场] ${remove ? '已取消' : '新增'}管理员：${email}（中心）`);
+      return { ok: true, admins: d.admins || [], viaCenter: true };
+    } catch (e) {
+      return { ok: false, error: '连不上市场服务：' + String(e?.message ?? e).slice(0, 60) };
     }
-    adm.admins = [...(adm.admins || []), { email, since: new Date().toISOString() }];
-    saveAdmin(adm);
-    ctx.log(`[市场] 新增管理员：${email}`);
+
+    /* 老的本机逻辑保留在下面作参考，不再执行 */
     return { ok: true, admins: adm.admins };
   }, { absolute: true });
 
@@ -1418,6 +1768,68 @@ export async function activate(ctx) {
   // ── 管理员：查看内核反馈（2026-10-25）──
   //
   // 普通作者只能看自己提交的；管理员能看全部，并可标记状态。
+  // ── 插件反馈（多附件，2026-10-25）──
+  //
+  // 用户要求："注册用户点击反馈按钮，出弹窗，可以提交 0-3 张图片
+  // 和 0-3 个日志或 md 文件，及文字描述内容"
+  ctx.http.route('POST', '/api/market/feedback/rich', async (_req, body) => {
+    const w = whoAmI();
+    if (w.role === 'guest' || !w.me?.email) {
+      return { ok: false, error: '请先注册或登录作者账号' };
+    }
+    let fbm;
+    try {
+      fbm = await import('../../src/feedback.js');
+    } catch {
+      return { ok: false, error: '当前内核版本不支持反馈（缺少 src/feedback.js）' };
+    }
+    if (typeof fbm.submitFeedbackRich !== 'function') {
+      return { ok: false, error: '当前内核版本的反馈模块太旧，请升级内核' };
+    }
+    const r = fbm.submitFeedbackRich(w.me, {
+      type: body?.type,
+      title: body?.title,
+      body: body?.body,
+      images: body?.images,
+      // 日志与文档分开（2026-10-26）
+      logFiles: body?.logFiles,
+      docFiles: body?.docFiles,
+      files: body?.files,   // 兼容老格式
+      pluginId: body?.pluginId,
+      pluginName: body?.pluginName,
+      pluginVersion: body?.pluginVersion,
+    });
+    if (r.ok) ctx.log(`[市场] 收到反馈 ${r.id}：${String(body?.title || '').slice(0, 30)}`);
+    return r;
+  }, { absolute: true });
+
+  /**
+   * 我的反馈列表（2026-10-25）
+   *
+   * 用户要求："插件反馈的列表在发布栏里看吧，你放到管理栏的话有些作者没权限"
+   *
+   * 完全正确 —— /api/market/admin/feedback 有 requireAdmin()，
+   * 普通作者点进去只会 403。作者该能看**自己提交过什么、处理到哪一步**。
+   */
+  ctx.http.route('GET', '/api/market/feedback/mine', async () => {
+    const w = whoAmI();
+    if (w.role === 'guest' || !w.me?.email) {
+      return { ok: false, error: '请先注册或登录作者账号' };
+    }
+    let fbm;
+    try {
+      fbm = await import('../../src/feedback.js');
+    } catch {
+      return { ok: false, error: '当前内核版本不支持反馈' };
+    }
+    const mine = fbm.listFeedback({ email: w.me.email, all: false });
+    return {
+      ok: true,
+      total: mine.length,
+      items: mine.map(({ dir, ...rest }) => rest),   // 不暴露服务器路径
+    };
+  }, { absolute: true });
+
   ctx.http.route('GET', '/api/market/admin/feedback', async (_req, _b, url) => {
     const g = requireAdmin();
     if (!g.ok) return g;
@@ -1524,17 +1936,116 @@ export async function activate(ctx) {
   // 修法：同时读两边，合并展示。
   //   · Worker 的 /api/bridge/pending（共享密钥认证）
   //   · 本地队列（旧路径，保留兼容）
-  const BRIDGE_KEY_FILE = '/home/lyy/.secrets/market-bridge/bridge.key';
+  // 🔴 bridge 密钥查找（2026-10-25 修）
+  //
+  // 原来写死 '/home/lyy/.secrets/market-bridge/bridge.key' ——
+  // 那是**我这台机器**的路径。别的管理员在自己机器上跑，
+  // 根本没这个文件，于是拉不到待审列表，界面永远"没有投稿"。
+  //
+  // 现在按优先级找：
+  //   ① 环境变量 QQAGENT_BRIDGE_KEY（部署时注入）
+  //   ② 插件数据目录 data/plugins/plugin-market/bridge.key（随插件走）
+  //   ③ ~/.secrets/market-bridge/bridge.key（本机开发）
+  //   ④ 老路径（兼容已部署的）
   const readBridgeKey = () => {
-    try { return fs.readFileSync(BRIDGE_KEY_FILE, 'utf8').trim(); } catch { return ''; }
+    const cands = [];
+    if (process.env.QQAGENT_BRIDGE_KEY) return String(process.env.QQAGENT_BRIDGE_KEY).trim();
+    cands.push(path.join(ctx.data.dir, 'bridge.key'));
+    cands.push(path.join(os.homedir(), '.secrets', 'market-bridge', 'bridge.key'));
+    cands.push('/home/lyy/.secrets/market-bridge/bridge.key');
+    for (const f of cands) {
+      try {
+        const k = fs.readFileSync(f, 'utf8').trim();
+        if (k) return k;
+      } catch { /* 试下一个 */ }
+    }
+    return '';
   };
 
-  const fetchRemotePending = async () => {
+  /**
+   * 用本机登录的作者身份换一张市场 token（2026-10-25）
+   * 有 bridge 密钥时走 bridge，没有就走 auth 中心的验证码（但需要交互）
+   * 实测：bridge 缺失时这里会返回 null，界面提示需要配置
+   */
+  const fetchMarketToken = async (me) => {
+    if (!me?.email) return null;
+
+    // ① 有 bridge 密钥 → 直接向 Worker 换（本机所有者，最快）
     const key = readBridgeKey();
-    if (!key) return { ok: false, error: '未配置 bridge 密钥', items: [] };
+    if (key) {
+      try {
+        const r = await fetch('https://market.baiguang211.top/api/bridge/token', {
+          method: 'POST',
+          headers: { 'x-bridge-key': key, 'content-type': 'application/json', 'User-Agent': UA },
+          body: JSON.stringify({ email: me.email, qq: me.qq || '', nickname: me.nickname || '' }),
+          signal: AbortSignal.timeout(20000),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (d?.ok && d.token) return d.token;
+      } catch { /* 落到下面 */ }
+    }
+
+    // ② 没密钥（普通作者）→ 走本机 /submit-token
+    //    它内部会用本机 bridge 密钥代签；没有则返回 null，
+    //    界面会提示走「邮箱验证码换凭证」那条公开路径。
     try {
-      const r = await fetch('https://market.baiguang211.top/api/bridge/pending', {
-        headers: { 'x-bridge-key': key, 'User-Agent': UA },
+      const r = await fetch('http://127.0.0.1:3210/api/market/submit-token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'User-Agent': UA },
+        body: '{}',
+        signal: AbortSignal.timeout(20000),
+      });
+      const d = await r.json().catch(() => ({}));
+      return d?.ok && d.token ? d.token : null;
+    } catch { return null; }
+  };
+
+  /**
+   * 用投稿凭证（token）发布到市场 —— 任何作者都能走（2026-10-25）
+   *
+   * 这是 Worker /api/publish 的正路：不需要 R2 密钥，不需要 bridge，
+   * 只要一张有效的投稿 token（邮箱验证码就能换）。
+   */
+  const publishViaWorker = async (payload) => {
+    try {
+      const res = await fetch('https://market.baiguang211.top/api/publish', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'User-Agent': UA },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(120000),
+      });
+      const d = await res.json().catch(() => ({}));
+      return res.ok && d?.ok ? { ok: true, filename: d.filename, item: d.published }
+        : { ok: false, reason: d?.error || `HTTP ${res.status}` };
+    } catch (e) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 80) };
+    }
+  };
+
+
+
+  const fetchRemotePending = async () => {
+    // 两条路：管理员 token（任何人可用）/ bridge 密钥（仅本机所有者）
+    const key = readBridgeKey();
+    let url = '';
+    let headers = { 'User-Agent': UA };
+    if (key) {
+      url = 'https://market.baiguang211.top/api/bridge/pending';
+      headers['x-bridge-key'] = key;
+    } else {
+      // 没有 bridge 密钥 → 用本机登录的管理员身份换 token 试试
+      const w = whoAmI();
+      if (w.role !== 'admin' || !w.me?.email) {
+        return { ok: false, error: '需要管理员身份（且本机未配置 bridge 密钥）', items: [] };
+      }
+      const tk = await fetchMarketToken(w.me);
+      if (!tk) return { ok: false, error: '无法获取审核凭证', items: [] };
+      url = 'https://market.baiguang211.top/api/pending';
+      headers['authorization'] = 'Bearer ' + tk;
+    }
+    try {
+      const r = await fetch(url, {
+        headers,
         signal: AbortSignal.timeout(25000),
       });
       const d = await r.json().catch(() => ({}));
@@ -1590,28 +2101,64 @@ export async function activate(ctx) {
   //
   // 本机会先确认"这个 email 确实在本机登录过"，再去向 Worker 换 token。
   // 所以这条路只有真正登录的人能走通 —— 不能凭空拿到投稿凭证。
+  /** 保存投稿凭证（2026-10-25）：前端换到 token 后存本机，发布时后端直接用 */
+  ctx.http.route('POST', '/api/market/submit-token/save', async (_req, body) => {
+    const tk = String(body?.token || '').trim();
+    if (!tk) return { ok: false, error: '缺少 token' };
+    try {
+      fs.mkdirSync(ctx.data.dir, { recursive: true });
+      fs.writeFileSync(path.join(ctx.data.dir, 'market-token.txt'), tk, 'utf8');
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String(e?.message ?? e) };
+    }
+  }, { absolute: true });
+
   ctx.http.route('POST', '/api/market/submit-token', async () => {
     const w = whoAmI();
     if (w.role === 'guest' || !w.me?.email) {
       return { ok: false, error: '请先注册或登录作者账号' };
     }
 
+    // 两条路（2026-10-25 修）：
+    //   ① 本机有 bridge 密钥 → 直接向 Worker 换（市场所有者机器）
+    //   ② 没有密钥（普通作者）→ 向中心服务换。中心有密钥，
+    //      且只给"已登记过的邮箱"签发 —— 所以伪造不了。
+    //
+    // 用户反馈的 "Failed to fetch" 就是因为原来只走 ①，
+    // 普通作者机器上一路撞墙。
     const key = readBridgeKey();
-    if (!key) return { ok: false, error: '未配置 bridge 密钥' };
 
+    if (key) {
+      try {
+        const res = await fetch('https://market.baiguang211.top/api/bridge/token', {
+          method: 'POST',
+          headers: { 'x-bridge-key': key, 'content-type': 'application/json', 'User-Agent': UA },
+          body: JSON.stringify({ email: w.me.email, qq: w.me.qq || '', nickname: w.me.nickname || '' }),
+          signal: AbortSignal.timeout(25000),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok && d?.ok && d.token) {
+          ctx.log(`[市场] 已为 ${w.me.email} 代签投稿凭证（本机密钥）`);
+          return { ok: true, token: d.token, email: w.me.email };
+        }
+      } catch { /* 落到中心那条路 */ }
+    }
+
+    // ② 走中心服务
     try {
-      const res = await fetch('https://market.baiguang211.top/api/bridge/token', {
+      const res = await fetch(`${CENTER_URL()}/market-token`, {
         method: 'POST',
-        headers: { 'x-bridge-key': key, 'content-type': 'application/json', 'User-Agent': UA },
-        body: JSON.stringify({ email: w.me.email, qq: w.me.qq || '', nickname: w.me.nickname || '' }),
+        headers: { 'content-type': 'application/json', 'User-Agent': UA },
+        body: JSON.stringify({ email: w.me.email }),
         signal: AbortSignal.timeout(25000),
       });
       const d = await res.json().catch(() => ({}));
-      if (!res.ok || !d?.ok) {
-        return { ok: false, error: d?.error || `换凭证失败（HTTP ${res.status}）` };
+      if (res.ok && d?.ok && d.token) {
+        ctx.log(`[市场] 已为 ${w.me.email} 从中心获取投稿凭证`);
+        return { ok: true, token: d.token, email: w.me.email };
       }
-      ctx.log(`[市场] 已为 ${w.me.email} 代签投稿凭证`);
-      return { ok: true, token: d.token, email: w.me.email };
+      return { ok: false, error: d?.error || `换凭证失败（HTTP ${res.status}）` };
     } catch (e) {
       return { ok: false, error: '连不上投稿服务：' + String(e?.message ?? e).slice(0, 60) };
     }
@@ -1809,19 +2356,195 @@ export async function activate(ctx) {
     return { ok: true, id, ...patch };
   }, { absolute: true });
 
+  /**
+   * 发布前体检（2026-10-26）
+   *
+   * 三道闸，按"能不能自动判断"分层：
+   *   ① 必填字段   —— 缺了直接拒绝，没有商量余地
+   *   ② 版本递增   —— 与市场现有版本比，不递增就拒绝（防"发了跟没发一样"）
+   *   ③ 敏感信息   —— 扫包内文本，命中就拒绝并报出位置
+   *
+   * 为什么 ③ 要拒绝而不是仅提示：
+   *   发到市场上就是公开的。QQ 号、服务器 IP、API key 一旦泄露，
+   *   撤回也来不及（别人可能已经下了）。宁可让作者改完再发。
+   *   确实需要（比如文档里本来就要写公网地址）可以传 force 跳过。
+   */
+  const preflightCheck = async (id, pkg, opts = {}) => {
+    const force = opts.force === true;
+    const issues = [];       // 硬错误
+    const warns = [];        // 提醒（不拦）
+
+    // ① 必填字段
+    let mf = {};
+    try {
+      mf = JSON.parse(fs.readFileSync(path.join(ctx.root, 'plugins', id, 'manifest.json'), 'utf8'));
+    } catch {
+      return { ok: false, error: '读不到 manifest.json，无法体检' };
+    }
+    for (const k of ['id', 'version', 'name']) {
+      if (!String(mf[k] || '').trim()) issues.push(`manifest 缺 ${k}`);
+    }
+    if (mf.id && mf.id !== id) issues.push(`manifest.id（${mf.id}）与要发布的 id（${id}）不一致`);
+    if (!/^\d+\.\d+\.\d+/.test(String(mf.version || ''))) {
+      issues.push(`版本号格式不对（${mf.version}），应形如 1.2.3`);
+    }
+
+    // ② 版本递增（与市场现状比）
+    if (!force) {
+      try {
+        const { idx } = await fetchRemoteIndex();
+        const cur = (idx.plugins || []).find((p) => p.id === id);
+        if (cur && cmpVer(String(mf.version), String(cur.version)) <= 0) {
+          issues.push(`版本没有递增：市场已是 v${cur.version}，这次是 v${mf.version}。改个版本号再发，或传 force 强制覆盖。`);
+        }
+      } catch { /* 拉不到远端就不拦（离线发布场景） */ }
+    }
+
+    // ③ 敏感信息扫描
+    //
+    // 扫的是**包内所有文本文件**，不是源码目录 ——
+    // 因为打包过程会注入 config.json，那里也可能带出密钥。
+    const SECRET_RULES = [
+      { name: 'QQ 号',     re: /\b[1-9]\d{4,11}\b/g,            level: 'warn' },   // 太容易误报，只提醒
+      { name: 'API Key',   re: /sk-[A-Za-z0-9]{16,}/g,            level: 'error' },
+      { name: 'Token',     re: /\b(?:ghp|gho|ghs)_[A-Za-z0-9]{20,}/g, level: 'error' },
+      { name: 'AWS 密钥',  re: /AKIA[0-9A-Z]{16}/g,               level: 'error' },
+      { name: '私钥',      re: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, level: 'error' },
+      { name: '内网 IP',   re: /\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b/g, level: 'warn' },
+      { name: '密码字段',  re: /["']?(?:password|passwd|apiKey|secret)["']?\s*[:=]\s*["'][^"']{6,}["']/gi, level: 'error' },
+    ];
+
+    const hits = [];
+    try {
+      const buf = fs.readFileSync(pkg.packagePath);
+      // 解压看内容（tar.gz）
+      const zlib = await import('node:zlib');
+      const tar = zlib.gunzipSync(buf);
+      // 极简 tar 遍历：只扫文本文件
+      let off = 0;
+      const TEXT_EXT = /(?:^|\/)[^/]+\.(js|json|md|txt|yml|yaml|html|css|sh|py)$/i;
+      while (off + 512 <= tar.length) {
+        const hd = tar.subarray(off, off + 512);
+        if (hd.every((b) => b === 0)) break;
+        const name = hd.subarray(0, 100).toString('utf8').replace(/\0.*$/, '');
+        if (!name) break;
+        const size = parseInt(hd.subarray(124, 136).toString('ascii').replace(/\0.*$/, '').trim() || '0', 8);
+        const ds = off + 512;
+        if (size > 0 && size < 512 * 1024 && TEXT_EXT.test(name)) {
+          const content = tar.subarray(ds, ds + size).toString('utf8');
+          for (const rule of SECRET_RULES) {
+            const found = content.match(rule.re);
+            if (found && found.length) {
+              // 只报前 2 个样例，且**脱敏**（不把密钥本身写进日志）
+              const samples = [...new Set(found)].slice(0, 2).map((s) => {
+                const str = String(s);
+                return str.length > 10 ? str.slice(0, 4) + '***' + str.slice(-2) : str.slice(0, 2) + '***';
+              });
+              hits.push({
+                level: rule.level,
+                kind: rule.name,
+                file: name,
+                count: found.length,
+                samples,
+              });
+            }
+          }
+        }
+        off = ds + Math.ceil(size / 512) * 512;
+      }
+    } catch (e) {
+      warns.push('敏感信息扫描未能完成：' + String(e?.message ?? e).slice(0, 60));
+    }
+
+    const errors = hits.filter((h) => h.level === 'error');
+    if (errors.length && !force) {
+      const lines = errors.slice(0, 5).map((h) =>
+        `  · ${h.kind} ×${h.count}  在 ${h.file}（样例 ${h.samples.join('、')}）`);
+      return {
+        ok: false,
+        error: `体检未通过：包里有 ${errors.length} 处敏感信息，发到市场就公开了。\n\n${lines.join('\n')}\n\n改掉再发；确实要发就带 force。`,
+        preflight: { errors, warns, hits },
+      };
+    }
+    const warnHits = hits.filter((h) => h.level === 'warn');
+    if (warnHits.length) {
+      warns.push(...warnHits.slice(0, 3).map((h) => `${h.kind} ×${h.count} 在 ${h.file}`));
+    }
+
+    if (issues.length) {
+      return { ok: false, error: '体检未通过：\n' + issues.map((x) => '  · ' + x).join('\n'), preflight: { issues, warns } };
+    }
+
+    if (warns.length) ctx.log(`[市场] ${id} 体检提醒：${warns.slice(0, 3).join('; ')}`);
+    return { ok: true, preflight: { issues: [], warns, hits } };
+  };
+
   /** 发布：打包 + 记录 */
   ctx.http.route('POST', '/api/market/myplugins/publish', async (_req, body) => {
     const id = String(body?.id || '');
     const changelog = String(body?.changelog || '').trim().slice(0, 2000);
     if (!id) return { ok: false, error: '缺少插件 id' };
+    // 变更说明必填（2026-10-26）：市场用户装完得知道变了什么
+    if (!changelog) {
+      return { ok: false, error: '请填写「这次改了什么」—— 市场里的用户要靠它知道更新了什么' };
+    }
 
     // 🔴 只有作者能发布
     const own = checkOwner(id);
     if (!own.ok) return own;
 
-    // 复用打包接口
-    let pkg;
+    // ── 复用已打包的文件（2026-10-26）──
+    //
+    // 外部建议：现在只能"点发布 → 现场打包"，没法指定已经打好的包。
+    // 场景：想先本地验证包、包很大不想重复打、分步发布。
+    //
+    // 安全：basename 限制在 packages 目录内（防路径穿越），
+    //      并且后面体检会校验包内 manifest.id 与要发的 id 一致。
+    const useFile = String(body?.file || '').trim();
+    let pkgFromFile = null;
+    if (useFile) {
+      const safe = path.basename(useFile);
+      const p = path.join(ctx.data.dir, 'packages', safe);
+      if (!fs.existsSync(p)) return { ok: false, error: `包不存在：${safe}` };
+      const buf = fs.readFileSync(p);
+      // 从包内 manifest 提元信息（不信任文件名）
+      let meta = {};
+      try {
+        const zlib = await import('node:zlib');
+        const tar = zlib.gunzipSync(buf);
+        const hd = tar.subarray(0, 512);
+        const nm = hd.subarray(0, 100).toString('utf8').replace(/\0.*$/, '');
+        const sz = parseInt(hd.subarray(124, 136).toString('ascii').replace(/\0.*$/, '').trim() || '0', 8);
+        if (/manifest\.json$/.test(nm)) {
+          meta = JSON.parse(tar.subarray(512, 512 + sz).toString('utf8'));
+        }
+      } catch { /* 提不出来就靠体检拦 */ }
+      if (meta.id && meta.id !== id) {
+        return { ok: false, error: `包里的插件是「${meta.id}」，与要发布的「${id}」不一致` };
+      }
+      const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+      const pkgDirect = {
+        ok: true,
+        packagePath: p,
+        filename: safe,
+        sizeText: `${(buf.length / 1024).toFixed(1)} KB`,
+        market: {
+          id, version: String(meta.version || ''), name: meta.name || id,
+          author: meta.author || '', summary: meta.summary || '',
+          description: meta.description || '', category: meta.category || '',
+          permissions: meta.permissions || [], scopes: meta.scopes || [],
+          apiVersion: meta.apiVersion || 1, sha256, size: buf.length,
+        },
+        warnings: [],
+      };
+      ctx.log(`[市场] ${id} 使用已打包文件 ${safe}（${pkgDirect.sizeText}）`);
+      pkgFromFile = pkgDirect;
+    }
+
+    // 复用打包接口（指定了文件就跳过打包）
+    let pkg = pkgFromFile;
     try {
+      if (pkgFromFile) { /* 已有包，不重复打包 */ } else {
       // 自动判断要不要剥离素材：先按原样打，超 5MB 就改剥离版
       //
       // 为什么自动而不是让用户选：
@@ -1845,10 +2568,26 @@ export async function activate(ctx) {
         pkg0 = await res.json();
       }
       pkg = pkg0;
+      }
     } catch (e) {
       return { ok: false, error: '打包失败：' + String(e?.message ?? e) };
     }
     if (!pkg?.ok) return { ok: false, error: pkg?.error || '打包失败' };
+
+    // ── 发布前体检（2026-10-26）──
+    //
+    // 外部建议：现在流程是"打包 → 直接上传"，出问题只靠作者肉眼。
+    // 三道闸：必填字段 / 版本递增 / **敏感信息扫描**。
+    //
+    // 第三条最实用 —— 作者在自己机器上打包，很容易把测试账号、
+    // 内网地址、API key 带出去，而这些东西一旦上市场就是公开的。
+    //
+    // 策略：
+    //   · 硬错误（缺 id/version）→ 拒绝发布
+    //   · 敏感信息 → **拒绝**，但给出具体位置，作者确认后可带 force 跳过
+    //   · 版本未递增 → 拒绝（除非 force）
+    const pre = await preflightCheck(id, pkg, { force: body?.force === true });
+    if (!pre.ok) return pre;
 
     // 记一条发布记录
     const db = loadPublished();
@@ -1872,9 +2611,98 @@ export async function activate(ctx) {
     // 现在一次做完：传包 → 改 index → 推回 R2。
     let remote = { ok: false, reason: '未尝试' };
     try {
+      // ── 优先走 Worker 代上传（2026-10-25）──
+      //
+      // 🔴 用户反馈：作者点「发布到市场」报「未配置 R2 凭据」
+      //
+      // 根因：本机直接调 loadR2() 读写 R2，但普通作者的机器
+      // 根本没有 R2 密钥（也不该有）—— 那是市场所有者的凭据。
+      //
+      // 现在先试 Worker 代理：有网络就能发，不依赖本地凭据。
+      // 失败再退回直连 R2（本机所有者场景）。
+      const meNow = whoAmI().me || {};
+      const pkgBuf = fs.readFileSync(pkg.packagePath);
+      let viaWorker = { ok: false };
+
+      // 拿凭证，三条路按顺序试：
+      //   ① 界面已存的投稿 token（作者用邮箱验证码换的，最通用）
+      //   ② bridge 密钥（本机所有者）
+      //   ③ 本机代签（bridge 存在时可用）
+      let pubToken = '';
+      const bridgeKey = readBridgeKey();
+
+      // 读本机存的 token，**先检查有没有过期**
+      // 不检查的话会拿着过期 token 去发，报"token 无效"，
+      // 用户以为要重新登录，实际只是过期了。
+      const tokenExpired = (tk) => {
+        try {
+          const parts = String(tk || '').split('.');
+          if (parts.length !== 2) return true;
+          let b = parts[0].replace(/-/g, '+').replace(/_/g, '/');
+          while (b.length % 4) b += '=';
+          const bin = Buffer.from(b, 'base64').toString('binary');
+          const bytes = Buffer.from(bin, 'binary');
+          const payload = JSON.parse(bytes.toString('utf8'));
+          return !payload?.exp || payload.exp <= Date.now();
+        } catch { return true; }
+      };
+
+      try {
+        const tkFile = path.join(ctx.data.dir, 'market-token.txt');
+        if (fs.existsSync(tkFile)) {
+          const tk = fs.readFileSync(tkFile, 'utf8').trim();
+          if (tk && !tokenExpired(tk)) pubToken = tk;
+        }
+      } catch { /* ignore */ }
+      if (!pubToken && !bridgeKey) {
+        const tk = await fetchMarketToken(meNow);
+        if (tk) pubToken = tk;
+      }
+
+      if (bridgeKey || pubToken) {
+        try {
+          const headers = { 'content-type': 'application/json', 'User-Agent': UA };
+          if (bridgeKey) headers['x-bridge-key'] = bridgeKey;
+          if (pubToken) headers['authorization'] = 'Bearer ' + pubToken;
+          const res = await fetch('https://market.baiguang211.top/api/publish', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              id,
+              version: rec.version,
+              base64: pkgBuf.toString('base64'),
+              // 更新说明（2026-10-26）：市场详情页要显示这版改了什么
+              changelog: rec.changelog || '',
+              author: meNow.nickname || meNow.email || '',
+              qq: meNow.qq || '',
+              email: meNow.email || '',
+            }),
+            signal: AbortSignal.timeout(120000),
+          });
+          const d = await res.json().catch(() => ({}));
+          if (res.ok && d?.ok) {
+            viaWorker = { ok: true, filename: d.filename, item: d.published };
+          } else {
+            viaWorker = { ok: false, reason: d?.error || `HTTP ${res.status}` };
+          }
+        } catch (e) {
+          viaWorker = { ok: false, reason: String(e?.message ?? e).slice(0, 80) };
+        }
+      }
+
+      if (viaWorker.ok) {
+        cache = { at: 0, data: null, source: '', error: null };
+        remote = { ok: true, filename: viaWorker.filename };
+        ctx.log(`[市场] ${id} v${rec.version} 已通过 Worker 发布`);
+      } else {
       const env = loadR2();
       if (!env) {
-        remote = { ok: false, reason: '未配置 R2 凭据' };
+        remote = {
+          ok: false,
+          reason: viaWorker.reason
+            ? `Worker 发布失败：${viaWorker.reason}`
+            : '未配置发布凭证（请先登录作者账号）',
+        };
       } else {
         // ① 传包（带内容哈希后缀，避开 CDN 缓存）
         const buf = fs.readFileSync(pkg.packagePath);
@@ -1926,8 +2754,48 @@ export async function activate(ctx) {
         remote.filename = fname;
         remote.download = download;
       }
+      }   // ← 关闭 viaWorker.ok 的 else
     } catch (e) {
       remote = { ok: false, reason: String(e?.message ?? e).slice(0, 150) };
+    }
+
+    // ── 发布成功后自动装回本地（2026-10-26）──
+    //
+    // 外部建议：发布后本地还是旧版本，容易"发出去了自己没更新"。
+    // 三个好处：
+    //   ① 保证市场版本 == 本机版本
+    //   ② 顺带验证包能不能装（装不上说明包坏了，当场发现）
+    //   ③ 作者省一步手动操作
+    //
+    // 用**刚打出来的那个包**装，不是从市场下载 ——
+    // 市场清单有缓存，刚发的可能还拉不到。
+    let selfInstalled = { ok: false, reason: '未尝试' };
+    if (remote.ok) {
+      try {
+        const buf = fs.readFileSync(pkg.packagePath);
+        const res = await fetch('http://127.0.0.1:3210/api/plugins/import', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'User-Agent': UA },
+          // keepLocalConfig：**不要**用包里的默认配置覆盖本地真实配置
+          // （2026-10-26 修：发布后装回会把 API Key 清空）
+          body: JSON.stringify({
+            base64: buf.toString('base64'),
+            mode: 'replace',
+            keepLocalConfig: true,
+          }),
+          signal: AbortSignal.timeout(60000),
+        });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok && d?.ok !== false) {
+          selfInstalled = { ok: true };
+          ctx.log(`[市场] ${id} 已同步装回本地（保留本地配置）`);
+        } else {
+          selfInstalled = { ok: false, reason: d?.error || `HTTP ${res.status}` };
+          ctx.log(`[市场] ${id} 装回本地失败：${selfInstalled.reason}`);
+        }
+      } catch (e) {
+        selfInstalled = { ok: false, reason: String(e?.message ?? e).slice(0, 80) };
+      }
     }
 
     ctx.log(`[市场] ${id} v${rec.version} ${remote.ok ? '已发布到市场' : '打包完成但上传失败：' + remote.reason}`);
@@ -1937,7 +2805,10 @@ export async function activate(ctx) {
       packagePath: pkg.packagePath,
       filename: pkg.filename,
       sizeText: pkg.sizeText,
-      warnings: pkg.warnings || [],
+      // 合并两处警告：打包体积预警 + 体检提醒
+      warnings: [...(pkg.warnings || []), ...((pre.preflight && pre.preflight.warns) || [])],
+      preflight: pre.preflight || null,
+      selfInstalled,
       remote,
       note: remote.ok
         ? `已发布到市场（${(rec.size/1024).toFixed(1)}KB），别人现在能装到了。`
@@ -2008,6 +2879,144 @@ export async function activate(ctx) {
     };
   }, { absolute: true });
 
+  // ── 版本历史与一键回退（2026-10-26）──
+  //
+  // 用户要求："做吧一键回退"
+  //
+  // 转发到 Worker（它有 R2 权限，能列出 packages/ 下的历史包）。
+  ctx.http.route('GET', '/api/market/myplugins/versions', async (_req, _b, url) => {
+    const own = requireAdmin();
+    const id = String(url?.searchParams?.get('id') || '').trim();
+    if (!id) return { ok: false, error: '缺少插件 id' };
+    // 作者能看自己的，管理员能看全部
+    if (!own.ok) {
+      const o = checkOwner(id);
+      if (!o.ok) return o;
+    }
+    try {
+      const r = await fetch(`https://market.baiguang211.top/api/versions?id=${encodeURIComponent(id)}`, {
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(25000),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d?.ok === false) return { ok: false, error: d?.error || `HTTP ${r.status}` };
+      return d;
+    } catch (e) {
+      return { ok: false, error: '连不上市场服务：' + String(e?.message ?? e).slice(0, 60) };
+    }
+  }, { absolute: true });
+
+  /** 删除历史版本包（支持批量，2026-10-26） */
+  ctx.http.route('POST', '/api/market/myplugins/delete-versions', async (_req, body) => {
+    const id = String(body?.id || '').trim();
+    const versions = Array.isArray(body?.versions)
+      ? body.versions.map((x) => String(x || '').trim()).filter(Boolean)
+      : (body?.version ? [String(body.version).trim()] : []);
+    if (!id) return { ok: false, error: '缺少插件 id' };
+    if (!versions.length) return { ok: false, error: '请选择要删除的版本' };
+
+    const own = checkOwner(id);
+    if (!own.ok) return own;
+
+    const key = readBridgeKey();
+    let pubToken = '';
+    try {
+      const tkFile = path.join(ctx.data.dir, 'market-token.txt');
+      if (fs.existsSync(tkFile)) pubToken = fs.readFileSync(tkFile, 'utf8').trim();
+    } catch { /* ignore */ }
+    if (!key && !pubToken) return { ok: false, error: '需要登录作者账号后再操作' };
+
+    try {
+      const headers = { 'content-type': 'application/json', 'User-Agent': UA };
+      if (key) headers['x-bridge-key'] = key;
+      if (pubToken) headers['authorization'] = 'Bearer ' + pubToken;
+      const r = await fetch('https://market.baiguang211.top/api/delete-version', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ id, versions, token: pubToken }),
+        signal: AbortSignal.timeout(90000),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d?.ok === false) {
+        return { ok: false, error: d?.error || `HTTP ${r.status}`, skipped: d?.skipped };
+      }
+      ctx.log(`[市场] ${id} 删除 ${d.deleted?.length || 0} 个历史包，释放 ${((d.freed || 0)/1024/1024).toFixed(1)}MB`);
+      return d;
+    } catch (e) {
+      return { ok: false, error: '连不上市场服务：' + String(e?.message ?? e).slice(0, 60) };
+    }
+  }, { absolute: true });
+
+  ctx.http.route('POST', '/api/market/myplugins/rollback', async (_req, body) => {
+    const id = String(body?.id || '').trim();
+    const version = String(body?.version || '').trim();
+    if (!id || !version) return { ok: false, error: '缺少 id 或 version' };
+
+    const own = checkOwner(id);
+    if (!own.ok) return own;
+
+    const key = readBridgeKey();
+    let pubToken = '';
+    try {
+      const tkFile = path.join(ctx.data.dir, 'market-token.txt');
+      if (fs.existsSync(tkFile)) pubToken = fs.readFileSync(tkFile, 'utf8').trim();
+    } catch { /* ignore */ }
+
+    if (!key && !pubToken) {
+      return { ok: false, error: '需要登录作者账号后再操作' };
+    }
+
+    try {
+      const headers = { 'content-type': 'application/json', 'User-Agent': UA };
+      if (key) headers['x-bridge-key'] = key;
+      if (pubToken) headers['authorization'] = 'Bearer ' + pubToken;
+      const r = await fetch('https://market.baiguang211.top/api/rollback', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ id, version, token: pubToken }),
+        signal: AbortSignal.timeout(60000),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d?.ok === false) return { ok: false, error: d?.error || `HTTP ${r.status}` };
+
+      cache = { at: 0, data: null, source: '', error: null };   // 清单变了，清缓存
+
+      // ── 回退后自动装回本地（与发布对称）──
+      // 否则市场是旧版、本机还是坏掉的新版，"回退"等于没做完。
+      let selfInstalled = { ok: false, reason: '未尝试' };
+      try {
+        const dl = d.item?.download;
+        if (dl) {
+          const pr = await fetch(dl, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(60000) });
+          if (pr.ok) {
+            const buf = Buffer.from(await pr.arrayBuffer());
+            const ir = await fetch('http://127.0.0.1:3210/api/plugins/import', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'User-Agent': UA },
+              body: JSON.stringify({
+                base64: buf.toString('base64'),
+                mode: 'replace',
+                keepLocalConfig: true,   // 回退也不该清配置
+              }),
+              signal: AbortSignal.timeout(60000),
+            });
+            const idd = await ir.json().catch(() => ({}));
+            selfInstalled = ir.ok && idd?.ok !== false
+              ? { ok: true }
+              : { ok: false, reason: idd?.error || `HTTP ${ir.status}` };
+          }
+        }
+      } catch (e) {
+        selfInstalled = { ok: false, reason: String(e?.message ?? e).slice(0, 60) };
+      }
+
+      ctx.log(`[市场] ${id} 回退 ${d.from} → ${d.to}${selfInstalled.ok ? '（已装回本地）' : ''}`);
+      return { ok: true, from: d.from, to: d.to, selfInstalled, item: d.item };
+    } catch (e) {
+      return { ok: false, error: '连不上市场服务：' + String(e?.message ?? e).slice(0, 60) };
+    }
+  }, { absolute: true });
+
   /** 某个插件是否已下架（给界面显示状态用） */
   const isUnpublished = (id, records) => {
     const latest = records.find((r) => r.id === id);
@@ -2036,15 +3045,7 @@ export async function activate(ctx) {
    *   market > local  → 可更新（别人发了新版）
    *   local  > market → 有未发布的改动（自己改了没发）
    */
-  const cmpVer = (a, b) => {
-    const pa = String(a || '0').split('.').map((x) => parseInt(x, 10) || 0);
-    const pb = String(b || '0').split('.').map((x) => parseInt(x, 10) || 0);
-    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-      const x = pa[i] || 0, y = pb[i] || 0;
-      if (x !== y) return x > y ? 1 : -1;
-    }
-    return 0;
-  };
+
 
   ctx.http.route('GET', '/api/market/updates', async () => {
     const w = whoAmI();
@@ -2439,6 +3440,9 @@ export async function activate(ctx) {
         body: JSON.stringify({ email: me.email, qq: me.qq || '', nickname: me.nickname || '' }),
         signal: AbortSignal.timeout(15000),
       });
+      // 同时直接写中心库 —— 中心端的 /heartbeat 只更新它本机的文件，
+      // 共享库要单独推一次，否则其他实例还是看不到这个人的最新昵称。
+      await pushUserToRegistry(me.email, me.qq || '', me.nickname || '').catch(() => {});
       if (res.ok) mark();
     } catch { /* 静默，明天再试 */ }
   };

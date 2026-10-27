@@ -80,16 +80,64 @@ export async function listModels() {
 }
 
 /** 累加 usage。 */
+/**
+ * 累加 token 用量。
+ *
+ * 🔴 2026-10-26 修：原来只累加 prompt/completion/total，
+ *    **把缓存字段整个丢了** —— 于是运营面板只能估算缓存命中，
+ *    拿不到真实数字。
+ *
+ * 各家的字段名不统一，这里都认：
+ *   · OpenAI / DeepSeek 新版：prompt_tokens_details.cached_tokens
+ *   · DeepSeek 旧版：          prompt_cache_hit_tokens / prompt_cache_miss_tokens
+ *   · Anthropic 风格：         cache_read_input_tokens / cache_creation_input_tokens
+ *
+ * 语义约定：
+ *   cachedTokens   = 命中缓存的 prompt token 数
+ *   cacheMissTokens = 未命中的 prompt token 数（拿不到时用 prompt - cached 推算）
+ */
 export function addUsage(target, usage) {
   if (!usage) return target;
-  target.promptTokens += Number(usage.prompt_tokens) || 0;
-  target.completionTokens += Number(usage.completion_tokens) || 0;
-  target.totalTokens += Number(usage.total_tokens) || (Number(usage.prompt_tokens) || 0) + (Number(usage.completion_tokens) || 0);
+
+  const num = (v) => Number(v) || 0;
+  const prompt = num(usage.prompt_tokens);
+  const completion = num(usage.completion_tokens);
+
+  target.promptTokens += prompt;
+  target.completionTokens += completion;
+  target.totalTokens += num(usage.total_tokens) || (prompt + completion);
+
+  // ── 缓存命中（多方言兼容）──
+  const det = usage.prompt_tokens_details || usage.prompt_tokens_details_v2 || {};
+  const cached = num(
+    usage.prompt_cache_hit_tokens
+    ?? det.cached_tokens
+    ?? usage.cache_read_input_tokens
+    ?? 0
+  );
+  const miss = num(
+    usage.prompt_cache_miss_tokens
+    ?? det.uncached_tokens
+    ?? (cached > 0 ? Math.max(0, prompt - cached) : 0)
+  );
+
+  if (cached) target.cachedTokens = (target.cachedTokens || 0) + cached;
+  if (miss) target.cacheMissTokens = (target.cacheMissTokens || 0) + miss;
+
+  // 记录最近一次的真实命中情况，方便面板显示「上一次请求命中了没」
+  if (cached || miss) {
+    target.lastCache = { cached, miss, at: Date.now() };
+  }
+
   return target;
 }
 
 export function emptyUsage() {
-  return { promptTokens: 0, completionTokens: 0, totalTokens: 0, calls: 0 };
+  return {
+    promptTokens: 0, completionTokens: 0, totalTokens: 0, calls: 0,
+    // 缓存统计（2026-10-26 加）：字段缺省为 0，老的 session 文件照样能读
+    cachedTokens: 0, cacheMissTokens: 0, lastCache: null
+  };
 }
 
 /** 按配置单价折算成本（元）。 */

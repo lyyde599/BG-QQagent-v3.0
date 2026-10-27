@@ -128,6 +128,9 @@ export class SessionRegistry {
     let completionTokens = 0;
     let totalTokens = 0;
     let runs = 0;
+    // 缓存命中（2026-10-26 加）：缺省 0，老汇总文件照样能读
+    let cachedTokens = 0;
+    let cacheMissTokens = 0;
     // 结束的会话记在汇总文件里
     try {
       const data = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage-today.json'), 'utf8'));
@@ -136,6 +139,8 @@ export class SessionRegistry {
         completionTokens = data.completionTokens || 0;
         totalTokens = data.totalTokens || 0;
         runs = data.runs || 0;
+        cachedTokens = data.cachedTokens || 0;
+        cacheMissTokens = data.cacheMissTokens || 0;
       }
     } catch { /* 无记录 */ }
     // 加上运行中的
@@ -143,14 +148,16 @@ export class SessionRegistry {
       promptTokens += s.usage.promptTokens;
       completionTokens += s.usage.completionTokens;
       totalTokens += s.usage.totalTokens;
+      cachedTokens += s.usage.cachedTokens || 0;
+      cacheMissTokens += s.usage.cacheMissTokens || 0;
     }
-    return { dayKey, promptTokens, completionTokens, totalTokens, runs };
+    return { dayKey, promptTokens, completionTokens, totalTokens, runs, cachedTokens, cacheMissTokens };
   }
 
   /** 在会话结束时累加今日用量。 */
   #bumpTodayUsage(s) {
     const dayKey = localDayKey(s.startedAt);
-    let data = { dayKey, promptTokens: 0, completionTokens: 0, totalTokens: 0, runs: 0 };
+    let data = { dayKey, promptTokens: 0, completionTokens: 0, totalTokens: 0, runs: 0, cachedTokens: 0, cacheMissTokens: 0 };
     try {
       const parsed = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage-today.json'), 'utf8'));
       if (parsed?.dayKey === dayKey) data = parsed;
@@ -158,6 +165,8 @@ export class SessionRegistry {
     data.promptTokens += s.usage.promptTokens;
     data.completionTokens += s.usage.completionTokens;
     data.totalTokens += s.usage.totalTokens;
+    data.cachedTokens = (data.cachedTokens || 0) + (s.usage.cachedTokens || 0);
+    data.cacheMissTokens = (data.cacheMissTokens || 0) + (s.usage.cacheMissTokens || 0);
     data.runs += 1;
     const tmp = path.join(DATA_DIR, 'usage-today.json.tmp');
     fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');

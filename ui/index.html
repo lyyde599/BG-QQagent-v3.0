@@ -37,7 +37,7 @@
   <div id="loading-overlay" class="loading-overlay">
     <div class="loading-card">
       <div class="loading-title">QQ Agent 正在启动</div>
-      <div class="loading-sub" id="loading-status">正在启动 SnowLuma 与 OneBot 服务，请稍候…</div>
+      <div class="loading-sub" id="loading-status">正在连接 OneBot 网关，请稍候…</div>
       <div class="loading-spinner"></div>
       <pre class="loading-logs" id="loading-logs"></pre>
     </div>
@@ -46,7 +46,7 @@
   <nav id="tabs">
     <button class="tab active" data-tab="sessions">会话</button>
     <button class="tab" data-tab="chats">存档</button>
-    <button class="tab" data-tab="snowluma">SnowLuma</button>
+    <button class="tab" data-tab="snowluma">登录</button>
     <!-- 插件自带的 tab 由 JS 按 manifest.uiTab 动态插入（插件卸载后自动消失）
          —— 原来写死在这里，导致"插件已卸载但页签还在，点进去报错" -->
     <span id="plugin-tabs"></span>
@@ -79,7 +79,7 @@
       </div>
     </section>
 
-    <!-- SnowLuma 视图 -->
+    <!-- OneBot 网关视图（页签名「登录」，tab id 仍为 snowluma 以兼容旧代码） -->
     <section id="view-snowluma" class="view">
       <div id="snowluma-page" class="snowluma-pane"></div>
     </section>

@@ -79,21 +79,72 @@ async function r2Put(env, key, body, contentType = 'application/json') {
 }
 
 /** 拉远端 skill 清单 */
-export async function fetchSkillIndex() {
+// ── 技能清单缓存（2026-10-26）──
+//
+// 🔴 外部报告指出的真问题：
+//   "面板首屏被一个每次都实时跨公网拉取的接口串行挡住"
+//
+// 实测（服务器本机直连，各 3 次）：
+//   /api/market/index       1.0~2.0s  ← 当时还没修下载统计缓存
+//   /api/skill-market/index 0.25~0.36s
+//   /api/skills             0.001s
+//
+// fetchSkillIndex 是**唯一一个完全没有缓存**的远端接口：
+// 无内存缓存、无 TTL、无备用源、无旧值回落，超时还写着 20 秒。
+// 面板打开时它串在渲染之前，等于把整屏拖慢。
+//
+// 对照组：plugins/plugin-market/index.js 的 fetchIndex() 有
+// 5 分钟 TTL + 主备双源 + 失败回落旧缓存 —— 所以那边很快。
+//
+// 现在照那套补齐：TTL 300s / 超时降到 4s / 失败回落旧值。
+let skillIdxCache = { at: 0, data: null, error: null };
+const SKILL_TTL = 300 * 1000;
+
+/**
+ * 拉技能市场清单
+ *
+ * @param {object} opts { force } force=true 时跳过缓存（手动刷新用）
+ */
+export async function fetchSkillIndex(opts = {}) {
+  const force = opts && opts.force === true;
+
+  // ① 命中缓存直接返回，零网络开销
+  if (!force && skillIdxCache.data && Date.now() - skillIdxCache.at < SKILL_TTL) {
+    return { ...skillIdxCache.data, cached: true };
+  }
+
   try {
     const res = await fetch(SKILL_INDEX, {
       headers: { 'User-Agent': 'QQAgent-SkillMarket/1.0' },
-      signal: AbortSignal.timeout(20000)
+      // 原来 20000：域名卡住时面板要空白 20 秒。
+      // 清单只是个 json，4 秒足够；超了就用旧的。
+      signal: AbortSignal.timeout(4000)
     });
     if (!res.ok) {
-      if (res.status === 404) return { ok: true, skills: [], empty: true };
-      return { ok: false, error: `清单返回 HTTP ${res.status}` };
+      if (res.status === 404) {
+        const r = { ok: true, skills: [], empty: true };
+        skillIdxCache = { at: Date.now(), data: r, error: null };
+        return r;
+      }
+      throw new Error(`清单返回 HTTP ${res.status}`);
     }
     const d = await res.json();
-    return { ok: true, skills: Array.isArray(d.skills) ? d.skills : [] };
+    const r = { ok: true, skills: Array.isArray(d.skills) ? d.skills : [] };
+    skillIdxCache = { at: Date.now(), data: r, error: null };
+    return r;
   } catch (e) {
-    return { ok: false, error: `连不上市场：${e?.message ?? e}` };
+    const msg = `连不上市场：${e?.message ?? e}`;
+    // ② 失败回落旧缓存 —— 界面能显示内容，并注明可能过期
+    if (skillIdxCache.data) {
+      return { ...skillIdxCache.data, cached: true, stale: true, error: msg };
+    }
+    return { ok: false, error: msg };
   }
+}
+
+/** 清技能清单缓存（发布/下架后调用，保证立刻看到变化） */
+export function clearSkillIndexCache() {
+  skillIdxCache = { at: 0, data: null, error: null };
 }
 
 /** 从 md 正文里解析 frontmatter */
@@ -172,6 +223,8 @@ export async function publishSkill(id, { version = '1.0.0', notes = '', dryRun =
   }, null, 2)), 'application/json');
   if (st2 !== 200) return { ok: false, error: `清单更新失败 HTTP ${st2}` };
 
+  // 刚改过清单，缓存立刻失效（否则要等 5 分钟才看到自己发的）
+  clearSkillIndexCache();
   return { ok: true, id, version: ver, bytes: buf.length, download, total: next.length };
 }
 

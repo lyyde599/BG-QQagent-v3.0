@@ -457,21 +457,88 @@ export async function autoInstallKernel(file) {
   fs.mkdirSync(path.dirname(installLogPath()), { recursive: true });
   const logFd = fs.openSync(installLogPath(), 'a');
 
-  const { spawn } = await import('node:child_process');
-  const child = spawn(process.execPath, [script, f], {
-    detached: true,
-    stdio: ['ignore', logFd, logFd],
-    cwd: ROOT,
-    // 告诉脚本真实的内核根目录（它现在可能从 /tmp 运行）
-    env: { ...process.env, KERNEL_ROOT: ROOT }
-  });
-  child.unref();
+  // 🔴 必须脱离内核的 cgroup（2026-10-26 事故）
+  //
+  // 症状：装到一半服务卡在 deactivating，3210 起不来，前端 502。
+  // 日志：`systemctl stop 返回异常 (signal=SIGTERM)` → `收到 SIGTERM` → `异常退出`
+  //
+  // 根因：spawn({ detached: true }) 只脱离**进程组**，不脱离 **cgroup**。
+  //   systemd 服务默认 KillMode=control-group，`systemctl stop` 会给
+  //   整个 cgroup 的所有进程发 SIGTERM —— 安装脚本自己也在里面，跟着被杀。
+  //   它一死就没人执行「启动服务」那步，服务永远停着。
+  //
+  // 解法：用 systemd-run 启动一个**独立的 transient unit**，
+  //   它有自己的 cgroup，不受内核服务 stop 的连带影响。
+  const { spawn, spawnSync } = await import('node:child_process');
+
+  // 🔴 sudo 权限：本机 sudoers 只给特定命令配了 NOPASSWD，
+  //    systemd-run 不在名单里 → sudo -n 必然失败。
+  //    按铁律 0.6：密码只走 stdin，绝不进命令行参数。
+  const pwFile = process.env.QQ_SUDO_PASSWORD_FILE
+    || path.join(os.homedir(), '.secrets', 'sudo', 'password');
+  let sudoPw = '';
+  try { if (fs.existsSync(pwFile)) sudoPw = fs.readFileSync(pwFile, 'utf8').trim(); } catch { /* 无密码文件 */ }
+
+  let launched = false;
+  let launcherPid = 0;
+
+  // 🔴 不能先判断 `sudo -n` 能不能用（2026-10-26 实测）：
+  //    服务进程的 sudo 缓存是独立的，`sudo -n systemd-run --version`
+  //    在服务里返回 false，但用密码走 `sudo -S` 完全可行。
+  //    所以：有密码文件就直接用密码，别被 canNoPass 挡住。
+  if (sudoPw) {
+    // ② 有密码文件：用 sudo -S，密码走 stdin
+    try {
+      const unit = `qqagent-install-${Date.now()}`;
+      const inner = `KERNEL_ROOT=${JSON.stringify(ROOT)} ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} ${JSON.stringify(f)}`;
+      const r = spawn('sudo', ['-S', 'systemd-run', '--unit', unit, '--collect', '--quiet',
+        '--property', 'Type=exec', '/bin/sh', '-c', inner], {
+        detached: true,
+        stdio: ['pipe', logFd, logFd],
+        cwd: ROOT
+      });
+      try { r.stdin.write(sudoPw + '\n'); r.stdin.end(); } catch { /* 已关闭 */ }
+      r.unref();
+      launcherPid = r.pid;
+      launched = true;
+    } catch { launched = false; }
+  }
+
+
+  // 没密码文件时，再试一次免密 systemd-run
+  if (!launched && !sudoPw) {
+    try {
+      const unit = `qqagent-install-${Date.now()}`;
+      const inner = `KERNEL_ROOT=${JSON.stringify(ROOT)} ${JSON.stringify(process.execPath)} ${JSON.stringify(script)} ${JSON.stringify(f)}`;
+      const r = spawn('sudo', ['-n', 'systemd-run', '--unit', unit, '--collect', '--quiet',
+        '--property', 'Type=exec', '/bin/sh', '-c', inner], {
+        detached: true, stdio: ['ignore', logFd, logFd], cwd: ROOT
+      });
+      r.unref();
+      launcherPid = r.pid;
+      launched = true;
+    } catch { launched = false; }
+  }
+
+  if (!launched) {
+    // 退化：非 systemd 环境（容器里裸跑）仍用原来的 detached spawn
+    const child = spawn(process.execPath, [script, f], {
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      cwd: ROOT,
+      env: { ...process.env, KERNEL_ROOT: ROOT }
+    });
+    child.unref();
+    launcherPid = child.pid;
+  }
   fs.closeSync(logFd);
 
   return {
     ok: true,
     accepted: true,
-    pid: child.pid,
+    pid: launcherPid,
+    isolated: launched,
+
     log: installLogPath(),
     note: '安装已在后台开始。服务会重启一次，期间约 30~90 秒不可用。失败会自动回滚。'
   };

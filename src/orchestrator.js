@@ -429,6 +429,13 @@ export class Orchestrator {
     // 视觉判定 = 全局开关 && 选中模型未被探测为"明确不支持图片"（未探测/unknown 时保持开关行为）
     const visionEnabled = cfg.api.vision !== false
       && modelVisionVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
+    // vision aux exemption: when vision plugin has full auxVision, main model need not see images
+    let visionAuxBypass = false;
+    try {
+      const vPlg = getConfig().plugins?.vision?.auxVision;
+      visionAuxBypass = !!(vPlg?.enabled && String(vPlg.baseUrl || '').trim() && String(vPlg.model || '').trim());
+    } catch { /* conservative: no exemption */ }
+    const gatedVision = visionEnabled || visionAuxBypass;
     // 主人判断：私聊（master QQ）或触发消息来自主人（在工具过滤前计算）
     const MASTER_QQ = String(getConfig().persona?.masterQQ || '');
     const triggerSender = (triggerEntries[0] && (triggerEntries[0].senderId || '')) || '';
@@ -437,7 +444,7 @@ export class Orchestrator {
     // 插件工具现取（面板装卸后即时生效，无需重启）。宿主为空则等同旧行为。
     const pluginTools = this.pluginHost ? this.pluginHost.allToolDefs() : [];
     const toolDefs = [...this.toolDefs, ...pluginTools].filter((d) => {
-      if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
+      if (!gatedVision && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
       // 主人专属工具：仅主人触发时挂载（群友/他人触发时模型看不到这些工具）
       if (d.masterOnly && !isMaster) return false;

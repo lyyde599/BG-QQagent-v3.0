@@ -60,6 +60,36 @@ export function normalizeManifest(raw, { dirName = '' } = {}) {
     ? raw.config
     : {};
 
+  // ── headAssets：全局资源注入（2026-10-25）──────────────────
+  //
+  // 需求来源：「手机版界面」这类**纯前端插件**要在页面加载的第一时间
+  // 判断宽度、接管整页。uiTab / 顶栏页签都要求用户先点进去，不够用 ——
+  // 只能靠安装脚本硬改 ui/index.html，内核一升级就被覆盖。
+  //
+  // 约定：
+  //   · 平铺文件名，**不允许带路径**（防越权）
+  //   · .css → <link>，其余 → <script>
+  //   · 只有 enabled 的插件才注入（在 app.js 里判断）
+  //   · 没有这个字段 = 不注入，老插件零影响
+  //
+  // 🔴 白名单在归一化阶段就做，提前把非法值挡在 manifest 之外。
+  const headAssets = (() => {
+    if (!Array.isArray(raw.headAssets)) return [];
+    const out = [];
+    for (const item of raw.headAssets) {
+      const name = asString(item).trim();
+      if (!name) continue;
+      // 只允许平铺文件名，挡掉 ../ 、/ 、协议头
+      if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name)) continue;
+      if (name.includes('..')) continue;
+      // 只收前端资源，避免有人塞 .md/.json 之类
+      if (!/\.(css|js|mjs)$/i.test(name)) continue;
+      if (out.length >= 30) break;          // 上限 30 个，防滥用
+      out.push(name);
+    }
+    return out;
+  })();
+
   let uiTab = null;
   if (raw.uiTab && typeof raw.uiTab === 'object') {
     const tabId = asString(raw.uiTab.id).trim();
@@ -110,6 +140,7 @@ export function normalizeManifest(raw, { dirName = '' } = {}) {
       tools: asBool(raw.tools, false),
       promptSections: Array.isArray(raw.promptSections) ? raw.promptSections.map(String) : [],
       uiTab,
+      headAssets,
       config,
       permissions: Array.isArray(raw.permissions) ? raw.permissions.map(String) : [],
       scopes,
