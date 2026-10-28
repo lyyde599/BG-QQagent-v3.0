@@ -42,6 +42,57 @@ const ROOT = process.env.KERNEL_ROOT
   ? path.resolve(process.env.KERNEL_ROOT)
   : path.resolve(HERE, '..');
 
+// 🔴 自我重定位：脱离内核的 cgroup（2026-10-26）
+//
+// 事故：不管内核侧怎么调（spawn / systemd-run），只要脚本最终跑在
+//   服务的 cgroup 里，`systemctl stop <服务>` 就会连带把它 SIGTERM 掉。
+//   证据：日志里 status=null signal=SIGTERM —— 那是脚本自己收到的信号，
+//   不是服务的退出状态。
+//
+// 解法：脚本启动后先自检。如果自己被 systemd 管着（有 INVOCATION_ID），
+//   且还没重定位过，就用 systemd-run 把自己挪到独立 unit，然后退出。
+//   重定位后的进程有独立的 cgroup，stop 杀不到。
+//
+// 为什么放在脚本最前面：必须在任何 systemctl stop 之前完成。
+//
+// 用环境变量 QQAGENT_INSTALLER_DETACHED 防无限递归。
+if (process.env.INVOCATION_ID && !process.env.QQAGENT_INSTALLER_DETACHED) {
+  const self = fileURLToPath(import.meta.url);
+  const logFile = path.join(ROOT, 'data', 'kernel-updates', 'install.log');
+  try {
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    // 找 sudo 密码（与 runCtl 同一套策略）
+    const pwFile = process.env.QQ_SUDO_PASSWORD_FILE
+      || path.join(os.homedir(), '.secrets', 'sudo', 'password');
+    let pw = '';
+    try { if (fs.existsSync(pwFile)) pw = fs.readFileSync(pwFile, 'utf8').trim(); } catch { /* 无 */ }
+
+    const unit = `qqagent-installer-${Date.now()}`;
+    const runArgs = [
+      'systemd-run', `--unit=${unit}`, '--collect',
+      '--property=Type=oneshot',
+      `--property=StandardOutput=append:${logFile}`,
+      `--property=StandardError=append:${logFile}`,
+      '--setenv=QQAGENT_INSTALLER_DETACHED=1',
+      `--setenv=KERNEL_ROOT=${ROOT}`,
+      process.execPath, self, ...process.argv.slice(2)
+    ];
+
+    const r = pw
+      ? spawnSync('sudo', ['-S', ...runArgs], { input: pw + '\n', encoding: 'utf8', timeout: 30000 })
+      : spawnSync('sudo', ['-n', ...runArgs], { encoding: 'utf8', timeout: 30000 });
+
+    if (r.status === 0) {
+      console.log('[kernel-install] 已重定位到独立 unit，本进程退出');
+      process.exit(0);
+    }
+    console.log(`[kernel-install] ⚠️ 重定位失败（${String(r.stderr || '').slice(0, 120)}），在当前 cgroup 继续`);
+  } catch (e) {
+    console.log(`[kernel-install] ⚠️ 重定位异常：${e?.message ?? e}，继续`);
+  }
+}
+
+
 const args = process.argv.slice(2);
 const pkgPath = args.find((a) => !a.startsWith('--'));
 const dry = args.includes('--dry');
@@ -153,7 +204,11 @@ function detectUnit() {
   } catch { /* ignore */ }
 
   // ④ 兜底：常见的几个名字
-  for (const n of ['qq-agent', 'qq-agent-v2', 'bg-qqagent']) {
+  //
+  // 顺序按"版本从新到旧"排（2026-10-28 补）：
+  // 3.0 起改名 BG-QQagent-Linux，老的 qq-agent-v2 仍然保留在列表里 ——
+  // 老用户升级后目录名变了但服务名可能还是旧的，两个都得能认出来。
+  for (const n of ['BG-QQagent-Linux', 'qq-agent-v3', 'qq-agent-v2', 'qq-agent', 'bg-qqagent']) {
     const s = spawnSync('systemctl', ['show', n, '-p', 'LoadState', '--value'], { encoding: 'utf8', timeout: 10000 });
     if (String(s.stdout || '').trim() === 'loaded') return (UNIT = n);
   }
@@ -428,7 +483,12 @@ function extractWithNode(pkg, dest) {
 
 /** 解压后定位内核根目录 */
 function afterExtract(dest) {
-  // 找包内的顶层目录（约定是 qq-agent-v2/）
+  // 找包内的顶层目录
+  //
+  // 不写死名字（2026-10-28 改注释）：
+  //   2.x 的包顶层叫 qq-agent-v2/，3.x 叫 BG-QQagent-Linux/，
+  //   以后还可能改。所以这里只判断"是不是唯一的目录"，
+  //   不认具体名字 —— 否则每改一次名，老用户的升级包就全废。
   const entries = fs.readdirSync(dest).filter((x) => !x.startsWith('.'));
   const dirs = entries.filter((x) => fs.statSync(path.join(dest, x)).isDirectory());
   if (dirs.length === 1) return path.join(dest, dirs[0]);
@@ -597,6 +657,39 @@ function restoreOwnership() {
   }
 }
 
+/**
+ * 「安装到一半」标记（2026-10-26）
+ *
+ * 事故背景：脚本被 SIGTERM 杀掉时，如果已经替换了一部分文件，
+ *   就会出现「src/ 一半新一半旧」—— 这种情况下服务起不来，
+ *   而且用户不知道发生了什么，只能手动翻备份。
+ *
+ * 做法：替换前写 .install-pending（记录备份目录路径），
+ *   健康探测通过后删掉。下次启动时如果发现标记还在，
+ *   说明上次没装完 → 自动回滚到标记里记的备份。
+ */
+function pendingFile() {
+  return path.join(ROOT, '.install-pending');
+}
+
+function writePending(bakDir) {
+  try {
+    fs.writeFileSync(pendingFile(), JSON.stringify({
+      at: new Date().toISOString(),
+      backup: path.basename(bakDir),
+      backupPath: bakDir,
+      pid: process.pid
+    }, null, 2), 'utf8');
+    LOG('   已写 .install-pending 标记（装完会删）');
+  } catch (e) {
+    LOG(`   ⚠️ 写标记失败：${e?.message ?? e}`);
+  }
+}
+
+function clearPending() {
+  try { if (fs.existsSync(pendingFile())) fs.unlinkSync(pendingFile()); } catch { /* 忽略 */ }
+}
+
 /** 回滚 */
 function rollback(bakDir) {
   LOG('⏪ 开始回滚…');
@@ -732,6 +825,42 @@ if (dry) {
 
 const bakDir = backup();
 
+// ③.5 残留标记检测：上次装到一半？（2026-10-26）
+//
+// 如果 .install-pending 还在，说明上次替换文件后没能走到「健康探测通过」那步。
+// 这种情况下 src/ 可能是半新半旧的状态，继续安装有风险 ——
+// 先把最近的备份还原回去，让现场回到已知可用的状态。
+try {
+  const pf = pendingFile();
+  if (fs.existsSync(pf)) {
+    const info = JSON.parse(fs.readFileSync(pf, 'utf8'));
+    LOG(`⚠️ 发现上次未完成的安装标记（${info.at}，备份 ${info.backup}）`);
+    const bakPath = info.backupPath || path.join(ROOT, info.backup);
+    if (fs.existsSync(bakPath)) {
+      LOG('   正在回滚到该备份…');
+      stopService();
+      const items = fs.readdirSync(bakPath);
+      let n = 0;
+      for (const it of items) {
+        try {
+          fs.rmSync(path.join(ROOT, it), { recursive: true, force: true });
+          fs.cpSync(path.join(bakPath, it), path.join(ROOT, it), { recursive: true });
+          n++;
+        } catch { /* 单文件失败不中断 */ }
+      }
+      LOG(`   已还原 ${n} 项，重新启动服务…`);
+      startService();
+      await new Promise((r) => setTimeout(r, 8000));
+      LOG(serviceActive() ? '   现场已恢复' : '   ⚠️ 恢复后服务仍未起来，请手动检查');
+    } else {
+      LOG(`   ⚠️ 备份目录不存在（${bakPath}），跳过自动回滚`);
+    }
+    clearPending();
+  }
+} catch (e) {
+  LOG(`⚠️ 检查残留标记出错（继续安装）：${e?.message ?? e}`);
+}
+
 // 替换前必须停服务，否则正在运行的代码占用文件
 // 🔴 退出保护（2026-10-25）：从停服务开始，任何异常退出都先拉起服务。
 //    SIGKILL 捕不到 —— 那种情况靠前面的「中断自愈」兜底。
@@ -809,6 +938,7 @@ if (serviceStopped && !servicePid()) {
 await new Promise((r) => setTimeout(r, 2000));
 
 phase = 'replacing';
+writePending(bakDir);        // 先落标记：万一中途挂了，下次启动能自动回滚
 replace(newDir);
 syncInstallerFromPackage(newDir);
 restoreOwnership();          // 把 root 属主还回去，否则用户后续编辑/打包会失败
@@ -853,6 +983,7 @@ if (!ok || !pidChanged) {
 finished = true;
 fs.rmSync(tmp, { recursive: true, force: true });
 phase = 'done';
+clearPending();              // 装成功了，删标记
 LOG(`🎉 安装成功，备份保留在 ${path.basename(bakDir)}（确认无误后可删）`);
 
 // 把备份路径写到文件，方便前端展示

@@ -170,8 +170,8 @@ export async function downloadKernelUpdate() {
     steps: [
       `备份现有内核：cp -a ${ROOT} ${ROOT}.bak-$(date +%Y%m%d-%H%M%S)`,
       `解压到临时目录并对比：mkdir -p /tmp/k && tar xzf ${file} -C /tmp/k`,
-      '确认差异（尤其 src/ ui/ 下你自己的改动）：diff -r /tmp/k/qq-agent-v2 ' + ROOT,
-      '合并后重启：systemctl restart qq-agent-v2',
+      '确认差异（尤其 src/ ui/ 下你自己的改动）：diff -r /tmp/k/<解包目录> ' + ROOT,
+      '合并后重启：systemctl restart BG-QQagent-Linux',
       '起不来就回滚：把 .bak-* 换回来再重启'
     ],
     warning: '本功能只下载与校验，不会覆盖现有内核。是否替换由你决定。'
@@ -288,7 +288,7 @@ async function fetchIndexForPublish() {
 export async function publishKernel({ notes = '', dryRun = false } = {}) {
   const env = loadR2();
   if (!env) {
-    return { ok: false, error: `没有 R2 凭据（${r2EnvPath()}）。发布需要写对象存储的权限。` };
+    return { ok: false, error: `没有 R2 凭据：${r2EnvPath()} 不存在。\n放到 ~/.secrets/market-r2/r2.env（推荐），或用环境变量 BG_R2_ENV 指定路径。`, needR2: true };
   }
 
   // ① 打包：把内核目录打成 tar.gz（排除运行数据/依赖/插件）
@@ -410,7 +410,7 @@ async function extractInstaller(pkgPath) {
       if (typeflag === 'L') { longName = td.decode(data).replace(/\0.*$/, ''); continue; }
       if (typeflag !== '0' && typeflag !== '\0') continue;
 
-      // 匹配 qq-agent-v2/scripts/kernel-install.mjs（兼容任意顶层目录名）
+      // 匹配 BG-QQagent-Linux/scripts/kernel-install.mjs（兼容任意顶层目录名）
       if (/(^|\/)scripts\/kernel-install\.mjs$/.test(name)) {
         const tmp = path.join(DATA_DIR, 'kernel-updates', 'installer-current.mjs');
         fs.mkdirSync(path.dirname(tmp), { recursive: true });

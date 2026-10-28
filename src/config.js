@@ -16,6 +16,12 @@ export const DEFAULT_CONFIG = {
     baseUrl: 'http://127.0.0.1:8787/v1',   // 例如本机 buddy2api 网关或任何 OpenAI 兼容端点
     apiKey: '',
     model: '',                              // UI 里选择/填写
+    // 输出 token 上限（2026-10-27 整合）：思考型模型给太小会只剩空正文，
+    // 不设则完全交给上游默认，不可控。0 或 null 表示不显式传。
+    maxTokens: 2000,
+    // 计费方式（2026-10-27 整合）：'token' 按 token 折算金额；'credit' 按积分，
+    // credit 模式下 estimateCost 恒返回 0，面板不再显示误导性金额。
+    billing: 'token',
     provider: '',                           // 当前模型所属提供商（多提供商目录的选中项）
     vision: true,                           // 模型是否支持图片输入（关掉则移除看图工具）
     temperature: 0.8,
@@ -77,6 +83,19 @@ export const DEFAULT_CONFIG = {
     // tutor: { label: '教师模式', personaRef: '', extraPrompt: '', masterOnly: true }
   },
   // 接入白名单
+  // ── 群聊行为（2026-10-27 整合）──
+  group: {
+    // 群里没 @ 机器人 = 只入库、不调模型（省钱 + 不抢话）。
+    // 设成 false 可恢复「所有消息都交给模型判断」的旧行为。
+    requireAt: true,
+    // @ 硬门的判定者（2026-10-28 新增）：
+    //   'builtin' → 内核按「有没有 at 段」硬判（默认，老行为）
+    //   'plugin'  → 跳过硬判，交给 context-strategy 插件综合判断
+    //               （@我 / 引用我 / 拍我 / 关键词，规则归插件）
+    // 配成 plugin 但没插件注册策略时，自动回退 builtin，
+    // 避免群里每句话都触发一次模型调用。
+    requireAtBy: 'builtin'
+  },
   allow: { groups: [], private: [] },
   deny: { groups: [], private: [] },
   allowAllWhenEmpty: false,

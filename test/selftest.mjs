@@ -263,7 +263,13 @@ refs:
     security: { allowPrivateImageHosts: false },
     snowluma: { wsUrl: `ws://127.0.0.1:${PORTS.onebotWs}`, httpUrl: `http://127.0.0.1:${PORTS.onebotHttp}`, accessToken: '' },
     persona: { botName: '审计Bot', participation: 'medium', roleText: '你是审计群里的机器人。' },
+    // 白名单：pushGroupMsg 里群号写死为 456（第一个参数是 userId 不是群号）
     allow: { groups: ['456'], private: ['777'] },
+    // 🔴 2026-10-27：内核新加了「群聊 @ 硬门」（group.requireAt，默认 true）——
+    //    群里没 @ 机器人就只入库、不调模型。
+    //    测试场景 1 发的是纯文本「在吗？」没有 @，会被这道门拦掉，
+    //    「第一次 LLM 调用」永远等不到。这里关掉，测的是消息链路而不是这道门。
+    group: { requireAt: false },
     deny: { groups: [], private: [] },
     allowAllWhenEmpty: false,
     wakeDelayMs: 300,
@@ -289,6 +295,22 @@ refs:
       'affinity': { enabled: false },
       'anti-ad': { enabled: false },
       'astrbot-compat': { enabled: false },
+      // 2026-10-27 补：这 4 个是后来新增的，未声明时会用 defaultEnabled
+      // （auto-review 有定时任务、mobile-ui 有 headAssets 注入），可能干扰消息链。
+      'auto-review': { enabled: false },
+      // 🔴 diary（2026-10-28 补）：defaultEnabled=true，且启动 10 秒后会
+      //    检查「昨天日记写了没」，没写就主动唤醒会话补写。
+      //    测试跑超过 10 秒就会命中，凭空多出几次 LLM 调用，
+      //    导致后面的场景全部错位（表现为「拍一拍回显触发了新会话」）。
+      'diary': { enabled: false },
+      // 2026-10-28 自检抓出来的（同样 defaultEnabled:true + 定时任务）：
+      //   heybox-pond  每 5 分钟轮询
+      //   napcat-alert 每 15 秒轮询（最频繁，最容易干扰）
+      'heybox-pond': { enabled: false },
+      'napcat-alert': { enabled: false },
+      'mcp-client': { enabled: false },
+      'mobile-ui': { enabled: false },
+      'plugin-market': { enabled: false },
       'bili-pond': { enabled: false },
       'blacklist': { enabled: false },
       'file-recv': { enabled: false },
@@ -315,6 +337,48 @@ refs:
     }
   };
   fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify(cfg));
+  // ── 插件声明自检（2026-10-28）──────────────────────────
+  //
+  // 为什么需要：测试用「显式声明表」控制启停，但**新增插件如果漏声明**，
+  // 且它的 manifest 里 defaultEnabled:true，就会静默生效并干预消息链。
+  //
+  // 踩过两次：
+  //   · auto-review / mcp-client / mobile-ui / plugin-market（干扰消息链）
+  //   · diary（启动 10 秒后补写日记、主动唤醒会话，让 mock LLM 的脚本索引全部错位，
+  //     表现为「拍一拍回显触发了新会话」这种八竿子打不着的断言失败）
+  //
+  // 那种失败极难定位 —— 断言报的和真因完全无关。
+  // 所以这里前置检查：漏声明就直接报错退出，把问题消灭在启动阶段。
+  {
+    const declared = new Set(Object.keys(cfg.plugins || {}));
+    const pluginsRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'plugins');
+    const missing = [];
+    try {
+      for (const name of fs.readdirSync(pluginsRoot)) {
+        if (name.startsWith('.') || name.startsWith('_')) continue;
+        const mf = path.join(pluginsRoot, name, 'manifest.json');
+        if (!fs.existsSync(mf)) continue;
+        if (declared.has(name)) continue;
+        let m = {};
+        try { m = JSON.parse(fs.readFileSync(mf, 'utf8')); } catch { continue; }
+        // 只有「会自己生效」的插件才危险；defaultEnabled 非 true 的漏声明无所谓
+        if (m.defaultEnabled === true) missing.push(name);
+      }
+    } catch { /* 没有 plugins 目录就跳过（纯净内核版） */ }
+
+    if (missing.length) {
+      console.error('');
+      console.error('❌ 测试配置漏声明了会自动启用的插件：');
+      for (const n of missing) console.error(`     · ${n}（manifest 里 defaultEnabled: true）`);
+      console.error('');
+      console.error('   请在 test/selftest.mjs 的 cfg.plugins 里显式声明它们（一般写 { enabled: false }），');
+      console.error('   否则它们会在测试期间静默生效，干扰消息链 / 定时任务 / mock LLM 脚本索引，');
+      console.error('   导致完全不相干的断言失败。');
+      console.error('');
+      process.exit(1);
+    }
+  }
+
 
   const { createApp } = await import('../src/app.js');
   const app = createApp({ log: () => {} });

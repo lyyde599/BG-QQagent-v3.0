@@ -796,18 +796,54 @@ th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--lin
 th { color: var(--fg2); font-weight: 500; font-size: var(--fs-sm); white-space: nowrap; }
 tbody tr:hover { background: var(--raised); color: var(--on-raised); }
 
-/* 插件页：工具列可能很长，限制宽度并允许换行，避免挤走右侧操作列 */
-#plugins-page table { table-layout: fixed; }
-#plugins-page table th:nth-child(1) { width: 200px; }  /* 插件（含作者行） */
-#plugins-page table th:nth-child(2) { width: 70px; }   /* 状态 */
-#plugins-page table th:nth-child(3) { width: auto; }   /* 说明：吃剩余空间，限宽后自动换行（全文显示） */
+/* 插件页表格（2026-10-28 重做）
+   ────────────────────────────────────────────────────────────
+   🔴 原实现踩的坑：
+     七列宽度写死为 200+70+auto+240+92+72+250 = 924px 固定 + auto。
+     容器窄于 924px 时，table-layout:fixed 不会溢出，而是把唯一的
+     auto 列（说明）压到接近 0 宽 —— 于是整段说明被挤成**一列竖排单字**，
+     一行占满整个屏幕高度。用户截图就是这个现象。
 
-#plugins-page table th:nth-child(4) { width: 240px; }  /* 工具 */
-#plugins-page table th:nth-child(5) { width: 92px; }   /* 数据 */
-#plugins-page table th:nth-child(6) { width: 72px; }   /* 作用域 */
-#plugins-page table th:nth-child(7) { width: 250px; }  /* 操作 */
+   新方案：
+     · 取消固定列宽，改用 min-width + 自然流动
+     · 说明列给 min-width，保证至少有 12 个汉字的宽度
+     · 窄屏（<1100px）横向滚动，而不是压缩内容
+     · 说明列限高，超长截断并可展开（避免一条说明撑爆整页）
+   ──────────────────────────────────────────────────────────── */
+#plugins-page table { table-layout: auto; min-width: 900px; }
+#plugins-page .table-wrap { overflow-x: auto; }        /* 窄屏横向滚动 */
+
+#plugins-page table th:nth-child(1) { min-width: 170px; }  /* 插件 */
+#plugins-page table th:nth-child(2) { min-width: 64px; }   /* 状态 */
+#plugins-page table th:nth-child(3) { min-width: 260px; }  /* 说明 */
+#plugins-page table th:nth-child(4) { min-width: 80px; }   /* 工具 */
+#plugins-page table th:nth-child(5) { min-width: 60px; }   /* 数据 */
+#plugins-page table th:nth-child(6) { min-width: 60px; }   /* 作用域 */
+#plugins-page table th:nth-child(7) { min-width: 210px; }  /* 操作 */
+
 #plugins-page table td code { font-size: 11.5px; word-break: break-all; }
-#plugins-page table td:nth-child(3) { word-break: break-word; }
+
+/* 说明列：正常换行 + 限高，超长折叠 */
+#plugins-page table td:nth-child(3) {
+  word-break: break-word;
+  line-height: 1.55;
+  max-width: 460px;
+  max-height: 5.2em;            /* 约 3 行 */
+  overflow: hidden;
+  position: relative;
+}
+#plugins-page table td:nth-child(3).expanded {
+  max-height: none;
+}
+#plugins-page table td:nth-child(3) .desc-toggle {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--acc);
+  cursor: pointer;
+  user-select: none;
+}
+#plugins-page table td:nth-child(3) .desc-toggle:hover { text-decoration: underline; }
 
 /* ── 卡片基线（2026-10-21 补）────────────────────────────────
    规范基线是「header + main > section.card × N」的单列卡片流。

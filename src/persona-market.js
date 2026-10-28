@@ -36,6 +36,20 @@ function r2EnvPath() {
   for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch { /* ignore */ } }
   return cands[0];
 }
+/** R2 凭据缺失时的统一提示（2026-10-28）——给出可直接执行的解法，而不是只报路径 */
+function r2MissingError() {
+  const p = r2EnvPath();
+  return [
+    `没有 R2 凭据：${p} 不存在。`,
+    '发布人设需要写对象存储的权限。',
+    '三个办法任选：',
+    '  ① 放到 ~/.secrets/market-r2/r2.env（推荐）',
+    '  ② 放到 <项目根>/.secrets/market-r2/r2.env',
+    '  ③ 设环境变量 BG_R2_ENV=/path/to/r2.env',
+    '文件需含：R2_ENDPOINT / R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET'
+  ].join('\n');
+}
+
 function loadR2() {
   try {
     const txt = fs.readFileSync(r2EnvPath(), 'utf8');
@@ -171,7 +185,7 @@ export async function publishPersona(id, { version = '', notes = '', dryRun = fa
   }
 
   const env = loadR2();
-  if (!env) return { ok: false, error: `没有 R2 凭据（${r2EnvPath()}）` };
+  if (!env) return { ok: false, error: r2MissingError(), needR2: true };
 
   const st = await r2Put(env, `personas/${fname}`, buf, 'text/markdown; charset=utf-8');
   if (st !== 200) return { ok: false, error: `正文上传失败 HTTP ${st}` };
@@ -214,7 +228,7 @@ export async function unpublishPersona(id, { reason = '' } = {}) {
   if (!pid) return { ok: false, error: '缺少角色卡 id' };
 
   const env = loadR2();
-  if (!env) return { ok: false, error: `没有 R2 凭据（${r2EnvPath()}）` };
+  if (!env) return { ok: false, error: r2MissingError(), needR2: true };
 
   const cur = await fetchPersonaIndex();
   if (!cur.ok) return { ok: false, error: `拉不到清单：${cur.error || ''}` };

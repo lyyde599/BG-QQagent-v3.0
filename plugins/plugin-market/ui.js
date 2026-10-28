@@ -77,7 +77,14 @@ export async function mountPanel(box, ctx) {
   const pluginCards = (market.plugins || []).map((p) => {
     const t = TRUST[p.trust] || TRUST.unverified;
     return `
-      <div class="cy-card cy-card-2col" data-pid="${esc(p.id)}" data-cat="${esc(p.category || '未分类')}">
+      <div class="cy-card cy-card-2col" data-pid="${esc(p.id)}" data-cat="${esc(p.category || '未分类')}"
+           data-downloads="${Number(p.downloads || 0)}"
+           data-name="${esc(p.name || p.id)}"
+           data-updated="${esc(String(p.updatedAt || p.publishedAt || ''))}"
+           data-search="${esc([
+             p.name, p.id, p.summary, p.description, p.author, p.category,
+             Array.isArray(p.tags) ? p.tags.join(' ') : p.tags
+           ].filter(Boolean).join(' '))}">
         <div class="cy-card-main">
           <div class="cy-card-head">
             <span class="cy-name">${esc(p.name || p.id)}</span>
@@ -189,6 +196,17 @@ export async function mountPanel(box, ctx) {
                   padding-top:8px; border-top:1px dashed var(--line); }
       .cy-card-act { display:flex; align-items:center; min-width:64px; justify-content:flex-end; }
 
+      /* 管理页三级菜单（2026-10-27） */
+      .cy-subtabs { display:flex; flex-wrap:wrap; gap:6px; margin:4px 0 14px; }
+      .cy-subtab { font-size:12.5px; padding:5px 12px; border-radius:16px; cursor:pointer;
+                   border:1px solid var(--line); background:var(--bg,#fff);
+                   color:var(--muted,#888); user-select:none; transition:all .12s; }
+      .cy-subtab:hover { border-color:var(--acc); color:var(--fg,#222); }
+      .cy-subtab.on { background:var(--acc); color:var(--on-acc,#fff); border-color:var(--acc); }
+      .cy-subn { opacity:.65; margin-left:3px; font-size:11px; }
+      .cy-subpane { display:none; }
+      .cy-subpane.on { display:block; }
+
       /* ── 管理员总览（2026-10-25）── */
       .cy-admin-stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(96px,1fr));
                         gap:10px; margin-bottom:20px; }
@@ -223,6 +241,27 @@ export async function mountPanel(box, ctx) {
                         display:flex; align-items:center; gap:8px; }
       .cy-group-title:first-child { margin-top:0; }
       .cy-group-hint { font-size:11.5px; font-weight:400; color:var(--muted,#999); }
+
+      /* 搜索框（2026-10-27） */
+      .cy-search-wrap { position:relative; margin-bottom:10px; }
+      .cy-search { width:100%; box-sizing:border-box; font-size:13px;
+                   padding:8px 32px 8px 12px; border-radius:8px;
+                   border:1px solid var(--line); background:var(--bg,#fff);
+                   color:var(--fg,#222); outline:none; transition:border-color .12s; }
+      .cy-search:focus { border-color:var(--acc); }
+      .cy-search::placeholder { color:var(--muted,#aaa); }
+      .cy-search-clear { position:absolute; right:8px; top:50%; transform:translateY(-50%);
+                         border:none; background:none; cursor:pointer; font-size:16px;
+                         color:var(--muted,#999); padding:2px 6px; line-height:1; }
+      .cy-search-clear:hover { color:var(--fg,#222); }
+
+      /* 排序（2026-10-27） */
+      .cy-sort-row { display:flex; align-items:center; gap:8px; margin-bottom:10px; }
+      .cy-sort-label { font-size:12px; color:var(--muted,#888); }
+      .cy-sort { font-size:12px; padding:4px 8px; border-radius:7px;
+                 border:1px solid var(--line); background:var(--bg,#fff);
+                 color:var(--fg,#222); cursor:pointer; outline:none; }
+      .cy-sort:focus { border-color:var(--acc); }
 
       /* 分类筛选栏（2026-10-25） */
       .cy-cats { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; }
@@ -399,6 +438,21 @@ export async function mountPanel(box, ctx) {
         </div>
         ${market.warning ? `<div class="cy-box" style="border-color:#b7791f">⚠️ ${esc(market.warning)}</div>` : ''}
         ${!market.ok ? `<div class="cy-box">${esc(market.error || '拿不到市场清单')}</div>` : ''}
+        <!-- 插件搜索 + 排序（2026-10-27）-->
+        <div class="cy-search-wrap">
+          <input class="cy-search" id="cy-search" type="search" autocomplete="off"
+                 placeholder="搜插件名 / 说明 / 作者 / id…">
+          <button class="cy-search-clear" id="cy-search-clear" title="清空" style="display:none">×</button>
+        </div>
+        <div class="cy-sort-row">
+          <span class="cy-sort-label">排序</span>
+          <select class="cy-sort" id="cy-sort">
+            <option value="default">默认</option>
+            <option value="downloads">下载量高→低</option>
+            <option value="name">名称 A→Z</option>
+            <option value="updated">最近更新</option>
+          </select>
+        </div>
         <div class="cy-cats" id="cy-cats"></div>
         <div id="pm-list">${pluginCards || '<div class="cy-empty">清单是空的</div>'}</div>
         <div id="cy-msg" class="cy-meta" style="margin-top:8px"></div>
@@ -635,7 +689,7 @@ license: MIT
           </div>
         </div>
 
-        <div class="cy-section-title" style="margin-top:20px">
+      <div class="cy-section-title" style="margin-top:20px">
           我提交的反馈
           <span class="cy-badge" id="cy-myfb-count">加载中…</span>
           <button class="btn tiny" id="cy-myfb-refresh" style="margin-left:8px">刷新</button>
@@ -760,11 +814,29 @@ license: MIT
     const fns = paneLoaders.get(pane);
     if (!fns || !fns.length) return;
     if (paneLoaded.has(pane)) return;
-    paneLoaded.add(pane);
-    // 逐个跑，单个失败不影响其他的
+
+    // 🔴 只在**真的跑成功**时才标记已加载（2026-10-28 修）
+    //
+    // 原实现是先 add 再跑 —— 如果 load 里因为 DOM 还没就绪抛错，
+    // 标记已经加上，之后就再也不会重试，页面永远停在「加载中…」。
+    // 实测症状：角色卡面板首次进入显示"加载中…"，点刷新才出来。
+    //
+    // 现在改成：任何一次抛错就不打标记，下次进入还能再试。
+    // 异步函数要等 Promise 才知道成不成功。
+    // 直接把 Promise 的结果收起来，全成功才打标记。
+    const results = [];
     for (const fn of fns) {
-      try { fn(); } catch { /* ignore */ }
+      try {
+        const r = fn();
+        results.push(r && typeof r.then === 'function' ? r : Promise.resolve(true));
+      } catch {
+        results.push(Promise.resolve(false));
+      }
     }
+    Promise.allSettled(results).then((rs) => {
+      const ok = rs.every((x) => x.status === 'fulfilled' && x.value !== false);
+      if (ok) paneLoaded.add(pane);
+    });
   };
 
   /** 强制重新加载某个 pane（忽略"已加载"标记） */
@@ -941,10 +1013,32 @@ license: MIT
         body: { id, version: ver, notes },
       });
       if (r?.ok) {
-        showSkillMsg(`✅ 已发布 v${r.version}（${(r.bytes / 1024).toFixed(1)}KB）\n市场里现在共 ${r.total} 个 skill`, 'ok');
-        ctx.toast?.('发布成功');
+        // 两种成功态（2026-10-28）：
+        //   submitted=true → 已投稿，等管理员审核（作者身份，无需 R2）
+        //   direct=true    → 已直接发布（市场所有者身份）
+        if (r.submitted) {
+          showSkillMsg(
+            `✅ 已提交 v${r.version}，等待管理员审核后上线\n`
+            + `投稿 ID：${r.submissionId || '-'}\n`
+            + '审核通过后会出现在技能库里。',
+            'ok'
+          );
+          ctx.toast?.('已提交，等待审核');
+        } else {
+          showSkillMsg(`✅ 已发布 v${r.version}（${(r.bytes / 1024).toFixed(1)}KB）\n市场里现在共 ${r.total} 个 skill`, 'ok');
+          ctx.toast?.('发布成功');
+        }
       } else {
-        showSkillMsg('❌ ' + (r?.error || '发布失败'), 'err');
+        // 需要先登录作者账号时，给出明确指引而不是干巴巴报错
+        if (r?.needSubmit) {
+          showSkillMsg(
+            '❌ ' + (r?.error || '需要作者身份') + '\n'
+            + '提示：发布技能不需要配置 R2 密钥 —— 登录创造营账号后提交即可，由管理员审核上线。',
+            'err'
+          );
+        } else {
+          showSkillMsg('❌ ' + (r?.error || '发布失败'), 'err');
+        }
       }
     } catch (e) {
       showSkillMsg('❌ ' + e.message, 'err');
@@ -1074,7 +1168,15 @@ license: MIT
   (() => {
     const listEl = box.querySelector('#cy-persona-list');
     const countEl = box.querySelector('#cy-persona-count');
-    if (!listEl) return;
+    // 🔴 拿不到元素就**不能 return**（2026-10-28 修）
+    //
+    // 原实现在这里直接 return，等于"这个 pane 的 load 函数根本没注册"。
+    // 而首次进入时 DOM 有可能还没渲染完 —— 于是永远拿不到元素，
+    // 页面就一直停在「加载中…」，点刷新才出来（因为那时候 DOM 好了）。
+    //
+    // 现在：延后到用户真正操作时再查元素。
+    const getEl = () => box.querySelector('#cy-persona-list');
+    if (!listEl && !getEl()) { /* DOM 未就绪，load 里会重新查 */ }
 
     let market = [];
     let local = [];
@@ -1083,8 +1185,10 @@ license: MIT
       const localById = new Map(local.map((x) => [x.id, x]));
       if (countEl) countEl.textContent = `市场 ${market.length} 个 · 本地 ${local.length} 个`;
 
+      const rEl = getEl();
+      if (!rEl) return;
       if (!market.length && !local.length) {
-        listEl.innerHTML = '<div class="cy-empty">还没有角色卡。点「写一个」创建第一张，或等别人发布。</div>';
+        rEl.innerHTML = '<div class="cy-empty">还没有角色卡。点「写一个」创建第一张，或等别人发布。</div>';
         return;
       }
 
@@ -1139,7 +1243,7 @@ license: MIT
           </div>`);
       }
 
-      listEl.innerHTML = rows.join('');
+      rEl.innerHTML = rows.join('');
       bind();
     };
 
@@ -1417,14 +1521,25 @@ license: MIT
     box.querySelector('#cy-persona-new')?.addEventListener('click', () => openEditor(''));
 
     const load = async () => {
-      listEl.innerHTML = '<div class="cy-empty">加载中…</div>';
-      const [m, l] = await Promise.all([
-        api('/api/persona-market/index').catch(() => ({ ok: false })),
-        api('/api/persona-market/local').catch(() => ({ ok: false })),
-      ]);
-      market = (m?.ok && m.personas) || [];
-      local = (l?.ok && l.personas) || [];
-      render();
+      const el = getEl();
+      if (!el) return false;          // DOM 还没就绪 → 不标已加载
+      el.innerHTML = '<div class="cy-empty">加载中…</div>';
+      try {
+        const [m, l] = await Promise.all([
+          api('/api/persona-market/index').catch(() => ({ ok: false })),
+          api('/api/persona-market/local').catch(() => ({ ok: false })),
+        ]);
+        market = (m?.ok && m.personas) || [];
+        local = (l?.ok && l.personas) || [];
+        render();
+        // 返回 true 表示"这次加载是有效的"，paneLoaded 才会打标记。
+        // 两个接口都失败 → 返回 false，下次进入这个 pane 会重试。
+        return !!(m?.ok || l?.ok);
+      } catch (e) {
+        const el2 = getEl();
+        if (el2) el2.innerHTML = '<div class="cy-empty">加载失败，点「刷新」重试</div>';
+        return false;
+      }
     };
 
     box.querySelector('#cy-persona-refresh')?.addEventListener('click', load);
@@ -1650,16 +1765,34 @@ license: MIT
       });
     };
 
+    // ── 搜索（2026-10-27）──
+    //
+    // 用户要求："给创造营加插件搜索功能"
+    //
+    // 与分类筛选**联合生效**（AND）：先按分类过滤，再按关键词过滤。
+    // 关键词匹配范围：插件名 / id / 说明 / 作者 / 分类名，
+    // 全部小写化后做子串匹配 —— 中文不用分词，命中率高、够用。
+    const searchEl = box.querySelector('#cy-search');
+    const clearEl = box.querySelector('#cy-search-clear');
+    let keyword = '';
+
     const applyFilter = () => {
       // 🔴 直接读卡片上的 data-cat（2026-10-25 修）
       //    原来靠 data-install 反查插件再取 category，
       //    但已安装的卡片没有 data-install（只有"已安装"文字）→ 全部匹配不到。
       const rows = [...listEl.querySelectorAll('[data-pid]')];
+      const kw = keyword.trim().toLowerCase();
+
       rows.forEach((row) => {
         const cat = row.dataset.cat || '未分类';
-        row.style.display = (current === '全部' || cat === current) ? '' : 'none';
+        const catOk = current === '全部' || cat === current;
+        // data-search 在渲染卡片时写入（见下方 pluginCards 生成处）
+        const hay = (row.dataset.search || '').toLowerCase();
+        const kwOk = !kw || hay.includes(kw);
+        row.style.display = (catOk && kwOk) ? '' : 'none';
       });
-      // 空结果提示
+
+      // 空结果提示：说清是"搜不到"还是"分类下没有"
       const visible = rows.filter((r) => r.style.display !== 'none').length;
       let empty = listEl.querySelector('.cy-cat-empty');
       if (!visible) {
@@ -1668,11 +1801,65 @@ license: MIT
           empty.className = 'cy-empty cy-cat-empty';
           listEl.appendChild(empty);
         }
-        empty.textContent = `「${current}」分类下没有插件`;
+        empty.textContent = kw
+          ? `没找到匹配「${keyword.trim()}」的插件${current !== '全部' ? `（当前分类：${current}）` : ''}`
+          : `「${current}」分类下没有插件`;
       } else if (empty) {
         empty.remove();
       }
     };
+
+    // 输入即搜（不防抖，本地过滤几十条无压力）
+    searchEl?.addEventListener('input', () => {
+      keyword = searchEl.value || '';
+      if (clearEl) clearEl.style.display = keyword ? '' : 'none';
+      applyFilter();
+    });
+    // Esc 清空
+    searchEl?.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        searchEl.value = '';
+        keyword = '';
+        if (clearEl) clearEl.style.display = 'none';
+        applyFilter();
+      }
+    });
+    clearEl?.addEventListener('click', () => {
+      if (searchEl) { searchEl.value = ''; searchEl.focus(); }
+      keyword = '';
+      clearEl.style.display = 'none';
+      applyFilter();
+    });
+
+    // ── 排序（2026-10-27）──
+    //
+    // 43 个插件只靠分类+搜索找，翻起来累。加三种排序。
+    // 排序 = 重排 DOM 顺序（appendChild），与筛选互不干扰：
+    // 先排序再过滤，隐藏的卡片保持原顺序，取消筛选后立刻恢复正确位置。
+    const sortEl = box.querySelector('#cy-sort');
+    const sortCards = () => {
+      const mode = sortEl?.value || 'default';
+      if (mode === 'default') return;
+      const rows = [...listEl.querySelectorAll('[data-pid]')];
+      rows.sort((a, b) => {
+        if (mode === 'downloads') {
+          const da = Number(a.dataset.downloads || 0);
+          const db = Number(b.dataset.downloads || 0);
+          if (db !== da) return db - da;
+        } else if (mode === 'name') {
+          return String(a.dataset.name || '').localeCompare(String(b.dataset.name || ''), 'zh');
+        } else if (mode === 'updated') {
+          return String(b.dataset.updated || '').localeCompare(String(a.dataset.updated || ''));
+        }
+        return 0;
+      });
+      for (const r of rows) listEl.appendChild(r);
+    };
+
+    sortEl?.addEventListener('change', () => {
+      sortCards();
+      applyFilter();
+    });
 
     renderChips();
   })();
@@ -2210,6 +2397,18 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
     }
 
     el.innerHTML = `
+      <!-- 三级菜单（2026-10-27）：管理页内容太多，分栏收起 -->
+      <div class="cy-subtabs" id="cy-admin-subtabs">
+        <button class="cy-subtab on" data-sub="downloads">下载统计</button>
+        <button class="cy-subtab" data-sub="users">注册用户 <span class="cy-subn">${d.usersTotal || 0}</span></button>
+        <button class="cy-subtab" data-sub="authors">作者 <span class="cy-subn">${authors.length}</span></button>
+        <button class="cy-subtab" data-sub="plugins">插件 <span class="cy-subn">${plugins.length}</span></button>
+        <button class="cy-subtab" data-sub="review">投稿审核</button>
+        <button class="cy-subtab" data-sub="admins">管理员</button>
+        <button class="cy-subtab" data-sub="feedback">反馈</button>
+      </div>
+
+      <div class="cy-subpane on" data-sub="downloads">
       <div class="cy-admin-stats">
         <div class="cy-stat"><b>${s.totalPlugins ?? 0}</b><span>插件总数</span></div>
         <div class="cy-stat"><b>${s.totalAuthors ?? 0}</b><span>作者数</span></div>
@@ -2228,6 +2427,8 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
       </div>
       <div id="cy-dl-root"><div class="cy-empty">加载中…</div></div>
 
+      </div>
+      <div class="cy-subpane" data-sub="users">
       <div class="cy-section-title" style="display:flex;align-items:center;gap:8px;margin-top:22px">
         全部注册用户
         <span class="cy-badge">共 ${d.usersTotal || 0} 位</span>
@@ -2254,6 +2455,8 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
           </div>`).join('') : '<div class="cy-empty">还没有人注册。别人的创造营会来这台服务器发验证码，注册后自动登记。</div>'}
       </div>
 
+      </div>
+      <div class="cy-subpane" data-sub="authors">
       <div class="cy-section-title">
         全部作者（有发布的）
         <span class="cy-badge" style="margin-left:8px">共 ${authors.length} 位</span>
@@ -2271,6 +2474,8 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
           </div>`).join('')}
       </div>
 
+      </div>
+      <div class="cy-subpane" data-sub="plugins">
       <div class="cy-section-title" style="margin-top:20px">
         全部插件
         <span class="cy-badge" style="margin-left:8px">共 ${plugins.length} 个</span>
@@ -2301,6 +2506,8 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
         }).join('')}
       </div>
 
+      </div>
+      <div class="cy-subpane" data-sub="review">
       <div class="cy-section-title" style="margin-top:24px">
         投稿审核
         <span class="cy-badge" id="cy-sub-stats" style="margin-left:8px">加载中…</span>
@@ -2308,7 +2515,8 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
       <div id="cy-sub-list">
         <div class="cy-empty">加载中…</div>
       </div>
-
+      </div><!-- /cy-subpane review -->
+      <div class="cy-subpane" data-sub="admins">
       <div class="cy-section-title" style="margin-top:20px">
         管理员
         <span class="cy-badge" id="cy-adm-count">加载中…</span>
@@ -2328,13 +2536,38 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
       </div>
 
       <!-- 全部反馈（管理员视角，2026-10-25）-->
+      </div>
+      <div class="cy-subpane" data-sub="feedback">
       <div class="cy-section-title" style="margin-top:22px">
         全部反馈
         <span class="cy-badge" id="cy-allfb-count">加载中…</span>
         <button class="btn tiny" id="cy-allfb-refresh" style="margin-left:8px">刷新</button>
       </div>
       <div id="cy-allfb-root"><div class="cy-empty">加载中…</div></div>
+      </div><!-- /cy-subpane feedback -->
 `;
+
+    // ── 三级菜单切换（2026-10-27）──
+    // 管理页塞了 7 块内容，全平铺太长。分栏显示，默认停在「下载统计」。
+    const subTabs = el.querySelector('#cy-admin-subtabs');
+    if (subTabs) {
+      const activate = (key) => {
+        subTabs.querySelectorAll('.cy-subtab').forEach((b) => {
+          b.classList.toggle('on', b.dataset.sub === key);
+        });
+        el.querySelectorAll('.cy-subpane').forEach((p) => {
+          p.classList.toggle('on', p.dataset.sub === key);
+        });
+        try { localStorage.setItem('cy_admin_sub', key); } catch { /* ignore */ }
+      };
+      subTabs.querySelectorAll('.cy-subtab').forEach((b) => {
+        b.addEventListener('click', () => activate(b.dataset.sub));
+      });
+      // 回到上次那一栏
+      let last = 'downloads';
+      try { last = localStorage.getItem('cy_admin_sub') || 'downloads'; } catch { /* ignore */ }
+      if (last !== 'downloads') activate(last);
+    }
 
     // 内核反馈已移到「发布」栏（作者也能看，见下方 myFeedback）
 

@@ -131,6 +131,8 @@ export class SessionRegistry {
     // 缓存命中（2026-10-26 加）：缺省 0，老汇总文件照样能读
     let cachedTokens = 0;
     let cacheMissTokens = 0;
+    // 积分（2026-10-27 整合）：按 credit 计费的中转商才有值
+    let credit = 0;
     // 结束的会话记在汇总文件里
     try {
       const data = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage-today.json'), 'utf8'));
@@ -141,6 +143,7 @@ export class SessionRegistry {
         runs = data.runs || 0;
         cachedTokens = data.cachedTokens || 0;
         cacheMissTokens = data.cacheMissTokens || 0;
+        credit = data.credit || 0;
       }
     } catch { /* 无记录 */ }
     // 加上运行中的
@@ -150,14 +153,15 @@ export class SessionRegistry {
       totalTokens += s.usage.totalTokens;
       cachedTokens += s.usage.cachedTokens || 0;
       cacheMissTokens += s.usage.cacheMissTokens || 0;
+      credit += s.usage.credit || 0;
     }
-    return { dayKey, promptTokens, completionTokens, totalTokens, runs, cachedTokens, cacheMissTokens };
+    return { dayKey, promptTokens, completionTokens, totalTokens, runs, cachedTokens, cacheMissTokens, credit };
   }
 
   /** 在会话结束时累加今日用量。 */
   #bumpTodayUsage(s) {
     const dayKey = localDayKey(s.startedAt);
-    let data = { dayKey, promptTokens: 0, completionTokens: 0, totalTokens: 0, runs: 0, cachedTokens: 0, cacheMissTokens: 0 };
+    let data = { dayKey, promptTokens: 0, completionTokens: 0, totalTokens: 0, runs: 0, cachedTokens: 0, cacheMissTokens: 0, credit: 0 };
     try {
       const parsed = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'usage-today.json'), 'utf8'));
       if (parsed?.dayKey === dayKey) data = parsed;
@@ -167,6 +171,7 @@ export class SessionRegistry {
     data.totalTokens += s.usage.totalTokens;
     data.cachedTokens = (data.cachedTokens || 0) + (s.usage.cachedTokens || 0);
     data.cacheMissTokens = (data.cacheMissTokens || 0) + (s.usage.cacheMissTokens || 0);
+    data.credit = (data.credit || 0) + (s.usage.credit || 0);
     data.runs += 1;
     const tmp = path.join(DATA_DIR, 'usage-today.json.tmp');
     fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');

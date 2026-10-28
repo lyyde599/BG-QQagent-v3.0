@@ -15,6 +15,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 
+import { checkPair, recommend, qqForNapcat, napcatForQQ, VERIFIED_PAIRS } from './napcat-compat.js';
+
 const NAPCAT_REPO = 'NapNeko/NapCatQQ';
 const QQ_VERSION_API = 'https://im.qq.com/rainbow/linuxQQDownload';
 
@@ -142,11 +144,28 @@ export async function checkQQLatest() {
     const d = JSON.parse(m[1]);
     const arch = process.arch === 'arm64' ? 'armDownloadUrl' : 'x64DownloadUrl';
     const dl = d?.[arch]?.deb || d?.[arch]?.rpm || '';
+
+    // 顺带探一下这个地址是否还活着（2026-10-28）
+    // 官网版本页会滞后：页面上写着 3.2.18，文件早撤了。
+    // 提前探明可以让前端把「安装」按钮标成不可用，而不是点下去才报 404。
+    let urlAlive = true;
+    if (dl) {
+      try {
+        const head = await fetch(dl, {
+          method: 'HEAD',
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(8000)
+        });
+        urlAlive = head.status !== 404 && head.status !== 403;
+      } catch { /* 探不通就当活着，交给下载去试 */ }
+    }
+
     return {
       ok: true,
       latest: String(d.version || ''),
       updateDate: String(d.updateDate || ''),
       url: dl,
+      urlAlive,
       desc: String(d.desc || ''),
       // 官方这个页面偶尔滞后，本地比它新时前端要提示"无需更新"而不是"降级"
       raw: { version: d.version, updateDate: d.updateDate },
@@ -189,6 +208,7 @@ export async function checkAll() {
       // 官方页面版本号可能滞后于本地，只在"官方确实更新"时提示
       needUpdate: qqInstalled && qq.ok && cmpVersion(qq.latest, localQq) > 0,
       url: qq.url || '',
+      urlAlive: qq.urlAlive !== false,   // false = 官方地址已失效
       desc: qq.desc || '',
     },
   };
@@ -362,6 +382,35 @@ export async function installNapcat({ url, version, onLog = () => {} } = {}) {
 export async function installQQ({ url, version, onLog = () => {} } = {}) {
   const root = napcatRoot();
   if (!url) return { ok: false, error: '缺少下载地址' };
+
+  // 🔴 下载前先探一下地址是否还活着（2026-10-28 修）
+  //
+  // 事故：群友点「安装 QQ 3.2.18」直接弹 404。
+  // 根因是腾讯官网版本页上的 deb 链接**会过期**——
+  // 页面还挂在 old 版本，实际文件已被撤掉。
+  // 这里提前 HEAD 一次，把"链接失效"和"网络不通"区分开，
+  // 报错时给出可操作的说法，而不是一句 HTTP 404。
+  try {
+    const probe = await fetch(url, {
+      method: 'HEAD',
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(15000)
+    });
+    if (probe.status === 404 || probe.status === 403) {
+      return {
+        ok: false,
+        error: `官方下载链接已失效（HTTP ${probe.status}）。`
+          + '腾讯官网的 QQ 安装包地址经常过期，建议：'
+          + '① 去 https://im.qq.com/linuxqq 手动下载当前版本；'
+          + '② 或用「检查更新」重新获取一次地址。',
+        urlDead: true,
+        url
+      };
+    }
+  } catch (e) {
+    // HEAD 失败不阻断——有些 CDN 不支持 HEAD，让真正的下载去试
+    onLog(`地址预检未通过（${String(e?.message ?? e).slice(0, 40)}），继续尝试下载…`);
+  }
 
   const dir = UPD_DIR();
   const tag = String(version || 'latest').replace(/[^\w.\-]/g, '');
@@ -779,8 +828,33 @@ export async function checkAllWithSnowluma() {
   const localSl = localSnowlumaVersion();
   const slInstalled = isSnowlumaInstalled();
 
+  // ── 兼容性判定（2026-10-28）──
+  //
+  // 群友反馈：按提示装了最新 NapCat 4.18.41 + 最新 QQ 3.2.18，
+  // 结果 DSH 报版本不兼容。
+  //
+  // 根因是"各自追最新"这个思路本身就错：NapCat 是注入到 QQ 里的，
+  // 两边版本必须配套。所以这里给出一份**已验证组合**的推荐，
+  // 而不是简单地报"两个都有新版"。
+  const ncLocal = base?.napcat?.local || '';
+  const qqLocal = base?.qq?.local || '';
+  const compat = checkPair(ncLocal, qqLocal);
+  const rec = recommend({
+    napcatLatest: base?.napcat?.latest,
+    qqLatest: base?.qq?.latest,
+    napcatLocal: ncLocal,
+    qqLocal
+  });
+
   return {
     ...base,
+    compat: {
+      ...compat,
+      recommendation: rec,
+      verifiedPairs: VERIFIED_PAIRS.map((p) => ({
+        napcat: p.napcat, qq: p.qq, note: p.note, verifiedAt: p.verifiedAt
+      }))
+    },
     snowluma: {
       installed: slInstalled,
       local: localSl,
@@ -880,7 +954,7 @@ async function systemctlAs(action, unit) {
  *   ① 先停掉**另一个**通道（同一 QQ 号不能同时在线，会互踢）
  *   ② 改 config.snowluma.wsUrl/httpUrl
  *   ③ 启动目标通道
- *   ④ 提示内核重连（重启 qq-agent-v2 最稳，但会中断当前对话，
+ *   ④ 提示内核重连（重启 BG-QQagent-Linux 最稳，但会中断当前对话，
  *      所以这里只改配置 + 返回 needKernelRestart，让前端决定）
  *
  * @param {string} target 'napcat' | 'snowluma'
@@ -922,7 +996,7 @@ export async function switchBackend(target, { writeConfig, onLog = () => {} } = 
     wsUrl: b.wsUrl,
     httpUrl: b.httpUrl,
     started: started.ok,
-    // 内核要重连才生效。重启 qq-agent-v2 最彻底，但会中断当前对话，
+    // 内核要重连才生效。重启 BG-QQagent-Linux 最彻底，但会中断当前对话，
     // 所以交给调用方决定（前端会给用户一个确认）。
     needKernelRestart: true,
   };

@@ -142,6 +142,16 @@ export function normalizeManifest(raw, { dirName = '' } = {}) {
       uiTab,
       headAssets,
       config,
+      // 🔴 configSchema 必须进白名单（2026-10-28）
+      //
+      // manifest 是**白名单式重组**：没列在这里的字段会被静默丢弃。
+      // configSchema 原来不在名单里，导致：
+      //   插件写了中文字段名 → 归一化时被扔掉 → 接口拿不到 →
+      //   前端 cfgBuildFields() 退化成按 config 键名推断 → 面板显示英文
+      // 是个很隐蔽的遗漏：不报错、不警告，只是"面板变英文"。
+      configSchema: (raw.configSchema && typeof raw.configSchema === 'object' && !Array.isArray(raw.configSchema))
+        ? raw.configSchema
+        : null,
       permissions: Array.isArray(raw.permissions) ? raw.permissions.map(String) : [],
       scopes,
       deps,

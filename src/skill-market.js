@@ -168,6 +168,24 @@ function parseFrontmatter(raw) {
  * @param {string} id      skill id（对应 skills/<id>.md）
  * @param {object} opts    { version, notes, dryRun }
  */
+/**
+ * 读创造营里登录后保存的作者 token（2026-10-28）
+ * 与 plugin-market 共用同一份凭据，不另立文件。
+ */
+function readMarketToken() {
+  const cands = [
+    path.join(DATA_DIR, 'plugins', 'plugin-market', 'market-token.txt'),
+    path.join(ROOT, 'data', 'plugins', 'plugin-market', 'market-token.txt')
+  ];
+  for (const f of cands) {
+    try {
+      const k = fs.readFileSync(f, 'utf8').trim();
+      if (k) return k;
+    } catch { /* 试下一个 */ }
+  }
+  return '';
+}
+
 export async function publishSkill(id, { version = '1.0.0', notes = '', dryRun = false } = {}) {
   const file = path.join(userSkillDir(), `${id}.md`);
   if (!fs.existsSync(file)) return { ok: false, error: `找不到 skills/${id}.md` };
@@ -186,47 +204,133 @@ export async function publishSkill(id, { version = '1.0.0', notes = '', dryRun =
     return { ok: true, dryRun: true, id, version: ver, bytes: buf.length, sha256, filename: fname };
   }
 
+  // ── 投稿给中心，由中心审核上线（2026-10-28）──
+  //
+  // 🔴 设计修正：
+  //   原来作者本机必须有 R2 密钥才能发布技能 —— 这不该是作者的负担，
+  //   也是"报错甩出 /root/agent-new/... 别人机器路径"的根源。
+  //
+  //   现在与插件投稿完全一致：
+  //     作者带 token → 提交到中心 → 管理员审核 → 上线
+  //   作者全程不接触对象存储。
+  //
+  //   例外：本机若是市场所有者（配了 R2），仍走直连（省一次往返）。
+
   const env = loadR2();
-  if (!env) return { ok: false, error: `没有 R2 凭据（${r2EnvPath()}）` };
+  if (env) {
+    // 所有者路径：直连写 R2（保留原有能力）
+    const st = await r2Put(env, `skills/${fname}`, buf, 'text/markdown; charset=utf-8');
+    if (st !== 200) return { ok: false, error: `正文上传失败 HTTP ${st}` };
+    const cur = await fetchSkillIndex();
+    const skills = cur.ok ? cur.skills : [];
+    const download = `${MARKET_BASE}/skills/${fname}`;
+    const hit = skills.find((s) => s.id === id);
+    const item = {
+      id, name: meta.name || id, summary: meta.summary || '',
+      author: meta.author || '白光', version: ver,
+      download, updatedAt: new Date().toISOString()
+    };
+    if (hit) Object.assign(hit, item); else skills.push(item);
 
-  // ① 传正文
-  const st = await r2Put(env, `skills/${fname}`, buf, 'text/markdown; charset=utf-8');
-  if (st !== 200) return { ok: false, error: `正文上传失败 HTTP ${st}` };
+    // 直接用 r2Put 写回清单（原 pushSkillIndex 未定义，2026-10-28 修）
+    const idxBody = JSON.stringify({
+      apiVersion: 1,
+      updatedAt: new Date().toISOString(),
+      skills
+    }, null, 2);
+    const st2 = await r2Put(env, 'skills/index.json', idxBody, 'application/json');
+    if (st2 !== 200) return { ok: false, error: `清单更新失败 HTTP ${st2}` };
+    return { ok: true, direct: true, id, version: ver, download, total: skills.length };
+  }
 
-  // ② 更新清单
-  const cur = await fetchSkillIndex();
-  const skills = cur.ok ? cur.skills : [];
-  const download = `${MARKET_BASE}/skills/${fname}`;
-  const item = {
-    id,
-    name: meta.name,
-    summary: meta.summary,
-    when: meta.when || '',
-    version: ver,
-    // 作者归属（2026-10-25）：skill 也能像插件一样归到人名下
-    author: meta.author || '白光',
-    license: meta.license || 'MIT',
-    updatedAt: new Date().toISOString(),
-    notes: String(notes || '').slice(0, 1000),
-    download,
-    sha256,
-    size: buf.length
-  };
-  const next = skills.filter((s) => s.id !== id);
-  next.push(item);
-  next.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  // ── 有作者 token：直传（Worker 代写，作者不接触密钥）──
+  //
+  // 2026-10-28 用户要求："有没有办法给她们（账号登录作者）r2 授权呢"
+  //
+  // 直接发 R2 密钥是错的 —— 那是桶级权限，拿到就能删光整个市场，
+  // 而且散落在每个作者机器上，无法单独吊销、无法审计。
+  //
+  // 正确做法：**给能力，不给密钥**。
+  // 作者带 token 调 /api/skills/direct-publish，Worker 用自己的绑定代写。
+  // 作者得到的是"发布自己的技能"这一项权限，Worker 侧还会校验归属：
+  // 同一个 id 只有原作者能覆盖。
+  const token0 = readMarketToken();
+  if (token0) {
+    try {
+      const r = await fetch(`${MARKET_BASE}/api/skills/direct-publish`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'User-Agent': UA },
+        body: JSON.stringify({
+          token: token0,
+          id,
+          version: ver,
+          name: meta.name || id,
+          summary: meta.summary || '',
+          content: raw
+        }),
+        signal: AbortSignal.timeout(60000)
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d?.ok) {
+        return {
+          ok: true,
+          direct: true,
+          via: 'author-token',
+          id,
+          version: ver,
+          download: d.download,
+          total: d.total
+        };
+      }
+      // 403（id 被占）等业务错误直接返回，不再退到投稿
+      if (r.status === 403) return { ok: false, error: d?.error || '这个 id 已被其他作者占用' };
+      if (r.status !== 401) return { ok: false, error: d?.error || `发布失败 HTTP ${r.status}` };
+      // 401 = token 失效，落到投稿路径给出明确提示
+    } catch { /* 网络异常，继续尝试投稿 */ }
+  }
 
-  const st2 = await r2Put(env, 'skills/index.json', Buffer.from(JSON.stringify({
-    apiVersion: 1,
-    updatedAt: new Date().toISOString(),
-    skills: next
-  }, null, 2)), 'application/json');
-  if (st2 !== 200) return { ok: false, error: `清单更新失败 HTTP ${st2}` };
+  // 非所有者：投稿给中心
+  const token = readMarketToken();
+  if (!token) {
+    return {
+      ok: false,
+      needSubmit: true,
+      error: '请先在「创造营」注册作者账号并登录，然后重新发布（不需要 R2 密钥）。'
+    };
+  }
 
-  // 刚改过清单，缓存立刻失效（否则要等 5 分钟才看到自己发的）
-  clearSkillIndexCache();
-  return { ok: true, id, version: ver, bytes: buf.length, download, total: next.length };
+  try {
+    const r = await fetch(`${MARKET_BASE}/api/skills/submit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'User-Agent': UA },
+      body: JSON.stringify({
+        token,
+        id,
+        version: ver,
+        name: meta.name || id,
+        summary: meta.summary || '',
+        notes: String(meta.notes || ''),
+        content: raw
+      }),
+      signal: AbortSignal.timeout(60000)
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d?.ok) {
+      return { ok: false, error: d?.error || `提交失败 HTTP ${r.status}`, needSubmit: true };
+    }
+    return {
+      ok: true,
+      submitted: true,
+      id,
+      version: ver,
+      submissionId: d.submission?.id,
+      message: '已提交，等待管理员审核后上线'
+    };
+  } catch (e) {
+    return { ok: false, error: '连不上市场服务：' + String(e?.message ?? e).slice(0, 80), needSubmit: true };
+  }
 }
+
 
 /**
  * 下架 skill（2026-10-25）

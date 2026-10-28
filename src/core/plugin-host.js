@@ -131,7 +131,8 @@ export class PluginHost {
     this.hooks = { message: [], poke: [], notice: [], tick: [], prefilter: [] };
     this.routes = [];                 // { id, method, pattern, handler }
     this.toolDefs = [];               // { id, def }
-    this.promptSections = [];         // { id, name, fn }
+    this.promptSections = [];
+    this.contextStrategy = null;   // 由插件注册的上下文策略（2026-10-28）         // { id, name, fn }
     this.uiTabs = [];                 // { id, label, pluginId, file }
     this.schedulerTimers = new Map(); // key -> timer
     this.#changeListeners = new Set();  // 装卸/重载订阅者（P1 公开 API 用）
@@ -240,7 +241,8 @@ export class PluginHost {
 
     // 子注册表：dispose 时按这些清单精确摘除，不误伤其它插件
     const sub = {
-      hooks: [], routes: [], tools: [], promptSections: [], timers: [], uiTab: null
+      hooks: [], routes: [], tools: [], promptSections: [], timers: [], uiTab: null,
+      contextStrategy: false
     };
     const priv = createPluginConfig(id, manifest.config);
     const state = createStateHandle(id);
@@ -309,6 +311,10 @@ export class PluginHost {
       this.#rollback(rec.sub || { hooks: [], routes: [], tools: [], promptSections: [], timers: [] }, id);
     }
     this.uiTabs = this.uiTabs.filter((t) => t.pluginId !== id);
+    // 上下文策略：只有注册者是本插件才摘（避免误清别的插件注册的策略）
+    if (this.contextStrategy?.id === id) {
+      this.contextStrategy = null;
+    }
     rec.status = 'disabled';
     rec.handle = null;
     this.log(`[plugins] ${id} 已停用`);
@@ -634,6 +640,36 @@ export class PluginHost {
           if (!def.body && !def.file) throw new Error(`skill ${def.id} 需要 body 或 file`);
           registerPluginSkill(id, def);
           return () => unregisterPluginSkills(id);
+        }
+      },
+
+// ── 上下文策略注册（2026-10-28）──
+      //
+      // 需求来源：群里 10+ 条未读时，模型抓不住上下文 ——
+      //   因为触发消息全部被排除出【过去状态】，只在【本次唤醒】出现，
+      //   于是历史断裂成碎片。
+      //
+      // 内核提供一个「决策点」，让插件决定：
+      //   · 哪些未读该进触发池（= 立刻要回）
+      //   · 哪些该留在过去状态里当背景（= 只是让你知道）
+      //
+      // 约定：
+      //   · 同一时刻只有一个策略生效（后注册的优先，日志会提示覆盖）
+      //   · 返回值必须是 { trigger: [], background: [] }（消息对象数组）
+      //   · 策略抛错 / 返回非法值 → 自动回退 builtin，**绝不让机器人哑掉**
+      //   · dispose 时自动摘除
+      context: {
+        registerStrategy(fn) {
+          if (typeof fn !== 'function') throw new Error('context.registerStrategy 需要函数');
+          if (host.contextStrategy) {
+            host.log(`[plugin:${id}] 上下文策略覆盖了 ${host.contextStrategy.id} 的注册`);
+          }
+          host.contextStrategy = { id, fn };
+          sub.contextStrategy = true;
+          return () => {
+            if (host.contextStrategy?.id === id) host.contextStrategy = null;
+            sub.contextStrategy = false;
+          };
         }
       },
 

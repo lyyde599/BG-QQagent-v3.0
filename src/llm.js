@@ -28,6 +28,14 @@ export async function chatCompletion({ messages, tools = null, toolChoice = 'aut
   const temp = temperature === null ? (cfg.temperature ?? 0.8) : temperature;
   if (temp !== null && temp !== undefined && Number.isFinite(Number(temp))) body.temperature = Number(temp);
 
+  // ── 输出 token 上限（2026-10-27 整合，开关 api.maxTokens）──
+  //
+  // 为什么要显式设：思考型模型会把预算耗在 reasoning 上，
+  // 不设上限时正文可能只剩空壳；设太小又会把正文挤没。
+  // 给个明确值（config 里 api.maxTokens），比完全交给上游默认可控。
+  const mt = Number(cfg.maxTokens);
+  if (Number.isFinite(mt) && mt > 0) body.max_tokens = mt;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('请求超时')), Math.max(5000, Number(cfg.timeoutMs) || 180000));
   if (signal) {
@@ -129,6 +137,12 @@ export function addUsage(target, usage) {
     target.lastCache = { cached, miss, at: Date.now() };
   }
 
+  // ── 积分计费（2026-10-27 整合）──
+  // 有些中转商按 credit 计费而非按 token 折算，上游会在 usage 里回传 credit。
+  // 有就累加，没有就保持 0，不影响按 token 计价的老配置。
+  const credit = num(usage.credit);
+  if (credit) target.credit = (target.credit || 0) + credit;
+
   return target;
 }
 
@@ -136,13 +150,17 @@ export function emptyUsage() {
   return {
     promptTokens: 0, completionTokens: 0, totalTokens: 0, calls: 0,
     // 缓存统计（2026-10-26 加）：字段缺省为 0，老的 session 文件照样能读
-    cachedTokens: 0, cacheMissTokens: 0, lastCache: null
+    cachedTokens: 0, cacheMissTokens: 0, lastCache: null,
+    // 积分（2026-10-27 加）：按 credit 计费的中转商才有值
+    credit: 0
   };
 }
 
 /** 按配置单价折算成本（元）。 */
 export function estimateCost(usage) {
   const cfg = getConfig().api;
+  // credit 计费模式下没有「钱」的概念，直接返回 0，避免面板显示误导性金额
+  if (cfg.billing === 'credit') return 0;
   const cost = (usage.promptTokens / 1e6) * (Number(cfg.priceInputPerM) || 0)
     + (usage.completionTokens / 1e6) * (Number(cfg.priceOutputPerM) || 0);
   return Math.round(cost * 1e4) / 1e4;

@@ -3,7 +3,7 @@
 // 「每晚定时私聊播报次日课程」——应用内调度器（不使用 cron / systemd timer）。
 //
 // 设计要点：
-//   1. 纯应用内：所有改动都在 /root/qq-agent-v2 里，不碰任何系统级配置。
+//   1. 纯应用内：所有改动都在 /root/BG-QQagent-Linux 里，不碰任何系统级配置。
 //   2. 到点走 orchestrator.wake(chatKey, { proactive: true, pushTask })，因此自动继承：
 //      · 预算熔断 / 全局并发上限 / 暂停状态保护
 //      · 私聊配额与"私聊必回"兜底；提醒逻辑写在主提示词里（见 src/prompt.js 的 pushTask 分支）
@@ -16,7 +16,7 @@
 //      （那是 UTC，23:00 之后会跨天，把"明天"算错）。
 //   7. 三态文案：有课 / 明日无课 / 超出课表范围（2027-01-18 之后）都有话说。
 //
-// 部署：把本文件拷到 /root/qq-agent-v2/src/schedule-notify.js（见 apply.sh）
+// 部署：把本文件拷到 /root/BG-QQagent-Linux/src/schedule-notify.js（见 apply.sh）
 // 依赖改动：src/app.js（import/实例化/start/stop/两个 API）、src/orchestrator.js（wake 透传
 //          pushTask）、src/prompt.js（渲染播报指令）。详见同目录 功能说明与部署手册.md
 // ─────────────────────────────────────────────────────────────────────────────

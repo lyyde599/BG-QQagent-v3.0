@@ -8,6 +8,94 @@ import { sleep, randInt, createSendChain, escapeCqText, formatClockTime } from '
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
 
 export class SendQueue {
+  #memberCache = new Map();
+  /**
+   * 把文本里的「@昵称」转成真正的 at 段（2026-10-28）
+   *
+   * 问题：模型经常不调 atUserId 参数，而是在正文里手打「@云鸮#123」。
+   *   发出去只是一段普通文字 —— 被 @ 的人**收不到提醒**，
+   *   表现是「形式上对了，但对方没反应」。
+   *
+   * 做法：发送前把群成员名单拉下来，按昵称/群名片匹配文本里的 @xxx，
+   *   命中就把那段文字替换成 { type:'at', data:{qq} } 段。
+   *
+   * 保守原则：
+   *   · 只在群聊里做（私聊没有群成员概念，@ 无意义）
+   *   · 昵称支持带 #数字后缀（QQ 客户端复制出来的格式）
+   *   · 匹配不到就不动，保持原文本（宁可假 @ 也不误 @）
+   *   · 名单拉取失败就跳过，不影响正常发送
+   *
+   * @returns {Array} OneBot 消息段数组
+   */
+  async #toSegments(kind, id, text) {
+    const plainSeg = { type: 'text', data: { text: escapeCqText(String(text ?? '')) } };
+    if (kind !== 'group') return [plainSeg];
+
+    const src = String(text ?? '');
+    if (!src.includes('@')) return [plainSeg];
+
+    // 拉群成员名单（带短缓存，避免每条消息都请求一次）
+    let members = null;
+    try {
+      members = await this.#groupMembersCached(id);
+    } catch { /* 拉不到就按纯文本发 */ }
+    if (!members || !members.length) return [plainSeg];
+
+    // 昵称 → QQ 号（同一昵称多人时取第一个，并记下来避免歧义误伤）
+    const byName = new Map();
+    for (const m of members) {
+      const card = String(m.card || '').trim();
+      const nick = String(m.nickname || '').trim();
+      const qq = String(m.user_id ?? '');
+      if (!qq) continue;
+      if (card) byName.set(card, qq);
+      if (nick && !byName.has(nick)) byName.set(nick, qq);
+    }
+
+    // 逐个 @xxx 尝试替换。@ 后面允许：昵称（可含空格外的任意字符）、#数字
+    const out = [];
+    const re = /@([^\s@]{1,32})/g;
+    let last = 0;
+    let m;
+    let replaced = 0;
+    while ((m = re.exec(src)) !== null) {
+      const raw = m[1];
+      // 去掉 QQ 客户端复制时带的 #数字后缀
+      const candidates = [raw, raw.replace(/#\d+$/, '')];
+      let qq = null;
+      for (const c of candidates) {
+        if (byName.has(c)) { qq = byName.get(c); break; }
+      }
+      if (!qq) continue;   // 匹配不到：保留原文
+
+      // 前面的普通文字
+      if (m.index > last) {
+        out.push({ type: 'text', data: { text: escapeCqText(src.slice(last, m.index)) } });
+      }
+      out.push({ type: 'at', data: { qq } });
+      last = m.index + m[0].length;
+      replaced++;
+    }
+
+    if (!replaced) return [plainSeg];
+    if (last < src.length) {
+      out.push({ type: 'text', data: { text: escapeCqText(src.slice(last)) } });
+    }
+    return out.length ? out : [plainSeg];
+  }
+
+  /** 群成员名单短缓存（60 秒），避免每条消息都打一次 API */
+  async #groupMembersCached(groupId) {
+    const now = Date.now();
+    const c = this.#memberCache.get(groupId);
+    if (c && now - c.at < 60000) return c.list;
+    const list = await this.onebot.call('get_group_member_list', { group_id: groupId });
+    const arr = Array.isArray(list) ? list : [];
+    this.#memberCache.set(groupId, { at: now, list: arr });
+    if (this.#memberCache.size > 50) this.#memberCache.clear();
+    return arr;
+  }
+
   constructor({ onebot, store, onSent = null }) {
     this.onebot = onebot;
     this.store = store;
@@ -89,9 +177,28 @@ export class SendQueue {
       promises.push(chain(async () => {
         this.#checkRate(chatKey);
         if (gap > 0) await sleep(gap);
-        const data = await this.onebot.sendText(kind, id, text, {
-          replyToMessageId: i === 0 ? options.replyToMessageId : null, // 引用挂在第一条上：回的就是那条
-          atUserId: i === 0 ? options.atUserId : null,
+        // 🔴 2026-10-28：把正文里的「@昵称」转成真正的 at 段
+        //
+        // 模型经常不调 atUserId，而是手打「@云鸮#123」—— 发出去只是普通文字，
+        // 被 @ 的人收不到提醒。这里自动识别并转成 at 段。
+        //
+        // 显式传了 atUserId 时，仍把它排在最前面（保持原有语义）。
+        let segments = await this.#toSegments(kind, id, text);
+
+        // 引用与 atUserId 只挂在第一条上（回的就是那条）
+        if (i === 0) {
+          const prefix = [];
+          if (options.replyToMessageId != null && String(options.replyToMessageId).trim() !== '') {
+            prefix.push({ type: 'reply', data: { id: String(options.replyToMessageId).trim() } });
+          }
+          if (options.atUserId != null && String(options.atUserId).trim() !== '') {
+            const at = String(options.atUserId).trim();
+            if (/^\d+$/.test(at)) prefix.push({ type: 'at', data: { qq: at } });
+          }
+          if (prefix.length) segments = [...prefix, ...segments];
+        }
+
+        const data = await this.onebot.sendSegments(kind, id, segments, {
           // 群临时会话：非好友的群成员必须带 group_id 才能私聊
           extraGroupId: options.extraGroupId ?? null,
         });
@@ -120,16 +227,41 @@ export class SendQueue {
     const [kind, id] = String(chatKey).split(':');
     const chain = this.#chain(chatKey);
     return chain(async () => {
-      const data = await this.onebot.sendFile(kind, id, filePath, fileName);
-      const ts = Date.now();
-      this.store.appendSelf(chatKey, { text: `[文件:${fileName || String(filePath).split('/').pop()}]`, ts });
-      this.onSent?.({ chatKey, text: '[文件]', messageId: data?.file_id ?? null });
-      return data;
+      const attemptAt = Date.now();
+      try {
+        const data = await this.onebot.sendFile(kind, id, filePath, fileName);
+        const ts = Date.now();
+        this.store.appendSelf(chatKey, { text: `[文件:${fileName || String(filePath).split('/').pop()}]`, ts });
+        this.onSent?.({ chatKey, text: '[文件]', messageId: data?.file_id ?? null });
+        return data;
+      } catch (e) {
+        const msg = String(e?.message ?? e);
+        // 🔴 文件通道同样有「假性超时」（2026-10-27 用户反馈）
+        //
+        // 现象：一次「画个龙」请求，机器人发了 3 张图还说"图送不出"。
+        // 根因是 sendImage 判超时 → 降级调 sendFile → sendFile 也超时 →
+        // 整条降级路径抛错 → 插件返回 err() → 模型认为失败并重画。
+        // 但用户明明收到了那几张图（文件形式）。
+        //
+        // 所以这里和 sendImage 一样：超时先查证，查到就是已送达。
+        if (/Timeout|EventChecker Failed|rich media transfer failed/i.test(msg)) {
+          await sleep(2500);
+          const v = await this.#verifyImageDelivered(kind, id, attemptAt);
+          if (v.found) {
+            const ts = Date.now();
+            const name = fileName || String(filePath).split('/').pop();
+            this.store.appendSelf(chatKey, { text: `[文件:${name}]`, ts });
+            this.onSent?.({ chatKey, text: '[文件]', messageId: v.messageId ?? null });
+            return { file_id: null, message_id: v.messageId ?? null, receiptMissing: true, verified: true };
+          }
+        }
+        throw e;
+      }
     });
   }
 
   /**
-   * 发图超时后，向 QQ 查证「到底送到了没有」。
+   * 发图/发文件超时后，向 QQ 查证「到底送到了没有」。
    *
    * 🔴 为什么降级前必须先查证（2026-10-27 用户反馈修正）
    *
@@ -152,8 +284,11 @@ export class SendQueue {
    */
   async #verifyImageDelivered(kind, id, sinceMs) {
     try {
+      // ⚠️ onebot.call() 返回的**已经是 body.data**，不要再 .data 一次
+      //    （2026-10-27 踩坑：多取一层导致 myId 恒为 0，查证永远返回 false，
+      //      于是假性超时被判成真失败，模型以为没发出去反复重画）
       const me = await this.onebot.call('get_login_info', {});
-      const myId = Number((me?.data || {}).user_id || 0);
+      const myId = Number((me || {}).user_id || 0);
       if (!myId) return { found: false };
 
       const action = kind === 'private' ? 'get_friend_msg_history' : 'get_group_msg_history';
@@ -161,14 +296,15 @@ export class SendQueue {
         ? { user_id: Number(id), count: 10 }
         : { group_id: Number(id), count: 10 };
       const r = await this.onebot.call(action, params);
-      const msgs = (r?.data || {}).messages || [];
+      const msgs = (r || {}).messages || [];
       const lo = Math.floor((sinceMs - 5000) / 1000);
 
       for (let i = msgs.length - 1; i >= 0; i--) {
         const m = msgs[i];
         if (Number((m.sender || {}).user_id) !== myId) continue;
         if (Number(m.time) < lo) continue;
-        if (!(m.message || []).some((s) => s && s.type === 'image')) continue;
+        // 图片和文件都算「送达」—— 降级发文件时必须认 file（2026-10-27）
+        if (!(m.message || []).some((s) => s && (s.type === 'image' || s.type === 'file'))) continue;
         return { found: true, messageId: String(m.message_id || '') };
       }
       return { found: false };

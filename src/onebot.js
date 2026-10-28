@@ -281,7 +281,15 @@ export async function segmentsToText(segments, { resolveReply = null, resolveAtN
         } else {
           let name = null;
           try { name = resolveAtName ? await resolveAtName(String(d.qq)) : null; } catch { name = null; }
-          out.push(name ? `@${name}` : `@${d.qq}`);
+          // 🔴 @ 文本必须带 QQ 号（2026-10-28 修）
+          //
+          // 事故：机器人有自己的群名片「鲸界魔王-白光-小鱼」，
+          // 但身份块告诉模型"你的名字是小鲸鱼"。别人 @ 它时，
+          // 渲染出来是「@鲸界魔王-白光-小鱼」——名字对不上，
+          // 模型判定"@ 的不是我"，该回的不回。
+          //
+          // 带上号后，模型能直接比对：@xxx#3170037984 里那个号就是自己。
+          out.push(name ? `@${name}#${d.qq}` : `@${d.qq}`);
         }
         break;
       }
@@ -304,8 +312,22 @@ export async function segmentsToText(segments, { resolveReply = null, resolveAtN
           try {
             const info = await resolveReply(String(d.id));
             if (info?.sender || info?.text) {
+              // 🔴 引用必须带 QQ 号（2026-10-28 修）
+              //
+              // 事故：机器人把「引用自己」认成「别人在引用别人」，该接的话不接。
+              // 根因：这里只取了 info.sender（群名片/昵称），
+              // **把 resolveReply 已经拿到的 senderId 丢掉了**。
+              // 于是引用文本里只有名字，名字又可能和人设名对不上 ——
+              // 模型没法按号核对，只能猜。
+              //
+              // 现在统一写成「名字#QQ号」，与消息行、@ 的格式一致，
+              // 模型只要比对数字就能确定是谁。
+              const rs = String(info.sender || '').trim();
+              const ru = String(info.senderId || '').trim();
+              const rwho = rs && ru && rs !== ru ? `${rs}#${ru}` : (rs || ru || '');
+
               const parts = [];
-              if (info.sender) parts.push(info.sender);
+              if (rwho) parts.push(rwho);
               if (info.text) parts.push(info.text);
               replyText = `[引用 ${parts.join('：')}]`;
             }

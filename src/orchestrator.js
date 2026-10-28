@@ -305,12 +305,60 @@ export class Orchestrator {
     // 触发批：当前所有未读（含之前积压的）
     // 触发批必须从「物理键」取——消息总是写入物理键（app.js 落库），
     // 有效键只用于历史/记忆隔离，不存放未读。
-    let triggerEntries = proactive ? [] : this.store.drainUnread(physKey);
-    if (proactive) {
-      // 主动机会：不打扰、无触发批，只带状态
-      this.store.drainUnread(physKey); // 把可能的零星未读一并处理掉
+    // 触发批：当前所有未读（含之前积压的）
+    // 触发批必须从「物理键」取——消息总是写入物理键（app.js 落库），
+    // 有效键只用于历史/记忆隔离，不存放未读。
+    //
+    // 🔴 上下文策略（2026-10-28）：插件可以决定「哪些未读算触发、哪些只当背景」。
+    //
+    //   默认（builtin）：全部未读都算触发 —— 但 buildUserPrompt 会把触发批
+    //   整个排除出【过去状态】，于是群里 10+ 条未读时，历史断裂成碎片，
+    //   模型抓不住上下文（用户反馈的核心问题）。
+    //
+    //   插件策略可以改成「只有 @我/引用我的算触发，其余留作背景」，
+    //   这样背景消息仍出现在【过去状态】里，模型能顺着读下来。
+    //
+    //   安全阀：策略抛错或返回值不合法 → 回退 builtin，绝不让机器人哑掉。
+    let triggerEntries = [];
+    let bgOnlyEntries = [];
+    if (!proactive) {
+      const all = this.store.drainUnread(physKey);
+      try {
+        const strat = this.pluginHost?.contextStrategy;
+        if (strat && typeof strat.fn === 'function') {
+          const out = await strat.fn({
+            chatKey: physKey,
+            entries: all,
+            source: 'strategy:' + strat.id
+          });
+          if (out && Array.isArray(out.trigger)) {
+            const triggerSet = new Set(out.trigger.map((m) => m.id));
+            triggerEntries = all.filter((m) => triggerSet.has(m.id));
+            bgOnlyEntries = all.filter((m) => !triggerSet.has(m.id));
+          } else {
+            this.log?.(`[context] 策略 ${strat.id} 返回非法值，回退 builtin`);
+            triggerEntries = all;
+          }
+        } else {
+          triggerEntries = all;
+        }
+      } catch (e) {
+        this.log?.(`[context] 策略执行失败（回退 builtin）：${e?.message ?? e}`);
+        triggerEntries = all;
+      }
     }
-    if (!proactive && triggerEntries.length === 0) return; // 没有未读就不空跑
+    const proactive0 = proactive;
+    if (proactive0) {
+      // 主动机会：不打扰、无触发批，只带状态
+      this.store.drainUnread(physKey);
+    }
+    if (!proactive0 && triggerEntries.length === 0) {
+      // 策略把全部未读都判成背景 —— 不入库空跑，但仍要保证它们进了过去状态
+      if (bgOnlyEntries.length > 0) {
+        this.log?.(`[context] ${chatKey} ${bgOnlyEntries.length} 条未读被策略归为背景，本次不唤醒`);
+      }
+      return;
+    }
 
     this.runningChats.add(runKey);
     const seq = (this.runSeq.get(runKey) || 0) + 1;
@@ -363,12 +411,56 @@ export class Orchestrator {
     this.#maybeConsolidateMemory(chatKey);
   }
 
+  /**
+   * 查自己在指定群里的名片（2026-10-28）
+   *
+   * 为什么不直接用 persona.selfNickname：
+   *   那是手填的，跟群主实际设的名片经常不一致。
+   *   而 @ 和引用在群里显示的是**名片**，对不上就会认错人。
+   *
+   * 缓存 5 分钟：名片不会每句话都变，但也不能永久缓存
+   *（群主随时可能改）。
+   */
+  async #selfCardIn(groupId, p0) {
+    const key = String(groupId);
+    const now = Date.now();
+    this.__cardCache ||= new Map();
+    const hit = this.__cardCache.get(key);
+    if (hit && now - hit.at < 300000) return hit.card;
+
+    let card = '';
+    try {
+      const id = this.onebot.selfId;
+      if (id) {
+        const info = await this.onebot.getGroupMemberInfo(groupId, id);
+        card = String(info?.card || info?.nickname || '').trim();
+      }
+    } catch { /* 查不到就用兜底 */ }
+
+    // 兜底顺序：群名片 → 配置里的 selfNickname → QQ 昵称 → 人设名
+    const final = card || String(p0?.selfNickname || '').trim() || this.onebot.selfNickname || p0?.botName || '';
+    this.__cardCache.set(key, { card: final, at: now });
+    return final;
+  }
+
   async #runAgent(session, { kind, chatId, chatKey, triggerEntries, proactive, seq, taskContext = null, pushTask = null }) {
     const cfg = getConfig();
     const chatName = kind === 'group' ? await this.#chatName(chatId) : '';
     const ident0 = resolvePersona(chatKey);
     const p0 = ident0.persona;
-    const selfNickname = kind === 'group' ? (p0.selfNickname || this.onebot.selfNickname || p0.botName) : p0.botName;
+    // ── 自己在**这个群**里的名片（2026-10-28 修）──
+    //
+    // 事故：机器人把「引用自己」认成「别人在引用别人」。
+    // 根因之一：这里原来用的是 persona.selfNickname（手填的"小鲸鱼"）
+    // 或 QQ 昵称（"l"）—— 但**群名片是群主设的**，可能是
+    // 「🐳鲸界魔王👿-白光-小鱼」这种完全不同的字符串。
+    // 名字对不上，模型只能猜，于是认错人。
+    //
+    // 现在：进入群聊时**实时查一次本群名片**（带 5 分钟缓存，
+    // 避免每条消息都打一次接口）。查不到再退回配置值。
+    const selfNickname = kind === 'group'
+      ? await this.#selfCardIn(chatId, p0)
+      : p0.botName;
 
     // 上下文统计
     const tenMinAgo = Date.now() - 600000;
@@ -471,7 +563,12 @@ export class Orchestrator {
     // 未安装工具的说法（2026-10-21 用户实测反馈的真实问题）。
     const mountedToolNames = new Set(toolDefs.map((d) => d.name));
     const systemPrompt = buildSystemPrompt({
-      persona, extraSections: pluginSections, availableTools: mountedToolNames
+      persona, extraSections: pluginSections, availableTools: mountedToolNames,
+      // 传入自己的 QQ 号 + 群名片，让模型能按号判定 @/引用/点名（2026-10-27/28）
+      // selfCard 很关键：机器人群名片常与人设名不同（如「鲸界魔王-白光-小鱼」vs「小鲸鱼」），
+      // 不给的话模型会因"名字不像我"把 @ 自己的消息当成别人。
+      selfId: this.onebot.selfId,
+      selfCard: selfNickname
     });
     session.systemPrompt = systemPrompt;
     session.userPrompt = userPrompt;
@@ -712,7 +809,9 @@ export class Orchestrator {
               { role: 'system', content: buildSystemPrompt({
                 persona: ctx.persona,
                 extraSections: this.pluginHost ? this.pluginHost.buildPromptBlocks({ chatKey: ctx.chatKey, kind: ctx.kind, chatId: ctx.chatId }) : [],
-                availableTools: new Set(toolDefs.map((d) => d.name))
+                availableTools: new Set(toolDefs.map((d) => d.name)),
+                selfId: this.onebot.selfId,
+                selfCard: this.onebot.selfNickname || ''
               }) },
               { role: 'user', content: '【系统提醒】你刚才收到主人的私聊消息，但没有给出任何回复就结束了。私聊规则：主人私聊你时必须回复，不能不吭声。请立即补上回复：如果刚才在查资料/思考，现在把结论发给主人（用 send_message）；如果没什么可说的，也至少要回一句简短的回应（比如"收到~刚在查，马上给你说"）。' }
             ];

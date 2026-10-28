@@ -1,6 +1,6 @@
 {
-  "name": "qq-agent",
-  "version": "2.9.45",
+  "name": "bg-qqagent-linux",
+  "version": "3.0.7",
   "private": true,
   "description": "Standalone QQ agent desktop app: event-driven stateless agent runs over an OpenAI-compatible API, with a session-style UI. Decoupled from DeepSeek Harness.",
   "type": "module",
@@ -11,9 +11,12 @@
   "scripts": {
     "start": "electron .",
     "server": "node src/server.js",
-    "test": "node test/lint-account-check.mjs && node test/selftest.mjs",
+    "test": "node test/lint-account-check.mjs && node test/lint-plugin-manifest.mjs && node test/selftest.mjs",
     "test:prompt": "node test/test-prompt.mjs",
-    "lint:account": "node test/lint-account-check.mjs"
+    "lint:account": "node test/lint-account-check.mjs",
+    "lint:manifest": "node test/lint-plugin-manifest.mjs",
+    "compat": "node scripts/compat-legacy.mjs",
+    "compat:check": "node scripts/compat-legacy.mjs --check"
   },
   "dependencies": {
     "js-yaml": "^5.4.1",

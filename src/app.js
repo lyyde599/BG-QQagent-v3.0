@@ -581,6 +581,9 @@ export function createApp({ log = console.log } = {}) {
     }
   }
 
+  // requireAtBy=plugin 但无策略时，只提醒一次（2026-10-28）
+  let noStrategyWarned = false;
+
   async function ingestMessage(kind, id, event) {
     const cfgNow = getConfig();
     // 白名单外的聊天完全不记录。
@@ -621,12 +624,28 @@ export function createApp({ log = console.log } = {}) {
       return;
     }
 
+    // 解析引用段（2026-10-27）：带上被引用者的 QQ 号，供模型精确判断"引用的是不是我"
+    //
+    // NapCat 的 reply 段通常只有 id；被引用消息的发送者需要另行查。
+    // 这里只保留 id + 可得的摘要，拼成 { id, sender, senderId, text } 交给 store。
+    // 提示词层会用 senderId 与自己的号比对 —— 这是"引用别人却当成引用我"的根治点。
+    let replyInfo = null;
+    try {
+      const segs = Array.isArray(event.message) ? event.message : [];
+      const rep = segs.find((s) => s && s.type === 'reply');
+      if (rep) {
+        const rid = String((rep.data && rep.data.id) ?? '').trim();
+        replyInfo = { id: rid || null, sender: '', senderId: '', text: '' };
+      }
+    } catch { /* 解析失败就当没有引用 */ }
+
     store.appendIncoming(chatKey, {
       mid: event.message_id,
       ts: event.time ? Math.round(Number(event.time) * 1000) : Date.now(),
       senderId,
       senderName,
       text: text || '[图片]' ,
+      reply: replyInfo,
       media
     });
     emit('chat-update', chatKey);
@@ -648,6 +667,49 @@ export function createApp({ log = console.log } = {}) {
       selfId: onebot.selfId
     });
     if (chainResult.handled) return;
+
+    // ── 群聊 @ 硬门（2026-10-27 整合，开关 group.requireAt）──
+    //
+    // 背景：所有消息都交给模型时，群里每句闲聊都会触发一次模型调用 ——
+    // 费用高、还容易抢话。加一道硬门：群里没 @ 机器人就只入库不说话。
+    //
+    // 为什么放代码里而不是靠提示词：提示词只是"引导"，模型仍可能选择开口；
+    // 这是"根本不调模型"，省钱也彻底。
+    //
+    // 默认开启；config 里写 group.requireAt = false 可关掉（恢复旧行为）。
+    // ── requireAtBy：让上下文策略接管判定（2026-10-28 新增）──
+    //
+    // 背景：context-strategy 插件要按「@我 / 引用我 / 拍我」综合判定，
+    // 但硬门在策略**之前**执行，没 @ 的消息在这里就 return 了，
+    // 根本到不了策略 —— 引用我的消息（通常不带 at 段）永远唤不醒。
+    //
+    // 判定规则归插件：不同需求（@我 / 引用我 / 拍我 / 关键词）内核写死
+    // 任何一个都不通用。所以内核只负责让路：
+    //   requireAtBy = 'builtin'（默认）→ 走下面的 @ 判定，老行为不变
+    //   requireAtBy = 'plugin'         → 跳过判定，交给 contextStrategy
+    //
+    // 🔴 但必须配套回退：配了 plugin 却没插件注册时，
+    //    不能让群里每句话都烧一次模型 —— 那种情况退回 builtin。
+    const byPlugin = cfgNow.group?.requireAtBy === 'plugin';
+    const hasStrategy = !!pluginHost?.contextStrategy;
+
+    if (kind === 'group' && cfgNow.group?.requireAt !== false) {
+      if (!byPlugin || !hasStrategy) {
+        if (byPlugin && !hasStrategy && !noStrategyWarned) {
+          // 配了插件模式但没插件 —— 只提醒一次，避免刷屏
+          noStrategyWarned = true;
+          log('[群聊] requireAtBy=plugin 但没有插件注册上下文策略，已回退 builtin 判定');
+        }
+        const segs = Array.isArray(event.message) ? event.message : [];
+        const selfId = String(onebot.selfId || '');
+        const atMe = segs.some((s) => s && s.type === 'at' && String((s.data && s.data.qq) ?? '') === selfId);
+        if (!atMe) {
+          log(`[群聊] ${chatKey} 没 @ 我，只入库不处理`);
+          return;
+        }
+      }
+      // byPlugin && hasStrategy → 放行，由 orchestrator 里的策略决定 trigger/background
+    }
 
     // 所有消息都交给模型处理（入库 + 触发），由模型根据上下文自主决定是否回复。
     // 系统提示已引导：@/点名/针对自己的必回；无关群聊/别人的图/别人的引用 → 模型选择安静结束（不回复）。
@@ -1326,7 +1388,10 @@ export function createApp({ log = console.log } = {}) {
             || path.join(os.homedir(), '.secrets', 'sudo', 'password');
           let pw = '';
           try { pw = fs.readFileSync(pwFile, 'utf8').trim(); } catch { /* 无密码文件 */ }
-          const child = spawn('sudo', ['-S', 'systemctl', 'restart', 'qq-agent-v2'], {
+          // 服务名从环境变量读，默认 BG-QQagent-Linux（2026-10-28 改名）
+          // 这样目录/服务改名后不用再改代码
+          const svc = process.env.QQ_AGENT_SERVICE || 'BG-QQagent-Linux';
+          const child = spawn('sudo', ['-S', 'systemctl', 'restart', svc], {
             detached: true,
             stdio: pw ? ['pipe', 'ignore', 'ignore'] : 'ignore',
           });
@@ -1418,7 +1483,38 @@ export function createApp({ log = console.log } = {}) {
             httpUrl: b.httpUrl,
           });
         }
-        return json(res, 200, { ok: true, current: cur, backends: items });
+        // ── 通道健康判定（2026-10-28）──
+        //
+        // 群友截图：SnowLuma「已停止」却标「✓ 使用中」。
+        // 那是配置指向它、但服务没跑 —— 用户以为正常，实际机器人是断的。
+        //
+        // 这里给出明确结论和可执行建议，前端照着显示即可。
+        const curItem = items.find((x) => x.key === cur);
+        const currentHealthy = !!(curItem && curItem.active);
+        // 有没有"在跑但没被使用"的通道可以切过去
+        const fallback = items.find((x) => x.key !== cur && x.active && x.installed);
+
+        let healthHint = '';
+        if (!cur) {
+          healthHint = '没能从配置里识别出当前通道（wsUrl 不是 3001/3011）。';
+        } else if (!currentHealthy) {
+          healthHint = `当前通道「${curItem?.label || cur}」没在运行，机器人现在是断的。`
+            + (fallback ? `可以切到正在运行的「${fallback.label}」，或先启动当前通道。`
+                        : '请先启动它，否则连接不上。');
+        }
+
+        return json(res, 200, {
+          ok: true,
+          current: cur,
+          currentHealthy,
+          healthHint,
+          // 建议动作：switch = 切到别的可用通道；start = 重启当前通道
+          suggest: !currentHealthy
+            ? (fallback ? { action: 'switch', to: fallback.key, label: fallback.label }
+                        : (cur ? { action: 'start', to: cur } : null))
+            : null,
+          backends: items
+        });
       }
 
       if (pathname === '/api/napcat-qq/switch-backend' && method === 'POST') {
@@ -1474,6 +1570,21 @@ export function createApp({ log = console.log } = {}) {
           // 没有登录态的话，重启后会掉到扫码 —— 明确告诉前端
           warn: r.hadState ? '' : `本地没有 ${r.uin} 的登录态，重启后需要扫码登录`,
         });
+      }
+
+      // ── 环境检查（2026-10-28）──
+      //
+      // 群友反馈"装完还是报错"，深一层原因是每个人 Linux 环境不同：
+      // 发行版 / 架构 / 包管理器 / Node 版本 / 有无 Xvfb / 内存够不够。
+      // 所以装之前先探一遍，给出**这个机器专属**的适配步骤。
+      if (pathname === '/api/env/probe' && method === 'GET') {
+        try {
+          const { probe, renderProbe } = await import('./env-probe.js');
+          const r = probe();
+          return json(res, 200, { ok: true, probe: r, text: renderProbe(r) });
+        } catch (e) {
+          return json(res, 200, { ok: false, error: String(e?.message ?? e).slice(0, 200) });
+        }
       }
 
       if (pathname === '/api/napcat-qq/check' && method === 'GET') {
@@ -2875,9 +2986,17 @@ export function createApp({ log = console.log } = {}) {
                 if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name)) continue;
                 // 相对路径：/qqbot/ 下反代也能正确解析（与上面 app.js 同理）
                 const url = './plugin-ui/' + encodeURIComponent(rec.id) + '/' + encodeURIComponent(name);
+                // 🔴 脚本必须加 defer（2026-10-27 修）
+                //
+                // headAssets 注入在 </head> 之前，那时 <body> 还没解析出来。
+                // 插件脚本若同步执行并调 document.body.appendChild()，
+                // 会抛 "Cannot read properties of null (reading 'appendChild')"
+                // —— mobile-ui 就是这么挂掉的（手机版一直不接管）。
+                //
+                // defer 让脚本等 DOM 解析完再跑，语义上也更符合"页面级 UI 插件"。
                 extra += name.toLowerCase().endsWith('.css')
                   ? '<link rel="stylesheet" href="' + url + '">\n'
-                  : '<script src="' + url + '"></script>\n';
+                  : '<script defer src="' + url + '"></script>\n';
               }
             }
             if (extra) {

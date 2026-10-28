@@ -107,6 +107,58 @@ export function tarWrite(files) {
   return Buffer.concat(blocks);
 }
 
+/**
+ * 最小 ZIP 读取（2026-10-27 修 B4）
+ *
+ * 为什么需要：UI 的上传框写着「支持 .tar.gz 与 .zip」，accept 也真收了 .zip，
+ * 但后端只有 zlib.gunzipSync —— zip 的头是 PK\x03\x04，gzip 校验必然失败，
+ * 用户看到「解包失败：incorrect header check」，会以为是自己包做错了。
+ *
+ * 这里手写一个够用的 ZIP 解析（只支持 store/deflate，不支持加密与 zip64），
+ * 与 tarRead 返回同样的 [name, buffer] 结构，上层逻辑不用改。
+ */
+export function zipRead(buf) {
+  const out = [];
+  // 找 EOCD（End of Central Directory）：签名 0x06054b50
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65558); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return out;
+
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);      // 中央目录偏移
+
+  for (let i = 0; i < count && p + 46 <= buf.length; i++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) break;
+    const method = buf.readUInt16LE(p + 10);
+    const compSize = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localOff = buf.readUInt32LE(p + 42);
+    const name = buf.subarray(p + 46, p + 46 + nameLen).toString('utf8');
+    p += 46 + nameLen + extraLen + commentLen;
+
+    if (name.endsWith('/')) continue;       // 目录项
+
+    // 定位本地头，跳过它的文件名/扩展区
+    const lh = localOff;
+    if (lh + 30 > buf.length || buf.readUInt32LE(lh) !== 0x04034b50) continue;
+    const lNameLen = buf.readUInt16LE(lh + 26);
+    const lExtraLen = buf.readUInt16LE(lh + 28);
+    const dataStart = lh + 30 + lNameLen + lExtraLen;
+    const raw = buf.subarray(dataStart, dataStart + compSize);
+
+    try {
+      if (method === 0) out.push([name, Buffer.from(raw)]);                 // 存储
+      else if (method === 8) out.push([name, zlib.inflateRawSync(raw)]);    // deflate
+      // 其它压缩法（bzip2/lzma）跳过
+    } catch { /* 单文件失败不影响其它 */ }
+  }
+  return out;
+}
+
 export function tarRead(buf) {
   const out = [];
   let off = 0;
@@ -186,6 +238,16 @@ export function registerPluginAdmin(host, { getConfig, log }) {
         // 而不是让用户点了才被后端拒绝。
         core: rec?.manifest?.core === true,
         coreReason: rec?.manifest?.coreReason || '',
+        // 🔴 透出 configSchema / configDefaults（2026-10-28）
+        //
+        // 原来这两个字段根本没往接口外发，导致前端 cfgBuildFields() 里
+        // `row.configSchema` 永远是 undefined —— 于是所有插件都退化成
+        // 按 config 键名自动推断，配置面板显示 startStage / moodWeight 这类英文。
+        //
+        // 插件写了 configSchema（中文名、控件类型、范围、说明）却完全没用上，
+        // 是个纯粹的透传遗漏。
+        configSchema: rec?.manifest?.configSchema || null,
+        configDefaults: rec?.manifest?.config || null,
         data: { exists: d.exists, fileCount: d.files.length, bytes: d.totalBytes, sizeText: humanSize(d.totalBytes) }
       };
     }),
@@ -553,11 +615,31 @@ export function registerPluginAdmin(host, { getConfig, log }) {
   add('POST', '/api/plugins/import', async (_req, body) => {
     const b64 = body?.base64;
     if (!b64) return { ok: false, error: '缺少 base64 数据' };
-    const replaceMode = body?.mode === 'replace';
+    // 🔴 未知 mode 一律拒绝（2026-10-27 修 B9）
+    //
+    // 原来只区分 mode==='replace'，其它任何值（如 'preview'）都被当成
+    // "非 replace" 而**静默执行真实安装** —— 有人误用 mode:'preview'
+    // 想预演，结果插件被装进去了。
+    const MODES = ['', 'merge', 'replace', 'overwrite'];
+    const modeRaw = String(body?.mode ?? '');
+    if (!MODES.includes(modeRaw)) {
+      return {
+        ok: false,
+        error: `不支持的 mode: ${modeRaw}（可用：merge / replace / overwrite；要预演请用 dryRun:true）`,
+      };
+    }
+    const replaceMode = modeRaw === 'replace' || modeRaw === 'overwrite';
 
     let entries;
     try {
-      entries = tarRead(zlib.gunzipSync(Buffer.from(String(b64), 'base64')));
+      const raw = Buffer.from(String(b64), 'base64');
+      // ZIP 魔术字节 PK\x03\x04 → 走 zipRead；否则按 gzip+tar 处理
+      if (raw.length > 4 && raw[0] === 0x50 && raw[1] === 0x4b && raw[2] === 0x03 && raw[3] === 0x04) {
+        entries = zipRead(raw);
+        if (!entries.length) return { ok: false, error: '解包失败：这个 zip 里没有可读文件（可能用了不支持的压缩方式）' };
+      } else {
+        entries = tarRead(zlib.gunzipSync(raw));
+      }
     } catch (error) {
       return { ok: false, error: `解包失败：${error?.message ?? error}` };
     }

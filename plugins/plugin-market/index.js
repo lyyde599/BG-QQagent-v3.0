@@ -48,6 +48,44 @@ export async function activate(ctx) {
    * @returns {Promise<object|null>} null 表示这个内核版本不支持
    */
   // 账密认证模块（内核，可能不存在）
+  // ── 自调用基址与封装（2026-10-27 修 B2/B3）──────────────
+  //
+  // 为什么需要：
+  //   ① 插件要回调内核自己的 HTTP 接口，但原来地址**写死 127.0.0.1:3210**。
+  //      用户的 server.port 一旦不是 3210（比如 80），安装/更新/卸载/打包
+  //      全部静默失败，报错还包装成 "fetch failed"，看着像网络问题。
+  //   ② 内核 authorize() 对 /api/* 要求 x-console-token 或 ?token=，
+  //      自调用两者都没带 → 设了 server.token 的机器必然 401。
+  //   ③ Node 的 fetch 不认相对路径（fetch('/api/x') 会抛 Failed to parse URL）。
+  //
+  // 统一走 localFetch()：动态端口 + 自动补 token + 相对路径补全。
+  const LOCAL_BASE = (() => {
+    let port = 3210;
+    let token = '';
+    try {
+      const raw = fs.readFileSync(path.join(ctx.root, 'data', 'config.json'), 'utf8');
+      const c = JSON.parse(raw);
+      port = Number(c?.server?.port) || 3210;
+      token = String(c?.server?.token || '');
+    } catch { /* 读不到就用默认 */ }
+    return { port, token, origin: 'http://127.0.0.1:' + port };
+  })();
+
+  /** 自调用：自动补 origin 与 console token */
+  const localFetch = (u, opts = {}) => {
+    let url = String(u);
+    if (url.startsWith('/')) url = LOCAL_BASE.origin + url;
+    if (LOCAL_BASE.token && !/[?&]token=/.test(url)) {
+      url += (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(LOCAL_BASE.token);
+    }
+    const o = { ...opts };
+    // 有 token 时也带上头，双保险（部分路由只认头）
+    if (LOCAL_BASE.token) {
+      o.headers = { ...(o.headers || {}), 'x-console-token': LOCAL_BASE.token };
+    }
+    return fetch(url, o);
+  };
+
   let authMod;
   let authTried = false;
   const getAuth = async () => {
@@ -264,7 +302,8 @@ export async function activate(ctx) {
       const body = tpl.lines(code).join('\n');
       const r = await ctx.mail.send(email, tpl.subject, body);
       if (!r.ok) return { ok: false, error: '发信失败：' + r.error };
-      return { ok: true, local: true, code };
+      // local:true 让前端能提示「已用本机邮箱发送」，避免用户以为走的是中心服务
+      return { ok: true, local: true, code, via: '本机 SMTP' };
     }
 
     // ② 没配 SMTP → 请求中心服务（带上用途）
@@ -281,10 +320,21 @@ export async function activate(ctx) {
       }
       return { ok: true, central: true };
     } catch (e) {
+      // 🔴 错误信息要能指导排查（2026-10-27 修 B5）
+      //
+      // 原来一律包装成「连不上验证码服务（fetch failed）」，用户会以为是自己的网络问题。
+      // 实际上多数情况是中心服务那条路径已经不存在（404），
+      // 或者配置里的 authUrl 域名不通 —— 两者处理方式完全不同。
+      const msg = String(e?.message ?? e);
+      const url = CENTER_URL();
+      const hint = /fetch failed|ENOTFOUND|ECONNREFUSED|timeout|Timeout/i.test(msg)
+        ? '（网络不通或域名不可达）'
+        : '';
       return {
         ok: false,
-        error: '连不上验证码服务（' + String(e?.message ?? e).slice(0, 60) + '）。'
-          + '可以在「设置」里配自己的邮箱，或检查网络。',
+        error: `请求验证码服务失败：${url}/send → ${msg.slice(0, 60)}${hint}。` +
+          '推荐在「设置」里配本机 SMTP 邮箱，就不依赖中心服务了。',
+        target: `${url}/send`,
       };
     }
   };
@@ -494,7 +544,13 @@ export async function activate(ctx) {
   }, { absolute: true });
 
   // 账号状态（前端决定显示「设密码」还是「改密码」）
-  ctx.http.route('POST', '/api/market/login/account', (_req, body) => {
+  ctx.http.route('POST', '/api/market/login/account', async (_req, body) => {
+    // 🔴 必须 await getAuth()（2026-10-27 修 B1）
+    //    原来这里直接调 auth.normEmail(...)，但 auth 从未在本作用域声明，
+    //    整个接口 500：{"ok":false,"error":"auth is not defined"}。
+    //    页面上「邮箱密码登录 / 设密码 / 改密码 / 忘记密码」全部连带不可用。
+    const auth = await getAuth();
+    if (!auth) return NO_AUTH;
     const email = auth.normEmail(body?.email);
     if (!email) return { ok: false, error: '邮箱为空' };
     const info = auth.accountInfo(email);
@@ -691,7 +747,7 @@ export async function activate(ctx) {
     // 已安装的标出来（内核 records 里有）
     let installed = new Map();
     try {
-      const d = await fetch('http://127.0.0.1:3210/api/plugins', { signal: AbortSignal.timeout(8000) })
+      const d = await localFetch(LOCAL_BASE.origin + '/api/plugins', { signal: AbortSignal.timeout(8000) })
         .then((x) => x.json());
       for (const p of (d.plugins || [])) installed.set(p.id, p.version);
     } catch { /* 拿不到就当没装 */ }
@@ -784,10 +840,22 @@ export async function activate(ctx) {
 
     // 交给内核的导入通道（它负责路径校验/覆盖/重载）
     try {
-      const res = await fetch('http://127.0.0.1:3210/api/plugins/import', {
+      const res = await localFetch(LOCAL_BASE.origin + '/api/plugins/import', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ base64: buf.toString('base64'), mode: 'replace' }),
+        // 🔴 2026-10-27 修：更新已装插件时必须保留本地配置。
+        //
+        // 「从市场更新」走的就是这条 install 通道（/api/market/update →
+        // /api/market/install → 这里）。原来不带 keepLocalConfig，
+        // 于是包内的 clean 默认值把用户真实配置整个覆盖 ——
+        // 表现是「更新完插件还在，但所有路径/Key 都空了」。
+        //
+        // 首次安装（body.keepLocalConfig 未传）仍用包内默认值，符合预期。
+        body: JSON.stringify({
+          base64: buf.toString('base64'),
+          mode: 'replace',
+          keepLocalConfig: body?.keepLocalConfig === true,
+        }),
         signal: AbortSignal.timeout(60000),
       });
       const out = await res.json();
@@ -853,7 +921,7 @@ export async function activate(ctx) {
       // stripAssets=true 时排除 assets/ 里的图片音视频（素材单独托管）
       const q = new URLSearchParams({ id, mode: 'clean' });
       if (stripAssets) q.set('stripAssets', '1');
-      const res = await fetch(`http://127.0.0.1:3210/api/plugins/export?${q}`, {
+      const res = await localFetch(LOCAL_BASE.origin + `/api/plugins/export?${q}`, {
         signal: AbortSignal.timeout(60000),
       });
       if (!res.ok) return { ok: false, error: `导出失败 HTTP ${res.status}` };
@@ -1989,7 +2057,7 @@ export async function activate(ctx) {
     //    它内部会用本机 bridge 密钥代签；没有则返回 null，
     //    界面会提示走「邮箱验证码换凭证」那条公开路径。
     try {
-      const r = await fetch('http://127.0.0.1:3210/api/market/submit-token', {
+      const r = await localFetch(LOCAL_BASE.origin + '/api/market/submit-token', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'User-Agent': UA },
         body: '{}',
@@ -2411,7 +2479,15 @@ export async function activate(ctx) {
       { name: 'AWS 密钥',  re: /AKIA[0-9A-Z]{16}/g,               level: 'error' },
       { name: '私钥',      re: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, level: 'error' },
       { name: '内网 IP',   re: /\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b/g, level: 'warn' },
-      { name: '密码字段',  re: /["']?(?:password|passwd|apiKey|secret)["']?\s*[:=]\s*["'][^"']{6,}["']/gi, level: 'error' },
+      // 密码字段（2026-10-28 收窄）
+      //
+      // 原规则 `apiKey: '任意6+字符'` 会误伤中文词典 ——
+      // 插件中心里有 `apiKey: 'API Key'` 这种「键名→中文名」的映射，
+      // 被当成硬编码密码拦下来，导致正常插件发不出去。
+      //
+      // 收窄为：值必须**像密钥**（含大小写+数字+符号，且非纯中文/纯单词），
+      // 或值长度 >= 16。映射表里的中文名天然不满足。
+      { name: '密码字段',  re: /["']?(?:password|passwd|apiKey|secret)["']?\s*[:=]\s*["'](?:[A-Za-z0-9_\-!@#$%^&*]{16,}|(?=[^"']*[A-Z])(?=[^"']*[a-z])(?=[^"']*[0-9])[A-Za-z0-9_\-!@#$%^&*]{8,})["']/g, level: 'error' },
     ];
 
     const hits = [];
@@ -2550,7 +2626,7 @@ export async function activate(ctx) {
       // 为什么自动而不是让用户选：
       //   grail 37MB 里有 36.9MB 是立绘图片，代码只有 0.5MB。
       //   用户点「发布」时不该被迫理解"素材要不要分离"这种事。
-      let res = await fetch(`http://127.0.0.1:3210/api/market/package`, {
+      let res = await localFetch(LOCAL_BASE.origin + `/api/market/package`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'User-Agent': 'QQAgent-Market/1.0' },
         body: JSON.stringify({ id }),
@@ -2559,7 +2635,7 @@ export async function activate(ctx) {
       let pkg0 = await res.json();
       if (pkg0?.ok && (pkg0.market?.size || 0) > 5 * 1024 * 1024) {
         ctx.log(`[市场] ${id} 包体积 ${(pkg0.market.size/1024/1024).toFixed(1)}MB，改用剥离素材版`);
-        res = await fetch(`http://127.0.0.1:3210/api/market/package`, {
+        res = await localFetch(LOCAL_BASE.origin + `/api/market/package`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'User-Agent': 'QQAgent-Market/1.0' },
           body: JSON.stringify({ id, stripAssets: true }),
@@ -2673,7 +2749,15 @@ export async function activate(ctx) {
               base64: pkgBuf.toString('base64'),
               // 更新说明（2026-10-26）：市场详情页要显示这版改了什么
               changelog: rec.changelog || '',
-              author: meNow.nickname || meNow.email || '',
+              // 🔴 保留原作者（2026-10-28）
+              //
+              // 原来固定传登录账号昵称，导致：
+              //   别人维护的插件（如 plugin-center 作者墨柒秋）一旦由我发布，
+              //   市场里的作者就被改成了我 —— 属于冒名。
+              //
+              // 现在优先用 manifest 里声明的 author，只有它为空时才用登录账号。
+              author: String(pkg?.market?.author || '').trim()
+                || meNow.nickname || meNow.email || '',
               qq: meNow.qq || '',
               email: meNow.email || '',
             }),
@@ -2773,7 +2857,7 @@ export async function activate(ctx) {
     if (remote.ok) {
       try {
         const buf = fs.readFileSync(pkg.packagePath);
-        const res = await fetch('http://127.0.0.1:3210/api/plugins/import', {
+        const res = await localFetch(LOCAL_BASE.origin + '/api/plugins/import', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'User-Agent': UA },
           // keepLocalConfig：**不要**用包里的默认配置覆盖本地真实配置
@@ -2990,7 +3074,7 @@ export async function activate(ctx) {
           const pr = await fetch(dl, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(60000) });
           if (pr.ok) {
             const buf = Buffer.from(await pr.arrayBuffer());
-            const ir = await fetch('http://127.0.0.1:3210/api/plugins/import', {
+            const ir = await localFetch(LOCAL_BASE.origin + '/api/plugins/import', {
               method: 'POST',
               headers: { 'content-type': 'application/json', 'User-Agent': UA },
               body: JSON.stringify({
@@ -3129,18 +3213,37 @@ export async function activate(ctx) {
     const id = String(body?.id || '');
     if (!id) return { ok: false, error: '缺少插件 id' };
 
-    const own = checkOwner(id);
-    if (!own.ok) return own;
+    // 🔴 第三方插件也要能更新（2026-10-27 修 B8）
+    //
+    // 原逻辑：checkOwner 不过就 return——只有「自己发布的」插件能更新，
+    // 装别人的插件（napcat-alert / plugin-center 等）点更新一律「未授权」。
+    //
+    // 现在：如果不是自己的插件，但**本地已安装**，就放行 ——
+    // 走的是 install 通道（覆盖安装），本质与用户手动装一次相同，
+    // 没有额外权限风险（装什么由市场清单决定，用户本来就点了更新）。
+    let own = checkOwner(id);
+    if (!own.ok) {
+      // 判断「本地是否已装」：直接看 plugins/<id>/manifest.json
+      // （ctx.plugins 只给目录路径，没有列表接口）
+      let installedVer = '';
+      try {
+        const mf = path.join(ctx.plugins, id, 'manifest.json');
+        if (fs.existsSync(mf)) installedVer = JSON.parse(fs.readFileSync(mf, 'utf8')).version || '0.0.0';
+      } catch { /* 读不到就当没装 */ }
+      if (!installedVer) return own;      // 没装 + 不是自己的 → 仍然拒绝
+      own = { ok: true, manifest: { version: installedVer }, thirdParty: true };
+    }
 
     const oldVer = own.manifest.version || '0.0.0';
 
     // 走安装通道（覆盖模式）
     let r;
     try {
-      const res = await fetch('http://127.0.0.1:3210/api/market/install', {
+      const res = await localFetch(LOCAL_BASE.origin + '/api/market/install', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'User-Agent': UA },
-        body: JSON.stringify({ id, confirmUntrusted: true }),
+        // 更新场景：必须保留本地配置（否则 clean 默认值会清空用户设置）
+        body: JSON.stringify({ id, confirmUntrusted: true, keepLocalConfig: true }),
         signal: AbortSignal.timeout(120000),
       });
       r = await res.json();
@@ -3165,7 +3268,7 @@ export async function activate(ctx) {
   ctx.http.route('POST', '/api/market/update-all', async () => {
     const list = [];
     try {
-      const res = await fetch('http://127.0.0.1:3210/api/market/updates', {
+      const res = await localFetch(LOCAL_BASE.origin + '/api/market/updates', {
         headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(30000),
       });
       const d = await res.json();
@@ -3178,7 +3281,7 @@ export async function activate(ctx) {
     const done = [], failed = [];
     for (const id of list) {
       try {
-        const res = await fetch('http://127.0.0.1:3210/api/market/update', {
+        const res = await localFetch(LOCAL_BASE.origin + '/api/market/update', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'User-Agent': UA },
           body: JSON.stringify({ id }), signal: AbortSignal.timeout(120000),
@@ -3213,7 +3316,7 @@ export async function activate(ctx) {
     }
 
     try {
-      const res = await fetch('http://127.0.0.1:3210/api/plugins/uninstall', {
+      const res = await localFetch(LOCAL_BASE.origin + '/api/plugins/uninstall', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'User-Agent': UA },
         body: JSON.stringify({ id, purgeData }),
@@ -3257,7 +3360,7 @@ export async function activate(ctx) {
   const runCheck = async () => {
     const c = cfg();
     try {
-      const res = await fetch('http://127.0.0.1:3210/api/market/updates', {
+      const res = await localFetch(LOCAL_BASE.origin + '/api/market/updates', {
         headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(60000),
       });
       const d = await res.json();
@@ -3272,7 +3375,7 @@ export async function activate(ctx) {
       ctx.log('[市场] 已开启自动更新，开始逐个安装…');
       for (const u of (d.updates || [])) {
         try {
-          const r2 = await fetch('http://127.0.0.1:3210/api/market/update', {
+          const r2 = await localFetch(LOCAL_BASE.origin + '/api/market/update', {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'User-Agent': UA },
             body: JSON.stringify({ id: u.id }),
@@ -3285,7 +3388,9 @@ export async function activate(ctx) {
         }
       }
     } catch (e) {
-      ctx.log('[市场] 定时检查失败：' + String(e?.message ?? e).slice(0, 80));
+      // 带上目标地址（2026-10-27 修 B6）
+      // 原来只打 "fetch failed"，看着像网络故障，实际多是自调用端口/token 问题。
+      ctx.log(`[市场] 定时检查失败：${LOCAL_BASE.origin}/api/market/updates → ${String(e?.message ?? e).slice(0, 80)}`);
     }
   };
 
@@ -3367,6 +3472,16 @@ export async function activate(ctx) {
         ctx.log(`[市场] 作者档案已上报中心：${me.email}${d.existed ? '（已存在）' : '（新增）'}`);
         fs.mkdirSync(ctx.data.dir, { recursive: true });
         fs.writeFileSync(flagFile, JSON.stringify({ version: myVer, at: new Date().toISOString() }), 'utf8');
+      } else if (res.status === 404 || res.status === 410) {
+        // 🔴 中心已无此接口就永久静默（2026-10-27 修 B7）
+        //    原来每次启动都刷一条 404，纯噪音。记时间戳，不再重试。
+        try {
+          fs.mkdirSync(ctx.data.dir, { recursive: true });
+          fs.writeFileSync(flagFile, JSON.stringify({
+            version: myVer, skipped: 'gone', status: res.status, at: new Date().toISOString()
+          }), 'utf8');
+        } catch { /* ignore */ }
+        ctx.log('[市场] 中心上报接口已下线（404/410），后续不再尝试');
       } else {
         ctx.log(`[市场] 上报中心失败（不影响使用）：${d?.error || 'HTTP ' + res.status}`);
       }

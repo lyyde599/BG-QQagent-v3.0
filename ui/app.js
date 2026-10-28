@@ -837,6 +837,8 @@ function buildSnowlumaSkeleton() {
           <span style="flex:1"></span>
           <button class="btn btn-small" id="be-refresh">刷新</button>
         </div>
+        <!-- 通道健康提示：当前通道没在跑时显示红色警告 + 一键修复（2026-10-28） -->
+        <div id="be-hint" style="display:none;font-size:12.5px;padding:6px 0;margin-bottom:4px"></div>
         <div id="be-list" style="font-size:12.5px">点「刷新」查看可用通道</div>
 
         <!-- 选型建议（2026-10-27 用户要求）-->
@@ -1148,19 +1150,64 @@ function bindSnowlumaEvents() {
     const box = slEl('be-list');
     const cur = slEl('be-current');
     if (!box) return;
-    if (cur) cur.textContent = d?.current ? `当前：${(d.backends || []).find((x) => x.current)?.label || d.current}` : '当前：未识别';
+
+    // 当前通道没在跑时，标题直接标红（2026-10-28）
+    if (cur) {
+      const label = d?.current
+        ? ((d.backends || []).find((x) => x.current)?.label || d.current)
+        : '未识别';
+      cur.textContent = d?.currentHealthy === false
+        ? `当前：${label}（异常）`
+        : `当前：${label}`;
+      cur.style.color = d?.currentHealthy === false ? '#c00' : '';
+      cur.style.fontWeight = d?.currentHealthy === false ? '600' : '';
+    }
+
+    // 通道异常时补一句明确结论 + 一键修复按钮
+    const hintBox = slEl('be-hint');
+    if (hintBox) {
+      if (d?.currentHealthy === false && d?.healthHint) {
+        const sg = d.suggest || {};
+        const act = sg.action === 'switch'
+          ? `<button class="btn btn-small primary" data-be-switch="${esc(sg.to)}" style="margin-left:8px">切到 ${esc(sg.label || sg.to)}</button>`
+          : (sg.action === 'start'
+            ? `<button class="btn btn-small primary" data-be-switch="${esc(sg.to)}" style="margin-left:8px">启动它</button>`
+            : '');
+        hintBox.innerHTML = `<span style="color:#c00">⚠ ${esc(d.healthHint)}</span>${act}`;
+        hintBox.style.display = '';
+      } else {
+        hintBox.innerHTML = '';
+        hintBox.style.display = 'none';
+      }
+    }
     const rows = (d?.backends || []).map((b) => {
+      // 🔴 「使用中」要和「运行中」对得上（2026-10-28 修）
+      //
+      // 事故（群友截图）：SnowLuma 显示「已停止」，右边却标着「✓ 使用中」——
+      // 因为配置里 ws 指向它，但服务根本没跑。
+      // 用户看到"使用中"会以为一切正常，实际机器人是断的。
+      //
+      // 现在分三种情况说清楚：
+      //   使用中 + 运行中  → 正常
+      //   使用中 + 已停止  → **红色警告：配置指向它但它没在跑**
+      //   未使用           → 给切换按钮
       let btn = '';
       if (!b.installed) {
         btn = '<span class="muted">未安装</span>';
-      } else if (b.current) {
+      } else if (b.current && b.active) {
         btn = '<span style="color:#2f855a">✓ 使用中</span>';
+      } else if (b.current && !b.active) {
+        btn = `<span style="color:#c00;font-weight:600">⚠ 配置指向它，但没在跑</span>`
+          + `<button class="btn btn-small" data-be-switch="${esc(b.key)}" style="margin-left:8px">重启它</button>`;
       } else {
         btn = `<button class="btn btn-small primary" data-be-switch="${esc(b.key)}">切到 ${esc(b.label)}</button>`;
       }
+      // 当前通道没运行时，状态文字也要红，别再绿色骗人
       const run = b.active
         ? '<span style="color:#2f855a">运行中</span>'
-        : '<span class="muted">已停止</span>';
+        : (b.current
+          ? '<span style="color:#c00">已停止（机器人当前是断的）</span>'
+          : '<span class="muted">已停止</span>');
       return `
         <div class="row" style="align-items:center;gap:10px;padding:5px 0;border-bottom:1px solid var(--line)">
           <span style="min-width:90px;font-weight:600">${esc(b.label)}</span>
@@ -1327,13 +1374,47 @@ function bindSnowlumaEvents() {
     const boxEl = slEl('nq-list');
     if (!boxEl) return;
     const rows = [];
+
+    // ── 兼容性横幅（2026-10-28）──
+    //
+    // 群友按"装最新版"提示操作后 DSH 报不兼容。
+    // 原因：NapCat 是注入到 QQ 里的，两边版本必须配套，不能各自追最新。
+    // 这里把已验证组合摆到最前面，让用户先看这个再决定装什么。
+    const cmp = d?.compat;
+    if (cmp) {
+      const rec = cmp.recommendation || {};
+      const okColor = cmp.verified ? '#2f855a' : '#b7791f';
+      const title = cmp.verified ? '✓ 当前组合已验证可用' : '⚠ 当前组合未经验证';
+      rows.push(`
+        <div style="padding:10px 12px;margin-bottom:10px;border-radius:8px;border:1px solid var(--line);background:var(--panel)">
+          <div style="font-weight:600;color:${okColor};margin-bottom:4px">${title}</div>
+          <div class="muted" style="font-size:12px;line-height:1.6">
+            ${esc(rec.reason || cmp.hint || '')}
+            ${rec.warning ? `<br><span style="color:#b7791f">${esc(rec.warning)}</span>` : ''}
+          </div>
+          ${(cmp.verifiedPairs || []).length ? `
+          <div class="muted" style="font-size:11.5px;margin-top:6px">
+            已验证组合：${(cmp.verifiedPairs || []).map((p) =>
+              `<code style="font-size:11px">NapCat ${esc(p.napcat)} + QQ ${esc(p.qq)}</code>`
+            ).join('　')}
+          </div>` : ''}
+        </div>`);
+    }
     for (const [key, label] of [['napcat', 'NapCat'], ['qq', 'QQ 客户端'], ['snowluma', 'SnowLuma']]) {
       const x = (d && d[key]) || {};
       const loc = x.local || '未安装';
       const lat = x.latest || '未知';
       let status = '';
       let btn = '';
-      if (x.needInstall) {
+      // 地址失效时不要给一个"点了必然 404"的按钮（2026-10-28）
+      const dead = x.urlAlive === false;
+      if (dead && (x.needInstall || x.needUpdate)) {
+        status = '<span style="color:#c00">官方链接已失效</span>';
+        btn = '<span class="muted" style="font-size:11.5px">'
+          + '腾讯官网的安装包地址过期了，请手动下载：'
+          + '<a href="https://im.qq.com/linuxqq" target="_blank">im.qq.com/linuxqq</a>'
+          + '</span>';
+      } else if (x.needInstall) {
         status = '<span style="color:var(--acc)">未安装</span>';
         btn = `<button class="btn btn-small primary" data-nq-install="${key}">安装 ${esc(lat)}</button>`;
       } else if (x.needUpdate) {
@@ -5326,10 +5407,13 @@ function renderPlugins(el, data) {
 
     <div class="card">
       <h3>已安装（${plugins.length}）</h3>
-      <table class="table">
-        <thead><tr><th>插件</th><th>状态</th><th>说明</th><th>工具</th><th>数据</th><th>作用域</th><th>操作</th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="7" class="muted">还没有插件</td></tr>'}</tbody>
-      </table>
+      <!-- table-wrap：窄屏横向滚动，别把说明列压成竖排单字（2026-10-28） -->
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>插件</th><th>状态</th><th>说明</th><th>工具</th><th>数据</th><th>作用域</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="7" class="muted">还没有插件</td></tr>'}</tbody>
+        </table>
+      </div>
     </div>
 
     <div class="card" id="pl-data-card" style="display:none"></div>`;
