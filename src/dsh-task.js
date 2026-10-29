@@ -4,26 +4,144 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT } from './config.js';
 
-const DSH_BASE = process.env.DSH_BASE_URL || 'http://127.0.0.1:3080';
+// 🔴 DSH 地址探测（2026-10-28 修）
+//
+// 事故：dsh_task 一直报「任务提交失败：fetch failed」。
+// 根因：这里写死 3080，但本机 DSH 实际跑在 **3083**（A 实例是 3084）。
+//      3080 根本没进程监听 → 连接被拒 → fetch failed。
+//
+// 本机会跑多个 DSH 实例（C=3083 / A=3084），端口不固定。
+// 写死任何一个都会在换实例/换机器后失效，所以改成：
+//   ① 环境变量 DSH_BASE_URL 优先（显式指定永远最高）
+//   ② 否则按候选端口探测，谁活着用谁
+//   ③ 探测失败时给出**可操作的**错误，而不是 bare 的 fetch failed
+const DSH_CANDIDATES = [
+  'http://127.0.0.1:3083',   // C 实例（本机主用）
+  'http://127.0.0.1:3084',   // A 实例
+  'http://127.0.0.1:3080',   // 历史默认
+];
+
+let dshBaseCache = null;
+
+/** 探测活着的 DSH 地址（结果缓存 60 秒，避免每次调用都探） */
+async function resolveDshBase() {
+  if (process.env.DSH_BASE_URL) return String(process.env.DSH_BASE_URL).replace(/\/+$/, '');
+  if (dshBaseCache && Date.now() - dshBaseCache.at < 60000) return dshBaseCache.url;
+
+  for (const url of DSH_CANDIDATES) {
+    try {
+      const res = await fetch(url + '/', { method: 'GET', signal: AbortSignal.timeout(2500) });
+      if (res.ok || res.status < 500) {
+        dshBaseCache = { url, at: Date.now() };
+        return url;
+      }
+    } catch { /* 试下一个 */ }
+  }
+  throw new Error(
+    '连不上 DSH。已试过 ' + DSH_CANDIDATES.join(' / ') + '。'
+    + '请确认 DSH 实例在运行（systemctl status 或 ss -tlnp | grep 308），'
+    + '或用环境变量 DSH_BASE_URL 指定正确地址。'
+  );
+}
 // 部署目录不固定（历史上是 /root/BG-QQagent-Linux），跟着项目根走，换机器/换路径都不用改代码。
-const WORK_ROOT = process.env.QQ_AGENT_WORK_ROOT || path.join(ROOT, 'dsh-work');
+// 🔴 工作目录改到用户指定的《鱼鱼的工作目录》（2026-10-28）
+//
+// 用户："我创建了一个《鱼鱼的工作目录》，以后她的外包对话全部放到这里"
+// 原来散在项目里的 dsh-work/，用户看不到她干了什么。
+// 现在统一放到 /home/lyy/鱼鱼的工作目录/，她自己也能在里面按任务建子目录。
+const YUYU_DIR = process.env.QQ_AGENT_YUYU_DIR || '/home/lyy/鱼鱼的工作目录';
+const WORK_ROOT = process.env.QQ_AGENT_WORK_ROOT || YUYU_DIR;
 const WORKSPACE_DIR = path.join(ROOT, 'workspace');
 
 let rpcSeq = 1;
 
-async function rpc(method, payload, timeoutMs = 60000) {
-  const body = JSON.stringify({ type: 'client-request', rpcId: 'qqa_' + (rpcSeq++), method, payload });
-  const res = await fetch(`${DSH_BASE}/api/${method}`, {
+/**
+ * 调用 DSH 的 typert 网关（2026-10-28 重写）
+ *
+ * 🔴 原来的实现全是错的，所以 dsh_task 从来就没通：
+ *   ① 端点写成 `session.list`（点号）→ 真实是 `session/list`（斜杠）
+ *   ② 连的端口 3080 没有进程监听
+ *   ③ 调了个不存在的 `workspace.create`（DSH 根本没有这个方法，
+ *      建会话只要传 cwd，不需要 workspaceId）
+ *   ④ payload 直接传对象 → 网关要求包一层 `{ args: { request: {...} } }`
+ *
+ * 正确的调用形态（实测）：:
+ *   POST http://127.0.0.1:3083/api/session/list
+ *   { "type":"client-request", "rpcId":"...", "method":"session/list",
+ *     "payload": { "args": { "request": {} } } }
+ *   → { "type":"server-response", "result": { "ok":true, "value":{...} } }
+ *
+ * @param {string} endpoint  形如 'session/list'（用斜杠）
+ * @param {object} args      会包成 { args: { request: args } }
+ */
+async function rpc(endpoint, args = {}, timeoutMs = 60000) {
+  const base = await resolveDshBase();
+  const name = String(endpoint).replace(/\./g, '/');
+  const body = JSON.stringify({
+    type: 'client-request',
+    rpcId: 'qqa_' + (rpcSeq++),
+    method: name,
+    // 🔴 参数名各端点不同（2026-10-28 实测）
+    //   session/list   → { args: { _request: {} } }
+    //   session/create → { args: { request: {...} } }
+    //   session/prompt → { args: { request: {...} } }
+    // 用错了会被网关按 schema 拒掉（missing "_request" / unexpected "request"）。
+    payload: { args: name === 'session/list' ? { _request: args || {} } : { request: args || {} } }
+  });
+  const res = await fetch(`${base}/api/${name}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body,
     signal: AbortSignal.timeout(timeoutMs)
   });
-  if (!res.ok) throw new Error(`DSH RPC ${method} HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`DSH RPC ${name} HTTP ${res.status}`);
   const data = await res.json();
   const r = data?.result;
-  if (!r?.ok) throw new Error(`DSH ${method} 失败: ${r?.error?.message || r?.error?.code || 'unknown'}`);
+  if (!r?.ok) throw new Error(`DSH ${name} 失败: ${r?.error?.message || r?.error?.code || 'unknown'}`);
   return r.value;
+}
+
+/**
+ * 把任务整理成一句人能看懂的标题（2026-10-28）
+ *
+ * 用户要求："标题要她自己整理好，我想看的时候要可以看到她干了什么"
+ *
+ * 不做花哨生成，只做三件事：
+ *   ① 去掉"帮我/请你/麻烦"这类客套开头
+ *   ② 去掉换行和多余标点，压成一行
+ *   ③ 超长截断到 28 字（够看清做什么，又不至于文件名离谱）
+ *
+ * 为什么不用模型生成标题：这里只是写文件名的辅助函数，
+ * 为了一个标题再调一次模型不值当，而且会拖慢任务提交。
+ */
+function humanTitle(name, taskText) {
+  let s = String(name || '').trim();
+  if (!s || s.length < 4) s = String(taskText || '').trim();
+
+  s = s
+    .replace(/^(帮我|帮忙|请你|请|麻烦你?|给我|替我)\s*/g, '')
+    .replace(/^\d+[.、)]\s*/, '')
+    .replace(/\s+/g, ' ')
+    .replace(/[。！？!?]+$/g, '')
+    .trim();
+
+  // 取第一句（任务描述常有多行，标题只留最核心那句）
+  let firstLine = s.split(/[。\n；;]/)[0].trim() || s;
+
+  // 去掉"在当前目录/在 dsh-work/请在"这类执行细节 —— 标题该说"做什么"，
+  // 不该说"在哪做"。实测「在当前目录创建 worklog-test.txt」读起来像操作日志。
+  firstLine = firstLine
+    .replace(/^(在|从)[^，,]{0,12}(目录|文件夹|下)\s*/g, '')
+    .replace(/^(当前|这个|该)\s*(目录|文件夹)\s*/g, '')
+    .trim();
+
+  // 截断时按整词切，避免把 worklog-test.txt 切成 .tx
+  if (firstLine.length > 26) {
+    const cut = firstLine.slice(0, 26);
+    const lastSpace = Math.max(cut.lastIndexOf(' '), cut.lastIndexOf('，'));
+    firstLine = (lastSpace > 12 ? cut.slice(0, lastSpace) : cut) + '…';
+  }
+  return firstLine || '未命名任务';
 }
 
 /** 安全目录名：去掉路径分隔和特殊字符 */
@@ -64,6 +182,48 @@ export async function submitDshTask(taskText, { taskName = '', preset = '' } = {
   // 任务档案：记录本次任务（标题用于区分，不再用作目录名）
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const taskId = `${stamp}_${name}`;
+  // ── 工作记录（2026-10-28 重做）──
+  //
+  // 用户："我看不到她的工作记录…以后她的外包对话全部放到这里，
+  //        而且标题要她自己整理好，我想看的时候要可以看到她干了什么"
+  //
+  // 原来按天一个大 md 追加，标题只是截取任务前 24 字 ——
+  // 翻起来像日志，看不出"她干了哪几件事"。
+  //
+  // 现在：**一个任务一个文件**，文件名带时间和整理好的标题，
+  // 结构固定（标题 / 什么时候 / 为什么派出去 / 交给 DSH 的原话 / 结果），
+  // 面板列表里一眼能扫完她做过什么。
+  const day = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+  const time = new Date().toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
+  const title = humanTitle(name, taskText);
+  const recordFile = `${day} ${time.replace(/:/g, '')} ${title}.md`.replace(/[\\/:*?"<>|]/g, '-');
+  try {
+    const dialogDir = path.join(WORK_ROOT, '对话记录');
+    fs.mkdirSync(dialogDir, { recursive: true });
+    fs.writeFileSync(path.join(dialogDir, recordFile), [
+      `# ${title}`,
+      '',
+      `**时间**：${day} ${time}（北京时间）`,
+      `**交给**：本机 dshc`,
+      `**会话**：${taskId}`,
+      '',
+      '## 我为什么派出去',
+      '',
+      '这类活需要跑代码/处理文件，我自己做不了，所以交给 dshc。',
+      '',
+      '## 我给 dshc 的原话',
+      '',
+      '```',
+      String(taskText).slice(0, 3000),
+      '```',
+      '',
+      '## 结果',
+      '',
+      '（完成后自动补进来）',
+      ''
+    ].join('\n'), 'utf8');
+  } catch { /* 记录失败不影响任务 */ }
+
   try {
     const tasksDir = path.join(workDir, '.tasks');
     fs.mkdirSync(tasksDir, { recursive: true });
@@ -72,17 +232,43 @@ export async function submitDshTask(taskText, { taskName = '', preset = '' } = {
     }, null, 2), 'utf8');
   } catch { /* 档案写失败不影响任务 */ }
 
-  // 1. 建 workspace（幂等：同一路径复用同一个 workspaceId）
-  const ws = await rpcRetry('workspace.create', { path: workDir }, { tries: 3 });
-  const workspaceId = ws?.workspace?.workspaceId;
-  if (!workspaceId) throw new Error('workspace.create 未返回 workspaceId');
-  // 2. 建会话（标题带任务名，便于在 DSH 里区分）
-  const params = { workspaceId };
+  // 1. 先建/复用 workspace（2026-10-28 修正）
+  //
+  // 用户反馈："为什么她的外包任务都进了 dsh 的未分组"
+  //
+  // 🔴 更正我之前的错误结论：`workspace/create` **是存在的**。
+  //    我上次搜端点时漏了它，误判成"DSH 没有这个方法"，改成只传 cwd ——
+  //    会话确实能建，但没有分组，全落进「未分组」。
+  //
+  //    workspace 的标题就是分组名（取 path 的最后一段），
+  //    所以工作目录叫《鱼鱼的工作目录》→ 分组名就是中文的。
+  //    同一 path 重复调用返回同一个 workspaceId，可以放心每次都建。
+  let workspaceId = '';
+  try {
+    const ws = await rpcRetry('workspace/create', { path: String(workDir) }, { tries: 2 });
+    workspaceId = ws?.workspace?.workspaceId || '';
+  } catch { /* 建不了 workspace 也要能建会话，退回 cwd 模式 */ }
+
+  // 2. 建会话：优先挂到 workspace（这样才不是"未分组"）
+  const params = workspaceId ? { workspaceId } : { cwd: String(workDir) };
   if (preset) params.agentPreset = preset;
-  if (name) params.title = String(name).slice(0, 60);
-  const sess = await rpcRetry('session.create', params, { tries: 3 });
+  const sess = await rpcRetry('session/create', params, { tries: 3 });
   const sessionId = sess?.sessionId;
-  if (!sessionId) throw new Error('session.create 未返回 sessionId');
+  if (!sessionId) throw new Error('session/create 未返回 sessionId');
+
+  // 3. 用**中文标题**命名会话（2026-10-28）
+  //
+  // 用户："标题不要英文，要方便我能看懂的中文"
+  // 原来直接用调用方传的 taskName（heybox-reverse / mt-verify-probe 这类英文短名），
+  // 在 DSH 列表里根本看不出干了什么。现在统一走 humanTitle()。
+  // 改名要**重试**：刚建完会话时 title 可能被初始化流程覆盖掉。
+  // 实测：建完立刻 rename 返回 ok，但列表里仍是英文/空 —— 过一会儿再改才稳。
+  for (let i = 0; i < 3; i++) {
+    try {
+      await rpc('session/rename', { sessionId, title: title.slice(0, 60) }, 15000);
+    } catch { /* 单次失败继续试 */ }
+    await new Promise((r) => setTimeout(r, 1200));
+  }
   // 3. 提交任务（queue 模式异步执行）
   const promptText = `【QQ 主人任务 · 小白鲸转发】任务名：${name || '(未命名)'}
 请完成以下任务：
@@ -94,11 +280,46 @@ ${taskText}
 2. 完成后在回复里明确说「任务完成」并列出产物文件
 3. 不要改动服务器系统配置（/etc、服务、DSH 配置等）
 4. 如果任务无法完成，说明原因`;
-  const accepted = await rpcRetry('session.prompt', {
-    sessionId, mode: 'queue',
+  // requestId 是必填的（schema 要求），用 taskId 当幂等键
+  const accepted = await rpcRetry('session/prompt', {
+    requestId: taskId,
+    sessionId,
+    mode: 'queue',
     content: [{ type: 'text', text: promptText }]
   }, { tries: 3, timeoutMs: 90000 });
-  return { sessionId, workDir, workspaceId, taskId, accepted: !!accepted?.accepted };
+  return { sessionId, workDir, taskId, recordFile, accepted: !!accepted?.accepted };
+}
+
+/**
+ * 把执行结果写回工作记录（2026-10-28）
+ *
+ * 提交时只写了"结果（完成后自动补进来）"，
+ * 真正跑完要把结果填进去 —— 否则用户翻记录只看到任务，看不到干成什么样。
+ *
+ * @param {string} recordFile  提交时返回的记录文件名
+ * @param {object} state       getDshSessionState 的返回
+ * @param {string[]} [files]   产物文件列表（可选）
+ */
+export function appendRecordResult(recordFile, state, files = []) {
+  if (!recordFile) return false;
+  try {
+    const full = path.join(WORK_ROOT, '对话记录', recordFile);
+    if (!fs.existsSync(full)) return false;
+    let text = fs.readFileSync(full, 'utf8');
+    const lines = [
+      `**状态**：${state?.detail || state?.state || '未知'}`,
+      `**完成时间**：${new Date().toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' })}`,
+      ''
+    ];
+    if (files.length) {
+      lines.push('**产物**：', ...files.slice(0, 30).map((f) => `- \`${f}\``), '');
+    }
+    lines.push('**产出在哪**：`鱼鱼的工作目录/` 下（或本次会话的子目录）');
+
+    text = text.replace('（完成后自动补进来）', lines.join('\n'));
+    fs.writeFileSync(full, text, 'utf8');
+    return true;
+  } catch { return false; }
 }
 
 /** 直接查询 DSH 会话的真实状态（不猜、不推断）。

@@ -102,7 +102,14 @@ export class ChatStore {
   }
 
   /** 追加一条收到的消息（未读）。返回写入的条目。 */
-  appendIncoming(chatKey, { mid, ts, senderId, senderName, text, reply = null, media = [] }) {
+  /**
+   * 追加一条收到的消息。
+   *
+   * read 参数（2026-10-28）：启动补偿补进来的消息要标已读，
+   * 否则它们会被算成"未读"，一启动就触发一堆回复。
+   * 早先是在返回后改 entry.read —— 没用，因为这里已经落盘了。
+   */
+  appendIncoming(chatKey, { mid, ts, senderId, senderName, text, reply = null, media = [], read = false }) {
     const st = this.#state(chatKey);
     const entry = {
       id: st.nextLocalId++,
@@ -112,7 +119,7 @@ export class ChatStore {
       senderName: String(senderName ?? ''),
       text: String(text ?? ''),
       self: false,
-      read: false,
+      read: read === true,
       reply: reply || null,
       media: Array.isArray(media) ? media : []
     };

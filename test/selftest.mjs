@@ -308,6 +308,12 @@ refs:
       //   napcat-alert 每 15 秒轮询（最频繁，最容易干扰）
       'heybox-pond': { enabled: false },
       'napcat-alert': { enabled: false },
+      // 2026-10-28 自检又抓到 4 个（都是 defaultEnabled:true）：
+      'companion': { enabled: false },
+      'friend-guard': { enabled: false },
+      'luoluo-memory': { enabled: false },
+      'proactive-ping': { enabled: false },
+      'dsh-dialog': { enabled: false },
       'mcp-client': { enabled: false },
       'mobile-ui': { enabled: false },
       'plugin-market': { enabled: false },
@@ -889,7 +895,7 @@ refs:
   const chatsRes = await (await fetch(`http://127.0.0.1:${cfg.server.port}/api/chats`)).json();
   assert.ok(chatsRes.chats.some((c) => c.key === 'group:456'));
   const uiRes = await fetch(`http://127.0.0.1:${cfg.server.port}/`);
-  assert.ok((await uiRes.text()).includes('QQ Agent'), 'UI 首页可访问');
+  assert.ok((await uiRes.text()).includes('鲸界Bridge'), 'UI 首页可访问');
   pass('HTTP API：status/models/sessions/chats/UI 全部可用', `今日 cost=¥${statusRes.usage.cost}`);
 
   // ── 场景 26：记忆自动整理（超阈值触发 + LLM 合并写回 + 备份 + 冷却）──

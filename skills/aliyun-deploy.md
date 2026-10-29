@@ -408,7 +408,7 @@ WantedBy=multi-user.target
 ```ini
 # /etc/systemd/system/qq-agent-v2.service
 [Unit]
-Description=QQ Agent
+Description=鲸界Bridge
 After=napcat-qq.service
 [Service]
 WorkingDirectory=/root/qqbot/qq-agent-v2

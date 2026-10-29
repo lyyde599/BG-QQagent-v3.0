@@ -1,0 +1,26 @@
+{
+  "id": "context-strategy",
+  "name": "上下文策略",
+  "version": "1.0.2",
+  "apiVersion": 1,
+  "entry": "index.js",
+  "author": "白光",
+  "summary": "决定哪些未读触发回复、哪些只当背景，避免长未读时上下文断裂",
+  "description": "群里积压十几条消息时，内核默认把它们全算「本次唤醒」并排除出【过去状态】，模型只看到一堆孤立消息。本插件改成：只有 @我/引用我/拍我的才算触发，其余留在过去状态里当背景，模型能顺着读下来。内置多种预设策略，也可自定义关键词。",
+  "category": "内核增强",
+  "defaultEnabled": false,
+  "priority": 50,
+  "hooks": [],
+  "ui": "ui.js",
+  "uiTab": {
+    "id": "context-strategy",
+    "label": "上下文策略",
+    "inline": true
+  },
+  "config": {
+    "mode": "mention-only",
+    "customKeywords": [],
+    "maxBackground": 50,
+    "debug": false
+  }
+}

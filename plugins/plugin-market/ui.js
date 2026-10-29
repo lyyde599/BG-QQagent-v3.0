@@ -411,7 +411,7 @@ export async function mountPanel(box, ctx) {
 
     <div class="cy-wrap">
       <div class="cy-head">
-        <div class="cy-title">BG-QQAgent 创造营</div>
+        <div class="cy-title">鲸界Bridge 创造营</div>
         <div class="cy-sub">装插件 · 发技能</div>
       </div>
 

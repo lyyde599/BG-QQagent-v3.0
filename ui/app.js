@@ -115,6 +115,14 @@ const pluginUiCache = new Map();
  *    插件 ui.js 更新后仍可能加载旧内容。加 ?v=<mtime> 强制拉新的。
  *    （内核不缓存 mtime，每次现取；代价是一次 API 调用，可接受）
  */
+// 最近一次插件 UI 加载失败的原因（给界面展示用）
+//
+// 🔴 2026-10-29：原来界面只显示「没有导出 mount / mountPanel」，
+//    把真实错误（语法错误 / 404 / 网络失败）藏在了 toast 里 ——
+//    用户看到的是误导性结论，根本不知道去哪查。
+//    现在把真实原因记下来，界面直接显示。
+const pluginUiErrors = new Map();
+
 async function loadPluginUi(pluginId, entryFile, stamp) {
   if (!entryFile) return null;
   const key = `${pluginId}@${stamp || ''}`;
@@ -124,13 +132,21 @@ async function loadPluginUi(pluginId, entryFile, stamp) {
     const url = `/plugin-ui/${encodeURIComponent(pluginId)}/${entryFile}${q}`;
     const mod = await import(/* @vite-ignore */ url);
     pluginUiCache.set(key, mod);
+    pluginUiErrors.delete(pluginId);
     return mod;
   } catch (e) {
+    const msg = String(e?.message ?? e);
+    pluginUiErrors.set(pluginId, msg);
     console.error(`[plugin-ui] ${pluginId} 加载失败:`, e);
-    toast(`插件「${pluginId}」界面加载失败：${e.message}`);
+    toast(`插件「${pluginId}」界面加载失败：${msg}`);
     // 注意：**不写缓存**，下次调用会重试
     return null;
   }
+}
+
+/** 取某插件上次 UI 加载失败的原因（没有则空串） */
+function pluginUiError(pluginId) {
+  return pluginUiErrors.get(pluginId) || '';
 }
 
 function pluginUiContext(pluginId) {
@@ -2126,7 +2142,7 @@ async function loadSnowlumaPage({ quiet = false } = {}) {
       setDot('sl-dot-run', _running);
       setText('sl-txt-run', _running ? '运行中' : '未运行');
       setText('sl-txt-pid', _pid ? ('pid ' + _pid) : '');
-      setText('sl-txt-mode', _embedded ? '内置模式（随 QQ Agent 退出）' : (_running ? '独立模式' : ''));
+      setText('sl-txt-mode', _embedded ? '内置模式（随鲸界Bridge 退出）' : (_running ? '独立模式' : ''));
 
       setDot('sl-dot-ob', _obOk);
       const _acct = _s.onebot?.account || {};
@@ -2142,7 +2158,13 @@ async function loadSnowlumaPage({ quiet = false } = {}) {
       setText('sl-txt-obws', _acctOff
         ? ('账号离线 —— 扫码或检查登录' + (_acct.lastError ? ('（' + _acct.lastError + '）') : ''))
         : (_s.onebot?.error ? ('WS ：' + _s.onebot.error) : ''));
-      setText('sl-txt-dir', '目录：' + (dir || '（未找到项目内 snowluma/ 文件夹）'));
+      // 显示实际连的 OneBot 目录（NapCat），而不是配置里填的 SnowLuma 路径
+      // —— 两者可能不同，只显示前者会让人以为配置错了（2026-10-28）
+      const _obDir = _s.snowluma?.onebotDir || '';
+      setText('sl-txt-dir',
+        _obDir
+          ? ('OneBot 目录：' + _obDir + (dir && dir !== _obDir ? `（SnowLuma 配置：${dir}）` : ''))
+          : ('目录：' + (dir || '（未找到 snowluma/ 或 NapCat 目录）')));
 
       // 把同样的状态同步到顶部左侧的紧凑面板（2026-10-27 布局优化）
       // 直接用 innerHTML 复制，避免再写一遍判断逻辑
@@ -2636,11 +2658,37 @@ async function loadMarketPage() {
       return;
     }
 
-    const mod = await loadPluginUi('plugin-market', meta.ui || 'ui.js');
+    // 🔴 2026-10-29：必须带 fileStamp，否则浏览器缓存旧 ui.js
+    //
+    // 用户反馈「更新了创造营插件，界面还是旧的」—— 根因就是没传 stamp，
+    // URL 上没有 ?v= 后缀，ES module 缓存直接命中旧文件。
+    // stamp 取自 tabs[]（后端按 ui.js 的 mtime 算，文件一改就变）。
+    const cyStamp = (d.tabs || []).find((x) => x.pluginId === 'plugin-market')?.fileStamp || meta.version || '';
+    const mod = await loadPluginUi('plugin-market', meta.ui || 'ui.js', cyStamp);
     const mount = mod?.mountPanel || mod?.mount;
     if (typeof mount !== 'function') {
-      box.innerHTML = `<div class="card"><h3>创造营</h3>
-        <p class="muted">界面文件没有导出 mount / mountPanel。</p></div>`;
+      // 🔴 2026-10-29：区分「加载失败」和「没导出」
+      //
+      // 用户反馈：创造营一直显示「界面文件没有导出 mount / mountPanel」。
+      // 实测发现这句话经常是**误导** —— 真实原因往往是文件加载失败
+      //（语法错误 / 404 / 版本不匹配），而那个错误只闪一下 toast。
+      const loadErr = pluginUiError('plugin-market');
+      const errHtml = loadErr
+        ? `<p class="muted">界面文件<b>加载失败</b>，所以拿不到 mount / mountPanel。</p>
+           <pre class="muted" style="font-size:12px;white-space:pre-wrap;word-break:break-all;background:var(--raised);padding:8px;border-radius:6px;margin-top:8px">${esc(loadErr)}</pre>
+           <p class="muted" style="font-size:12.5px;margin-top:8px">
+             常见原因：<br>
+             · 内核与插件版本不匹配（更新到最新内核）<br>
+             · <code>plugins/plugin-market/ui.js</code> 文件损坏或被截断<br>
+             · 浏览器缓存了旧文件（强制刷新 Ctrl+Shift+R）<br>
+             按 F12 看 Console 有完整堆栈。
+           </p>`
+        : `<p class="muted">界面文件加载成功了，但没有导出 mount / mountPanel —— 插件文件本身有问题（可能装的是旧版）。</p>
+           <p class="muted" style="font-size:12.5px;margin-top:8px">
+             核对：插件版本 v${esc(meta.version || '?')}。
+             建议更新到最新内核包（设置 → 关于 → 检查更新）。
+           </p>`;
+      box.innerHTML = `<div class="card"><h3>创造营</h3>${errHtml}</div>`;
       return;
     }
     box.innerHTML = '';
@@ -2665,7 +2713,7 @@ async function loadMarketPage() {
       // 这里让重挂后的 ctx 也带上 remount（闭包，无需命名函数）。
       remount: (function mountCycle() {
         return async () => {
-          const fresh = await loadPluginUi('plugin-market', meta.ui || 'ui.js');
+          const fresh = await loadPluginUi('plugin-market', meta.ui || 'ui.js', cyStamp);
           const m2 = fresh?.mountPanel || fresh?.mount;
           if (typeof m2 !== 'function') return;
           box.innerHTML = '';
@@ -2747,7 +2795,7 @@ async function renderFeedbackSection() {
         <h3>BUG 反馈</h3>
         <p class="muted" style="font-size:13px;line-height:1.8">
           这个功能需要先登录创造营作者账号。<br>
-          到 <b>BG创造营 → 发布 → 作者账号</b> 注册或用邮箱密码登录，回来就能提交。
+          到 <b>创造营 → 发布 → 作者账号</b> 注册或用邮箱密码登录，回来就能提交。
         </p>
       </div>`;
     return;
@@ -2920,7 +2968,7 @@ function renderAboutSection(c) {
   return `
     <h3>关于</h3>
     <div class="hint" style="margin-bottom:14px">
-      QQ Agent 是一个可扩展的群机器人框架：内核只保留收发消息与调度，
+      鲸界Bridge 是一个可扩展的群机器人框架：内核只保留收发消息与调度，
       其余能力都以插件形式装卸。
     </div>
 
@@ -3547,7 +3595,12 @@ function renderApiSection(c) {
         <button class="btn btn-small btn-primary" type="button" id="save-search-keys-btn">保存 Key</button>
         <span id="search-key-result" class="muted"></span>
       </div>
-      <div class="hint" style="margin-top:4px">支持多个 Key 轮换（某个额度用尽时自动换下一个）。已保存的 Key 只显示首尾，重新填写才会覆盖；环境变量注入的 Key 优先且不在此显示。</div></div>
+      <div class="hint" style="margin-top:4px">
+        支持多个 Key 轮换（某个额度用尽时自动换下一个）。<br>
+        <b>已保存的 Key 显示成 <code>as_sk_****abcd</code> 这种遮影形式 —— 这是正常的，说明它在库里</b>，
+        不是保存失败。想换就在框里重新粘贴一个完整 Key，点保存才会覆盖。<br>
+        环境变量注入的 Key 优先且不在此显示。
+      </div></div>
     <div class="field"><label>搜索地址（高级：可替换为兼容 Bing 结果格式的引擎）</label><input type="text" id="cfg-searchurl" value="${esc(c.webSearch?.searchUrl || 'https://cn.bing.com/search')}" /></div>
 
     <div class="settings-divider"></div>
@@ -3616,6 +3669,24 @@ function renderSearchKeyRows() {
       '<button class="btn btn-small" type="button" data-del-key="' + i + '" title="删除这一项">✕</button>' +
       '</div>');
   }
+
+  // 状态行（2026-10-29）：明确告诉用户「已保存几个」，别再被遮影值误导
+  //
+  // 用户反馈「点了保存、刷新后保存状态就没了」—— 其实数据一直在库里，
+  // 只是输入框显示的是 as_sk_****abcd 这种遮影，看起来像没保存。
+  const savedCount = (sk.configKeyCount || 0) + envCount;
+  if (savedCount > 0) {
+    const parts = [];
+    if (sk.configKeyCount) parts.push(`配置里 ${sk.configKeyCount} 个`);
+    if (envCount) parts.push(`环境变量 ${envCount} 个`);
+    rows.push('<div class="muted" style="font-size:12px;margin-top:2px;color:#2f855a">'
+      + '✅ 已保存 ' + savedCount + ' 个 Key（' + parts.join(' + ') + '）'
+      + (masked.length ? ' —— 框里显示 ' + esc(masked[0]) + ' 是遮影，不是丢失' : '')
+      + '</div>');
+  } else {
+    rows.push('<div class="muted" style="font-size:12px;margin-top:2px">还没有保存任何 Key</div>');
+  }
+
   box.innerHTML = rows.join('');
   box.querySelectorAll('[data-del-key]').forEach((el) => {
     el.addEventListener('click', () => {
@@ -3739,6 +3810,21 @@ function renderChatSection(c) {
       <div class="field"><label>每分钟最多发送</label><input type="number" id="cfg-maxpermin" min="1" value="${esc(c.send.maxPerMinute)}" /></div>
     </div>
 
+<h3>群聊回复方式</h3>
+    <div class="field">
+      <label>群里什么时候回复</label>
+      <select id="cfg-requireat">
+        <option value="always" ${c.group?.requireAt === false ? 'selected' : ''}>每条消息都交给模型判断（可能主动接话，费 token）</option>
+        <option value="at" ${c.group?.requireAt !== false && c.group?.requireAtBy !== 'plugin' ? 'selected' : ''}>只有 @ 机器人才回复（省钱，推荐）</option>
+        <option value="plugin" ${c.group?.requireAt !== false && c.group?.requireAtBy === 'plugin' ? 'selected' : ''}>交给「上下文策略」插件判定（@我/引用我/拍我/关键词）</option>
+      </select>
+      <div class="hint">
+        选「只有 @ 才回复」时，没 @ 的消息只入库、不调模型 —— 省钱但机器人不主动接话。<br>
+        想让它像真人一样偶尔插话，选第一项；想精细控制（引用我也回、关键词也回），
+        选第三项并到「插件」页启用「上下文策略」。
+      </div>
+    </div>
+
     <h3>主动开话题</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-proactive" ${c.proactive.enabled ? 'checked' : ''} />
       <label for="cfg-proactive">冷场时按概率主动开话题</label></div>
@@ -3789,7 +3875,7 @@ function renderOnebotSection(c) {
       </div>
       <div class="hint" id="snowluma-hint"></div></div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-snowlumalaunch" ${c.snowluma.autoLaunch ? 'checked' : ''} />
-      <label for="cfg-snowlumalaunch">QQ Agent 启动时自动拉起网关（仅 SnowLuma 部署有效）</label></div>
+      <label for="cfg-snowlumalaunch">鲸界Bridge 启动时自动拉起网关（仅 SnowLuma 部署有效）</label></div>
     <div class="field-row">
       <div class="field"><label>WebSocket 地址（收消息）</label><input type="text" id="cfg-wsurl" value="${esc(c.snowluma.wsUrl)}" /></div>
       <div class="field"><label>HTTP 地址（发消息）</label><input type="text" id="cfg-httpurl" value="${esc(c.snowluma.httpUrl)}" /></div>
@@ -4815,6 +4901,13 @@ async function saveConfig({ quiet = false } = {}) {
   // ⚠️ 只保留**内核级**开关；插件级开关（课程播报、学习模式、teacher_control）
   //    已归到各自插件，在「插件」页管理 —— 状态与开关应在同一处，不要两处重复。
   if (sec === 'chat') {
+    // 群聊回复方式（2026-10-29）：三个选项映射到 requireAt / requireAtBy
+    const gate = val('#cfg-requireat', 'at');
+    patch.group = {
+      ...(c.group || {}),
+      requireAt: gate !== 'always',
+      requireAtBy: gate === 'plugin' ? 'plugin' : 'builtin'
+    };
     patch.privateAllowGroupMembers = chk('#cfg-feat-allowgroupmembers', c.privateAllowGroupMembers !== false);
     patch.features = {
       ...(c.features || {}),
@@ -4916,7 +5009,7 @@ $$('.tab').forEach((tab) => {
 // ── 启动 ──
 (async function init() {
   // 启动 loading：先等 HTTP 服务可用（页面可能先于服务打开）
-  setLoadingStatus('正在启动 QQ Agent 服务…');
+  setLoadingStatus('正在启动 鲸界Bridge 服务…');
   await bootLoop();
 
   // 首启引导：关键配置（模型/白名单）没填就直接带去设置页
@@ -5633,14 +5726,15 @@ async function openPluginPanel(id) {
   //
   // 🔴 关键：**重挂后的新 ctx 里必须还能拿到 remount**，
   //    否则第二次点刷新又会退化成整页重载。所以这里递归注入自己。
-  const panelRemount = async (pid, entry, container) => {
+  // stamp：插件 ui.js 的 mtime，带上才能绕过浏览器对 ES module 的缓存
+  const panelRemount = async (pid, entry, container, stamp) => {
     try {
-      const fresh = await loadPluginUi(pid, entry || 'ui.js');
+      const fresh = await loadPluginUi(pid, entry || 'ui.js', stamp);
       const m2 = fresh?.mountPanel || fresh?.mount;
       if (typeof m2 !== 'function') return false;
       container.innerHTML = '';
       const ctx2 = { ...pluginUiContext(pid), openPluginPanel };
-      ctx2.remount = () => panelRemount(pid, entry, container);
+      ctx2.remount = () => panelRemount(pid, entry, container, stamp);
       await m2(container, ctx2);
       return true;
     } catch (e) {
@@ -5655,13 +5749,15 @@ async function openPluginPanel(id) {
     const d = await api('/api/plugins');
     const tab = (d.tabs || []).find((x) => x.pluginId === id);
     const entry = tab?.file || '';
+    // 🔴 带上 fileStamp：不加 ?v= 的话，插件更新后浏览器仍用旧 ui.js
+    const stamp = tab?.fileStamp || '';
     if (entry) {
-      const mod = await loadPluginUi(id, entry);
+      const mod = await loadPluginUi(id, entry, stamp);
       // ① 有 mountPanel 就用它（配置面板形态）
       if (mod && typeof mod.mountPanel === 'function') {
         box.innerHTML = '';
         const ctx1 = { ...pluginUiContext(id), openPluginPanel };
-        ctx1.remount = () => panelRemount(id, entry, box);
+        ctx1.remount = () => panelRemount(id, entry, box, stamp);
         await mod.mountPanel(box, ctx1);
         return;
       }
@@ -5670,7 +5766,7 @@ async function openPluginPanel(id) {
       if (mod && typeof mod.mount === 'function') {
         box.innerHTML = '<div id="pl-inline-mount"></div>';
         const ctx2 = { ...pluginUiContext(id), openPluginPanel };
-        ctx2.remount = () => panelRemount(id, entry, $('#pl-inline-mount'));
+        ctx2.remount = () => panelRemount(id, entry, $('#pl-inline-mount'), stamp);
         await mod.mount($('#pl-inline-mount'), ctx2);
         return;
       }

@@ -251,6 +251,22 @@ export function createApp({ log = console.log } = {}) {
     return fs.existsSync(bundled) ? bundled : '';
   }
 
+  /** SnowLuma WebUI 端口（默认 5099），从 runtime.json 或配置读 */
+  function snowlumaWebuiPort() {
+    try {
+      const dir = snowlumaDir();
+      if (dir) {
+        const rtPath = path.join(dir, 'config', 'runtime.json');
+        if (fs.existsSync(rtPath)) {
+          const rt = JSON.parse(fs.readFileSync(rtPath, 'utf8'));
+          const p = Number(rt.webuiPort);
+          if (p > 0) return p;
+        }
+      }
+    } catch { /* 忽略 */ }
+    return 5099;
+  }
+
   function snowlumaWsPort() {
     try {
       const wsUrl = String(getConfig().snowluma?.wsUrl || 'ws://127.0.0.1:3001');
@@ -331,9 +347,13 @@ export function createApp({ log = console.log } = {}) {
   async function launchSnowluma() {
     const dir = snowlumaDir();
     if (!dir) return { ok: false, error: '找不到 SnowLuma 目录：请确认项目内 snowluma/ 文件夹存在，或在设置里填写 SnowLuma 目录' };
-    const wsPort = snowlumaWsPort();
-    if (await isPortOpen('127.0.0.1', wsPort)) {
-      pushSnowlumaLog(`SnowLuma 已在运行（端口 ${wsPort} 已就绪），无需重复启动`, 'stdout');
+    // 🔴 判断「是否已在运行」要看 **SnowLuma 自己的 WebUI 端口**，不是 OneBot 的 wsPort。
+    //
+    // 原来检测 wsPort（默认 3001）—— 那是 NapCat 的端口。走 NapCat 的部署里
+    // 3001 常年被占着，于是这里永远误判「已在运行」，SnowLuma 根本起不来。
+    const uiPort = snowlumaWebuiPort();
+    if (await isPortOpen('127.0.0.1', uiPort)) {
+      pushSnowlumaLog(`SnowLuma 已在运行（WebUI 端口 ${uiPort} 已就绪），无需重复启动`, 'stdout');
       return { ok: true, alreadyRunning: true };
     }
     const indexMjs = path.join(dir, 'index.mjs');
@@ -377,6 +397,54 @@ export function createApp({ log = console.log } = {}) {
       }
     }
     // 回退：launcher.bat 独立控制台窗口（老行为，日志无法内置）
+    // ── Linux / macOS：直接用 node 跑 index.mjs（2026-10-28）──
+    //
+    // 原来这里只有 Windows 分支（node.exe / launcher.bat / cmd.exe），
+    // 在 Linux 上永远走到「目录里没有 index.mjs / node.exe，也没有 launcher.bat」。
+    //
+    // 🔴 SnowLuma 需要 Node >= 24（用它读 QQ 的 SQLite 账号库，
+    //    Node 22 会报 "SQLite requires Node >=24"）。
+    //    本机系统 Node 是 22，所以优先找独立安装的 /opt/node24。
+    if (process.platform !== 'win32') {
+      if (!fs.existsSync(indexMjs)) {
+        return { ok: false, error: `目录里没有 index.mjs：${dir}` };
+      }
+      // 依次尝试：显式配置 → /opt/node24 → 系统 node
+      const candidates = [
+        String(getConfig().snowluma?.nodePath || '').trim(),
+        '/opt/node24/bin/node',
+        process.execPath
+      ].filter(Boolean);
+      const nodeBin = candidates.find((p) => {
+        try { return fs.existsSync(p); } catch { return false; }
+      }) || 'node';
+
+      const child = spawn(nodeBin, [indexMjs], {
+        cwd: dir,
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, PATH: `/opt/node24/bin:${process.env.PATH || ''}` }
+      });
+      snowlumaProc = child;
+      child.unref();
+      pushSnowlumaLog(`SnowLuma 启动中（${nodeBin}，pid=${child.pid}）…`, 'stdout');
+      child.stdout.on('data', (d) => {
+        for (const line of String(d).split(/\r?\n/)) {
+          if (line.trim()) pushSnowlumaLog(line, 'stdout');
+        }
+      });
+      child.stderr.on('data', (d) => {
+        for (const line of String(d).split(/\r?\n/)) {
+          if (line.trim()) pushSnowlumaLog(line, 'stderr');
+        }
+      });
+      child.on('exit', (code, signal) => {
+        snowlumaProc = null;
+        pushSnowlumaLog(`SnowLuma 进程已退出（code=${code} signal=${signal}）`, 'stderr');
+      });
+      return { ok: true, launched: true, embedded: true, node: nodeBin };
+    }
+
     const launcher = path.join(dir, 'launcher.bat');
     if (!fs.existsSync(launcher)) return { ok: false, error: `目录里没有 index.mjs / node.exe，也没有 launcher.bat：${dir}` };
     const child = spawn('cmd.exe', ['/c', launcher], {
@@ -417,7 +485,12 @@ export function createApp({ log = console.log } = {}) {
   });
   // 注意：pluginHost 在下面才构造，这里先传 null 占位；构造完成后立刻回填，
   // 避免插件工具/提示词与内核形成循环依赖（宿主需要 orchestrator 的工具校验，orchestrator 也要宿主的插件）。
-  const orchestrator = new Orchestrator({ store, memory, stickers, sender, sessions, onebot, emit, pluginHost: null });
+  // 🔴 必须传 log（2026-10-28）
+  //
+  // 没传的话 orchestrator 内部所有 this.log?.() 全是静默的 ——
+  // 排查"消息为什么不回复"时，wake 里的跳过原因一条都打不出来，
+  // 白白绕了一大圈。这类"日志静默"比报错更难查。
+  const orchestrator = new Orchestrator({ store, memory, stickers, sender, sessions, onebot, emit, log, pluginHost: null });
 
   // 每晚课程播报已**移交 schedule 插件**（2026-10-21）。
   // 内核不再持有这个调度器 —— 否则"插件停用了但播报还在跑"，
@@ -477,6 +550,17 @@ export function createApp({ log = console.log } = {}) {
   });
   // 宿主就绪 → 把插件能力接进 orchestrator（工具集 + 提示词段）
   orchestrator.pluginHost = pluginHost;
+  // 🔴 回填 orchestrator 给插件宿主（2026-10-28 补）
+  //
+  // ctx.orchestrator 是 host.deps.orchestrator 的 getter，但这里一直没赋值 ——
+  // 结果所有拿 ctx.orchestrator 的插件（reply-control 的 wake 接管、
+  // proactive-ping 的主动唤醒）拿到的都是 undefined，
+  // **整条主动唤醒链路是死的**，而且不报错（都用了可选链）。
+  //
+  // 表现：reply-control 日志里"放行，交给 orchestrator 唤醒"刷了很多次，
+  //       但一次都没真唤醒。
+  // 用 defineProperty 覆盖 getter（deps.orchestrator 是只读 getter）
+  try { Object.defineProperty(pluginHost.deps, 'orchestrator', { value: orchestrator, writable: true, configurable: true }); } catch { /* ignore */ }
   // 管理端点（列表/启停/导出/导入/卸载）——属内核能力，不随任何业务插件走
   registerPluginAdmin(pluginHost, { getConfig, log });
 
@@ -586,6 +670,7 @@ export function createApp({ log = console.log } = {}) {
 
   async function ingestMessage(kind, id, event) {
     const cfgNow = getConfig();
+    log(`[ingest] 收到 ${kind}:${id} 消息 event=${event?.post_type || '?'}`);
     // 白名单外的聊天完全不记录。
     // ⚠️ 用 allowedAsync：缓存未热时对私聊做实时查证，避免群成员私聊被静默丢弃
     //    （2026-10-04 事故，见 allowedAsync 注释）。
@@ -666,7 +751,10 @@ export function createApp({ log = console.log } = {}) {
       messageId: event.message_id ?? null,
       selfId: onebot.selfId
     });
-    if (chainResult.handled) return;
+    if (chainResult.handled) {
+      log(`[链] 被 ${chainResult.by} 终止，不唤醒模型（${chatKey}）`);
+      return;
+    }
 
     // ── 群聊 @ 硬门（2026-10-27 整合，开关 group.requireAt）──
     //
@@ -963,7 +1051,7 @@ export function createApp({ log = console.log } = {}) {
           if (fs.existsSync(f)) author = JSON.parse(fs.readFileSync(f, 'utf8'));
         } catch { /* ignore */ }
         if (!author?.email) {
-          return json(res, 403, { ok: false, error: '请先到「BG创造营 → 发布」登录作者账号' });
+          return json(res, 403, { ok: false, error: '请先到「创造营 → 发布」登录作者账号' });
         }
         const body = await readBody(req, { limitMB: 4 }).catch(() => ({}));
         const r = submitFeedback(author, body);
@@ -1324,7 +1412,16 @@ export function createApp({ log = console.log } = {}) {
             healthy: !!onebot.connected && onebotHealth.snapshot().online !== false
           },
           snowluma: {
+            // 显示**实际使用的**目录，而不是配置值（2026-10-28）
+            //
+            // 配置里可能填着 SnowLuma 目录，但 OneBot 实际连的是 NapCat ——
+            // 只显示 snowlumaDir() 会让人以为"目录配错了"，其实一切正常。
             dir: snowlumaDir(),
+            // 实际连的 OneBot 目录（NapCat）—— 直接问 napcatWebui，它内部已做过筛选
+            onebotDir: (() => {
+              try { return napcatWebui.info(snowlumaDir())?.dir || ''; }
+              catch { return ''; }
+            })(),
             running: await isPortOpen('127.0.0.1', snowlumaWsPort()),
             webuiUrl: snowlumaWebuiUrl(),
             ...snowlumaStatus()
@@ -2290,16 +2387,47 @@ export function createApp({ log = console.log } = {}) {
         const id = String(body?.id || '').trim();
         const existing = listSkills().find((s) => s.id === id);
         if (!existing) return json(res, 404, { ok: false, error: '没有这个 skill' });
-        if (existing.source !== 'user') {
-          return json(res, 400, { ok: false, error: '只有用户自定义的技能可以删除' });
-        }
+
         try {
-          fs.unlinkSync(path.join(userSkillDir(), `${id}.md`));
-          reloadUserSkills();
-          return json(res, 200, { ok: true });
+          // 用户自己写的：物理删文件 —— 但**同时记黑名单**（2026-10-29 补）
+          //
+          // 只删文件不够：skills/ 目录里的内置技能（如 aliyun-deploy）
+          // 在发布包里也有一份，内核更新解压时会原样写回来。
+          // 所以无论哪种来源，都记一笔 deleted-skills.json，
+          // 更新脚本据此跳过 —— 这样"删了就是删了"。
+          if (existing.source === 'user') {
+            try { fs.unlinkSync(path.join(userSkillDir(), `${id}.md`)); } catch { /* 已不在 */ }
+            const { hideSkill } = await import('./skill.js');
+            hideSkill(id);
+            reloadUserSkills();
+            return json(res, 200, { ok: true, mode: 'file' });
+          }
+
+          // 内置 / 插件的：记黑名单隐藏（2026-10-29）
+          //
+          // 原来这里直接 400「只有用户自定义的技能可以删除」，
+          // 用户想删掉用不上的内置技能（比如阿里云部署教程）就删不掉；
+          // 更糟的是删不掉还会在**内核更新后重新出现**，像没删过一样。
+          //
+          // 内置 skill 的正文指向仓库文件，物理删既破坏仓库、下次 pull 又回来，
+          // 所以改成 data/deleted-skills.json 记一笔，读取时跳过。
+          const { hideSkill } = await import('./skill.js');
+          hideSkill(id);
+          return json(res, 200, { ok: true, mode: 'hidden',
+            note: '已隐藏。想恢复可以在设置里取消，或删掉 data/deleted-skills.json 里的这一项。' });
         } catch (e) {
           return json(res, 500, { ok: false, error: String(e?.message ?? e) });
         }
+      }
+
+      // 恢复被隐藏的 skill（2026-10-29）
+      if (pathname === '/api/skills/restore' && method === 'POST') {
+        const body = await readBody(req).catch(() => ({}));
+        const id = String(body?.id || '').trim();
+        if (!id) return json(res, 400, { ok: false, error: '缺少 id' });
+        const { unhideSkill, listHiddenSkills } = await import('./skill.js');
+        const ok = unhideSkill(id);
+        return json(res, 200, { ok, hidden: listHiddenSkills() });
       }
 
       if (pathname === '/api/config' && method === 'GET') {
@@ -2795,6 +2923,63 @@ export function createApp({ log = console.log } = {}) {
         }
       }
 
+      // ── 她与 DSH 的专属对话文件夹（2026-10-28）──
+      //
+      // 用户需求："与 dshc 联通并给她留个专属对话文件夹页"
+      //
+      // 做的事：给机器人和 DSH 之间留一个固定的对话目录，
+      // 里面按日期存双方交换的文本（任务描述 / DSH 产出 / 汇报草稿），
+      // 面板上能直接看，不用翻 dsh-work 那堆混合产物。
+      // 工作记录目录（2026-10-28 用户指定）
+      // "我创建了一个《鱼鱼的工作目录》，以后她的外包对话全部放到这里"
+      const DSH_DIALOG_DIR = process.env.QQ_AGENT_YUYU_DIR
+        ? path.join(process.env.QQ_AGENT_YUYU_DIR, '对话记录')
+        : '/home/lyy/鱼鱼的工作目录/对话记录';
+
+      if (pathname === '/api/dsh/dialog' && method === 'GET') {
+        try {
+          fs.mkdirSync(DSH_DIALOG_DIR, { recursive: true });
+          const files = fs.readdirSync(DSH_DIALOG_DIR)
+            .filter((f) => f.endsWith('.md') || f.endsWith('.json'))
+            .sort()
+            .reverse()
+            .slice(0, 100);
+          return json(res, 200, {
+            ok: true,
+            dir: DSH_DIALOG_DIR,
+            items: files.map((f) => {
+              const full = path.join(DSH_DIALOG_DIR, f);
+              let stat = null;
+              try { stat = fs.statSync(full); } catch { /* ignore */ }
+              return {
+                name: f,
+                size: stat?.size ?? 0,
+                // 时间统一给北京时间（铁律 0.5）
+                at: stat ? new Date(stat.mtimeMs).toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' }) : ''
+              };
+            })
+          });
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e?.message ?? e) });
+        }
+      }
+
+      if (pathname === '/api/dsh/dialog/read' && method === 'GET') {
+        try {
+          const name = String(new URL(req.url, 'http://x').searchParams.get('name') || '');
+          // 防目录穿越：只允许纯文件名
+          if (!name || name.includes('/') || name.includes('..')) {
+            return json(res, 400, { ok: false, error: '文件名不合法' });
+          }
+          const full = path.join(DSH_DIALOG_DIR, name);
+          if (!fs.existsSync(full)) return json(res, 404, { ok: false, error: '文件不存在' });
+          const text = fs.readFileSync(full, 'utf8');
+          return json(res, 200, { ok: true, name, text: text.slice(0, 200000) });
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e?.message ?? e) });
+        }
+      }
+
       // 补报 DSH 任务：任务已完成但没汇报时（或通知链路故障后），让机器人现在汇报一次
       if (pathname === '/api/dsh/report' && method === 'POST') {
         try {
@@ -3097,6 +3282,7 @@ export function createApp({ log = console.log } = {}) {
     await onebot.connect();
     if (getConfig().proactive?.enabled) orchestrator.startProactiveLoop();
     orchestrator.startDshWatcher(); // DSH 任务完成汇报 watcher
+    log('[DSH watcher] 已启动（每 10 秒轮询待汇报任务）');
     // 课程播报的启动逻辑在 schedule 插件里（插件启用且 notifyEnabled 才跑）
     scheduledRunner.start();   // 通用定时任务调度器
 
@@ -3106,9 +3292,47 @@ export function createApp({ log = console.log } = {}) {
     // 理由见 src/kernel-update.js 顶部：整包替换第三方宿主出过真实事故。
     startKernelAutoCheck();
 
+    // 启动清理：上次被重启打断的会话收敛成 interrupted（2026-10-28）
+    // 否则控制台里会堆一堆永远"正在运行"的僵尸会话
+    try {
+      const n = sessions.reapStaleRunning();
+      if (n > 0) log(`[会话] 清理了 ${n} 个被中断的会话（上次进程退出时没来得及收尾）`);
+    } catch (e) {
+      log('[会话] 清理中断会话失败（不影响运行）：' + String(e?.message ?? e).slice(0, 60));
+    }
+
     log(`控制台已就绪：http://127.0.0.1:${port}`);
     log(`OneBot（SnowLuma）: ws=${getConfig().snowluma?.wsUrl} http=${getConfig().snowluma?.httpUrl}`);
     log(`模型: ${getConfig().api.model || '（未设置，请在设置里选择）'} @ ${getConfig().api.baseUrl}`);
+
+    // ── 启动补偿（2026-10-28）──
+    //
+    // 服务重启那几十秒里的群消息本来永久丢失 —— 既不入库也不会补处理。
+    // 这里起来后回看一段，把库里没有的补进去。
+    //
+    // 三条克制：
+    //   ① 只补库，不触发模型（补进来的标已读），否则一启动就连回十条
+    //   ② 等 8 秒再跑，给 OneBot 连接留出握手时间
+    //   ③ 失败只写日志，绝不影响启动
+    setTimeout(async () => {
+      try {
+        const { runStartupCatchup } = await import('./startup-catchup.js');
+        const cfgNow = getConfig();
+        const groups = (cfgNow.allow?.groups || []).map((g) => ({ kind: 'group', id: String(g) }));
+        if (!groups.length) return;
+        const r = await runStartupCatchup({
+          onebot,
+          store,
+          targets: groups,
+          config: cfgNow.startupCatchup || {},
+          log
+        });
+        if (r.added === 0) log('[补偿] 启动回看完成：没有遗漏消息');
+      } catch (e) {
+        log('[补偿] 执行失败（不影响运行）：' + String(e?.message ?? e).slice(0, 80));
+      }
+    }, 8000).unref?.();
+
     return port;
   }
 

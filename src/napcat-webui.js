@@ -33,11 +33,22 @@ function napcatDirCandidates(extraDir = '') {
   ].filter(Boolean);
 }
 
-/** 找到 NapCat 目录（含 config/webui.json 的那个）。 */
+/**
+ * 找到 NapCat 目录（含**带 token 的** config/webui.json 的那个）。
+ *
+ * 🔴 2026-10-28 修：不能只判断 webui.json 是否存在。
+ *   SnowLuma 的 config/webui.json 是另一套格式（passwordHash/passwordSalt，
+ *   没有 token 字段）。如果 snowluma 目录排在候选前面，就会被选中，
+ *   导致 NapCat 的配置读不到、账密登录报 available:false。
+ *
+ *   现在的判据：必须能读出非空 token 才算有效。
+ */
 export function findNapcatDir(extraDir = '') {
   for (const d of napcatDirCandidates(extraDir)) {
     try {
-      if (fs.existsSync(path.join(d, 'config', 'webui.json'))) return d;
+      if (!fs.existsSync(path.join(d, 'config', 'webui.json'))) continue;
+      const cfg = readWebuiCfg(d);
+      if (cfg && cfg.token) return d;
     } catch { /* 继续 */ }
   }
   return '';

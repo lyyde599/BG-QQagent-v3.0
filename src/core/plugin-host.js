@@ -659,6 +659,27 @@ export class PluginHost {
       //   · 策略抛错 / 返回非法值 → 自动回退 builtin，**绝不让机器人哑掉**
       //   · dispose 时自动摘除
       context: {
+        /**
+         * 标记某个会话"已被插件放行"（2026-10-28）
+         *
+         * 用途：reply-control 这类闸门插件放行后，要告诉内核
+         *       "这条消息该进模型了"，避免 context-strategy 用另一套
+         *       标准再否一次（两道闸门标准不同 → 第一道白放行）。
+         *
+         * 有效期 60 秒：放行是一次性的，过期自动失效，
+         * 不会让某个会话永久绕过策略。
+         */
+        markArmed(chatKey) {
+          const k = String(chatKey || '');
+          if (!k) return;
+          host.armedChats ||= new Map();
+          host.armedChats.set(k, Date.now());
+          // 顺手清理过期项，避免无限增长
+          const now = Date.now();
+          for (const [key, ts] of host.armedChats) {
+            if (now - ts > 60000) host.armedChats.delete(key);
+          }
+        },
         registerStrategy(fn) {
           if (typeof fn !== 'function') throw new Error('context.registerStrategy 需要函数');
           if (host.contextStrategy) {
@@ -733,7 +754,12 @@ export class PluginHost {
       try {
         const fn = entry.fn;
         const out = await fn(msg, { chain, pluginId: entry.id });
-        if (out && out.handled === true) return { handled: true, by: entry.id, flags };
+        if (out && out.handled === true) {
+          // 排查用：谁拦了消息必须能查到（2026-10-28）
+          // 之前出过"私聊不回复但日志一片空白"，就是没有这行。
+          this.log(`[链] ${entry.id} 拦截了消息（${msg.chatKey}）：${String(msg.text || '').slice(0, 20)}`);
+          return { handled: true, by: entry.id, flags };
+        }
         if (out && Array.isArray(out.flags)) for (const f of out.flags) flags.add(f);
       } catch (error) {
         this.log(`[plugin:${entry.id}] message 钩子出错（已隔离）：${error?.message ?? error}`);

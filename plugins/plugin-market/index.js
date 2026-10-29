@@ -271,7 +271,7 @@ export async function activate(ctx) {
   //   **验证码本身不经过客户端** —— 校验也在中心做（见 verify）。
   const CENTER_URL = () => {
     const c = ctx.config.get() || {};
-    return String(c.authUrl || 'https://auth.597457.xyz/api/auth');
+    return String(c.authUrl || 'https://market.baiguang211.top/api/auth');
   };
 
   // 邮件文案模板（2026-10-25）：按用途区分，别让收件人以为点错了

@@ -93,7 +93,8 @@ export class Orchestrator {
 
   /** 收到新消息（已通过白名单校验并写入 store）。 */
   onIncoming(chatKey) {
-    if (this.paused || this.aborted) return;
+    this.log?.(`[incoming] 收到 ${chatKey}`);
+    if (this.paused || this.aborted) return this.log?.(`[incoming] ${chatKey} 跳过：暂停/中止`);
     // 身份切换口令：在聚批前拦截（切换本身不消耗 LLM，但会主动回一句确认/结果）
     try {
       const intent = this.#detectIdentityIntent(chatKey);
@@ -253,15 +254,96 @@ export class Orchestrator {
   }
 
   /** 防抖聚批：等待 wakeDelayMs，期间每来一条消息重置计时。 */
+  /**
+   * 安排一次唤醒（带防抖 + 最大等待上限）
+   *
+   * 🔴 加了硬上限（2026-10-28）
+   *
+   * 事故：群里聊得密（每秒一条），机器人全程不吭声。
+   * 根因是**防抖死锁**：
+   *   每来一条消息就 clearTimeout 重开 2 秒计时，
+   *   消息间隔 < 2 秒时定时器永远被重置 → wake 永远不触发。
+   *   群里越热闹，机器人越哑。
+   *
+   * 修法：记录「第一次排队的时刻」，超过 maxWaitMs 就强制触发，
+   *      不再重置。防抖仍生效（安静下来会提前触发），但不会无限延后。
+   */
   scheduleWake(chatKey, delay = null) {
+    const cfg = getConfig();
+    const ms = delay ?? Math.max(0, Number(cfg.wakeDelayMs) || 2000);
+    const maxWait = Math.max(ms, Number(cfg.wakeMaxWaitMs) || 8000);
+
+    this.wakeFirstAt ||= new Map();
+    if (!this.wakeFirstAt.has(chatKey)) this.wakeFirstAt.set(chatKey, Date.now());
+    const waited = Date.now() - this.wakeFirstAt.get(chatKey);
+
+    // 已经等够上限 → 不再重排，立刻触发
+    if (waited >= maxWait) {
+      if (this.pendingWake.has(chatKey)) clearTimeout(this.wakeTimers.get(chatKey));
+      this.pendingWake.delete(chatKey);
+      this.wakeFirstAt.delete(chatKey);
+      this.log?.(`[wake] ${chatKey} 已等 ${Math.round(waited / 1000)}s 达上限，强制触发`);
+      this.wake(chatKey).catch((error) => console.error(`[orchestrator] wake ${chatKey} 出错:`, error));
+      return;
+    }
+
     if (this.pendingWake.has(chatKey)) clearTimeout(this.wakeTimers.get(chatKey));
     this.pendingWake.add(chatKey);
-    const ms = delay ?? Math.max(0, Number(getConfig().wakeDelayMs) || 2000);
+
+    // 剩余可等时间不能超过上限
+    const remain = maxWait - waited;
+    const timeout = Math.min(ms, Math.max(200, remain));
+
     const timer = setTimeout(() => {
       this.pendingWake.delete(chatKey);
+      this.wakeFirstAt.delete(chatKey);
       this.wake(chatKey).catch((error) => console.error(`[orchestrator] wake ${chatKey} 出错:`, error));
-    }, ms);
+    }, timeout);
     this.wakeTimers.set(chatKey, timer);
+  }
+
+  /**
+   * 抢救：私聊里已经生成好、但还没发出去的文字（2026-10-28）
+   *
+   * 为什么要有它 —— 彻底排查时发现，"想好了没发"有多条路径：
+   *   ① 正常结束但 status=noreply
+   *   ② 收尾阶段抛错 → catch 里 finish('error')
+   *   ③ 用户点暂停 → aborted 分支 return
+   * 三处原本各写一遍抢救逻辑，改一处漏两处。
+   * 现在统一到这里，所有退出路径都调同一个方法。
+   *
+   * @param {object} session
+   * @param {string} chatKey
+   * @param {string} tag 日志前缀，便于区分是哪条路径触发的
+   * @returns {Promise<boolean>} 是否真的发出去了
+   */
+  async rescueUnsent(session, chatKey, tag = '抢救') {
+    try {
+      if (!String(chatKey || '').startsWith('private:')) return false;
+      if ((session?.sent || []).length > 0) return false;
+
+      // 从本轮消息里倒着找最后一条有文字的 assistant 内容
+      const spoken = [...(session?.messages || [])]
+        .reverse()
+        .map((m) => String(m?.content || '').trim())
+        .find((c) => c && c.length >= 2 && c.length <= 1500 && !/^[\[（(]/.test(c));
+      if (!spoken) {
+        this.log?.(`[${tag}] 私聊无内容可发`);
+        return false;
+      }
+
+      const r = await this.sender?.sendTextBatch?.(chatKey, spoken, {});
+      if (r?.sent?.length) {
+        session.sent.push(...r.sent.map((x) => ({ type: 'text', text: x.text })));
+        this.log?.(`[${tag}] 已代发：${spoken.slice(0, 40)}`);
+        return true;
+      }
+      this.log?.(`[${tag}] 发送未成功`);
+      return false;
+    } catch (e) {
+      this.log?.(`[${tag}] 失败：${String(e?.message ?? e).slice(0, 60)}`);
+      return false;
+    }
   }
 
   /** 手动触发一次处理（UI 按钮）。 */
@@ -274,15 +356,17 @@ export class Orchestrator {
   // ── 核心循环 ───────────────────────────────────────────────────────────
 
   async wake(chatKey, { proactive = false, taskContext = null, pushTask = null } = {}) {
-    if (this.aborted) return;
-    if (this.paused && !proactive) return;
+    // 诊断日志（2026-10-28）：wake 有无被调用、被哪个条件挡回
+    const dbg = (why) => this.log?.(`[wake] ${chatKey} ${why}`);
+    if (this.aborted) return dbg('跳过：已中止');
+    if (this.paused && !proactive) return dbg('跳过：已暂停');
     // 身份模式：物理键（消息来源）→ 有效键（含身份后缀），实现历史/记忆按身份隔离
     const physKey = String(chatKey);
     const runKey = resolveChatKey(physKey);
-    if (this.runningChats.has(runKey)) return;
+    if (this.runningChats.has(runKey)) return dbg(`跳过：${runKey} 正在运行`);
 
     // 模型未设置：不产生报错会话，消息保留为未读；设置模型后（下一条消息或手动唤醒）自动补处理
-    if (!String(getConfig().api.model || '').trim()) return;
+    if (!String(getConfig().api.model || '').trim()) return dbg('跳过：没配模型');
 
     // 预算保险丝：今日成本达到上限 → 自动暂停，不再发起任何 LLM 调用
     if (this.overBudget()) {
@@ -352,12 +436,45 @@ export class Orchestrator {
       // 主动机会：不打扰、无触发批，只带状态
       this.store.drainUnread(physKey);
     }
+    if (!proactive0) {
+      this.log?.(`[wake] ${chatKey} 未读 ${this.store.unreadCount(physKey)} 条，触发批 ${triggerEntries.length} 条，背景 ${bgOnlyEntries.length} 条`);
+    }
     if (!proactive0 && triggerEntries.length === 0) {
-      // 策略把全部未读都判成背景 —— 不入库空跑，但仍要保证它们进了过去状态
-      if (bgOnlyEntries.length > 0) {
-        this.log?.(`[context] ${chatKey} ${bgOnlyEntries.length} 条未读被策略归为背景，本次不唤醒`);
+      // 🔴 私聊不能因为"没有 @/引用"就不唤醒（2026-10-28 修）
+      //
+      // 事故：私聊连发「我是谁」全部石沉大海。
+      // 根因：context-strategy 的 mention-only 模式在私聊里找不到 @/引用，
+      //      把所有消息判成背景 → trigger 为空 → 这里直接 return。
+      //
+      // 私聊是一对一说话，不存在"插不插话"，策略给出空触发时应当兜底唤醒。
+      // 🔴 reply-control 已经放行过的，策略不该再挡一次（2026-10-28 修）
+      //
+      // 事故：群里回复永远不发生，但 reply-control 明明"放行"了 N 次。
+      // 根因是**两道闸门标准不同**：
+      //   第一道 reply-control：按条数配额放行 → 消息进来了
+      //   第二道 context-strategy：按 @/引用 判定 → 全判成背景 → 内核 return
+      // 结果第一道白放行，第二道把门关上。
+      //
+      // 闸门只能有一道。reply-control 放行即意味着"这道消息该进模型"，
+      // 策略层不该用另一套标准再否一次。
+      // 查插件是否放行过（markArmed 标记，60 秒有效）
+      let armedByPlugin = false;
+      try {
+        const ts = this.pluginHost?.armedChats?.get(String(chatKey));
+        armedByPlugin = !!ts && Date.now() - ts < 60000;
+      } catch { /* ignore */ }
+      const isPrivate = String(chatKey || '').startsWith('private:');
+      if (isPrivate || armedByPlugin) {
+        this.log?.(`[context] ${chatKey} ${armedByPlugin ? "已由插件放行" : "私聊"}，按全触发处理`);
+        triggerEntries = bgOnlyEntries.length ? bgOnlyEntries : this.store.recent(physKey, { limit: 10 }).filter((m) => !m.self);
+        bgOnlyEntries = [];
+      } else {
+        // 策略把全部未读都判成背景 —— 不入库空跑，但仍要保证它们进了过去状态
+        if (bgOnlyEntries.length > 0) {
+          this.log?.(`[context] ${chatKey} ${bgOnlyEntries.length} 条未读被策略归为背景，本次不唤醒`);
+        }
+        return;
       }
-      return;
     }
 
     this.runningChats.add(runKey);
@@ -380,9 +497,13 @@ export class Orchestrator {
       await this.#runAgent(session, { kind, chatId, chatKey: runKey, triggerEntries, proactive, seq, taskContext, pushTask });
     } catch (error) {
       session.error = String(error?.message ?? error);
+      console.error(`[orchestrator] 运行 ${session.id} 出错:`, error);
+
+      // 🔴 出错也要抢救已经生成的内容
+      await this.rescueUnsent(session, runKey, '出错抢救');
+
       this.sessions.finish(session.id, 'error');
       this.emit('session-end', { sessionId: session.id, chatKey: runKey, status: 'error', error: session.error });
-      console.error(`[orchestrator] 运行 ${session.id} 出错:`, error);
     } finally {
       this.activeRuns.delete(runKey);
       this.runningChats.delete(runKey);
@@ -535,6 +656,10 @@ export class Orchestrator {
     const searchEnabled = cfg.webSearch?.enabled !== false;
     // 插件工具现取（面板装卸后即时生效，无需重启）。宿主为空则等同旧行为。
     const pluginTools = this.pluginHost ? this.pluginHost.allToolDefs() : [];
+    // 诊断：本轮实际挂载了哪些工具（2026-10-29）
+    const __all = [...this.toolDefs, ...pluginTools];
+    this.log?.(`[工具] 候选 ${__all.length} 个（内核 ${this.toolDefs.length} + 插件 ${pluginTools.length}），heybox 有 ${__all.filter((d) => String(d.name || '').includes('heybox')).length} 个`);
+
     const toolDefs = [...this.toolDefs, ...pluginTools].filter((d) => {
       if (!gatedVision && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
@@ -568,7 +693,10 @@ export class Orchestrator {
       // selfCard 很关键：机器人群名片常与人设名不同（如「鲸界魔王-白光-小鱼」vs「小鲸鱼」），
       // 不给的话模型会因"名字不像我"把 @ 自己的消息当成别人。
       selfId: this.onebot.selfId,
-      selfCard: selfNickname
+      selfCard: selfNickname,
+      // 主人关系注入（2026-10-28）：只有 masterQQ 触发时才带
+      isMaster,
+      masterQQ: MASTER_QQ
     });
     session.systemPrompt = systemPrompt;
     session.userPrompt = userPrompt;
@@ -601,6 +729,15 @@ export class Orchestrator {
       pushTask,
       onebot: this.onebot,
       store: this.store,
+      // 🔴 必须带上插件宿主（2026-10-28 修）
+      //
+      // 事故：主人问"你有什么能力"，master_list_capabilities 回报
+      //      「错误：插件宿主未就绪」—— 因为它读 ctx.pluginHost，
+      //      而这个 ctx 里从来没放过这个字段。
+      //
+      // 同类受影响的主工具还有 master_get_config / master_set_config
+      // （它们也要遍历插件配置），等于主人专属的三个工具全废。
+      pluginHost: this.pluginHost,
       memory: this.memory,
       stickers: this.stickers,
       sender: this.sender,
@@ -611,8 +748,25 @@ export class Orchestrator {
 
     const maxRounds = Math.max(1, Number(cfg.api.maxRounds) || 12);
     let finish = false;
+    // 本次会话是否「有人在找我」（私聊 或 触发批里含 @/引用我）
+    const isAddressedSession = (() => {
+      try {
+        if (String(ctx?.chatKey || '').startsWith('private:')) return true;
+        const self = String(this.onebot?.selfId || '');
+        if (!self) return false;
+        return (triggerEntries || []).some((m) => {
+          const t = String(m?.text || '');
+          return t.includes('#' + self) || t.includes('@' + self);
+        });
+      } catch { return false; }
+    })();
+
     for (let round = 0; round < maxRounds && !finish; round++) {
-      if (this.aborted) { this.sessions.finish(session.id, 'aborted'); return; }
+      if (this.aborted) {
+        // 中止前也抢救（用户点暂停，但想好的答案不该丢）
+        await this.rescueUnsent(session, ctx.chatKey, '中止抢救');
+        return;
+      }
       const response = await chatCompletion({ messages, tools: openAiTools });
       session.model = response.model || session.model;
       addUsage(session.usage, response.usage);
@@ -726,6 +880,20 @@ export class Orchestrator {
         // （原「工具前 content 兜底」已移除：私聊改为与群聊一致的"不兜底"策略）
       }
 
+      // ── 回执已移除（2026-10-28）──
+      //
+      // 原来这里硬编码代发一句「收到，我这就去弄」，本意是"接活先应一声"。
+      // 但它有三个根本问题：
+      //   ① **判据错**：TASK_TOOLS 正则含 `send`，而每次回复都要调 send_message
+      //      → 永远命中 → 每句回复前面都自动加一句
+      //   ② **代它说话**：这句不是模型生成的，是代码硬塞的。
+      //      模型自己想说的和用户看到的不是一回事。
+      //   ③ **固定措辞**：反复出现必然变成口头禅。
+      //
+      // 正确做法是让它自己判断什么时候该告知 —— 已写进提示词 5.4：
+      // 只有把活派给 dshc 那种"会有几分钟说不出话"的场景才需要先说一声。
+      // 代码不该替它说话。
+
       const toolResults = [];
       const imageUserMessages = [];
       for (const call of toolCalls) {
@@ -798,6 +966,10 @@ export class Orchestrator {
     // ── 私聊必回铁律（兜底重试）────────────────────────────
     // 私聊且模型本轮思考了却什么都没发（没调 send_message、content 也空）：
     // 再给一次机会强制让它回复，避免"私聊了却不回复"。最多重试 2 次。
+    // 诊断：私聊兜底是否被判定（2026-10-28）
+    if (String(ctx.chatKey || '').startsWith('private:')) {
+      this.log?.(`[私聊兜底] chatKey=${ctx.chatKey} status=${status} sent=${session.sent.length} error=${session.error ? 'yes' : 'no'}`);
+    }
     if (!session.error && status === 'noreply' && String(ctx.chatKey || '').startsWith('private:')) {
       // 私聊必回：不限 masterQQ —— 任何人私聊都该有回复
       {
@@ -811,7 +983,10 @@ export class Orchestrator {
                 extraSections: this.pluginHost ? this.pluginHost.buildPromptBlocks({ chatKey: ctx.chatKey, kind: ctx.kind, chatId: ctx.chatId }) : [],
                 availableTools: new Set(toolDefs.map((d) => d.name)),
                 selfId: this.onebot.selfId,
-                selfCard: this.onebot.selfNickname || ''
+                selfCard: this.onebot.selfNickname || '',
+                // 这里必然是主人私聊的补发场景，直接带关系段
+                isMaster: true,
+                masterQQ: String(getConfig().persona?.masterQQ || '')
               }) },
               { role: 'user', content: '【系统提醒】你刚才收到主人的私聊消息，但没有给出任何回复就结束了。私聊规则：主人私聊你时必须回复，不能不吭声。请立即补上回复：如果刚才在查资料/思考，现在把结论发给主人（用 send_message）；如果没什么可说的，也至少要回一句简短的回应（比如"收到~刚在查，马上给你说"）。' }
             ];
@@ -819,11 +994,21 @@ export class Orchestrator {
             // 🔴 重试必须**带工具**，并要求模型调 send_message（2026-10-21）
             //    旧实现直接发 resp.content —— 那和"从 content 兜底"是同一类错误，
             //    思维链照样会漏。现在只接受工具调用产生的发送。
+            //
+            // 🔴 2026-10-29 加固：tool_choice 从 'auto' 改成**强制**。
+            //
+            //    实测事故：用户在私聊问「你能看小黑盒吗」，模型第一轮把回答
+            //    写在 content 里（"小黑盒？能，我这边有接口…"）、没调 send_message，
+            //    状态变 noreply。重试用 auto 再问一次，模型仍然只输出 content
+            //    不调工具 → 补发失败 → 用户永远收不到回复。
+            //
+            //    强制模式让模型必须调用工具，配合下面的兜底（若它还不调，
+            //    就把 content 直接发出去），保证私聊一定有回音。
             const resp = await chatCompletion({
               messages: retryMsg,
               temperature: 0.6,
               tools: openAiTools,
-              tool_choice: 'auto'
+              tool_choice: { type: 'function', function: { name: 'send_message' } }
             });
             const retryToolCalls = resp?.message?.tool_calls || [];
             const sendCall = retryToolCalls.find((c) => (c?.function?.name || '') === 'send_message');
@@ -834,7 +1019,25 @@ export class Orchestrator {
                 this.emit('log', { text: '[必回重试] 模型已通过 send_message 补发' });
               }
             } else {
-              this.emit('log', { text: '[必回重试] 模型仍未调 send_message，放弃补发' });
+              // 最后一道网：强制了还只给 content —— 直接把 content 发出去。
+              //
+              // 这里和"从 content 兜底"的区别：那条路径适用于**所有轮次**，
+              // 会把内心独白也漏出去；而这里只在「私聊 + 整轮一条没发 +
+              // 已经强制要求过回复」的最后关头才用，风险面小得多。
+              const finalText = String(resp?.message?.content || '').trim();
+              if (finalText && finalText.length >= 1 && finalText.length <= 2000
+                  && !looksLikeMonologue(finalText, { hasSendMessage: false }).think) {
+                try {
+                  const rFinal = await ctx.sender.sendTextBatch(ctx.chatKey, finalText, {});
+                  ctx.session.sent.push(...rFinal.sent.map((x) => ({ type: 'text', text: x.text })));
+                  status = 'done';
+                  this.emit('log', { text: '[必回重试] 强制未生效，已直接发出 content: ' + finalText.slice(0, 40) });
+                } catch (e) {
+                  this.emit('log', { text: '[必回重试] 直接发送失败: ' + (e?.message || e) });
+                }
+              } else {
+                this.emit('log', { text: '[必回重试] 模型仍未给出可用回复，放弃补发' });
+              }
             }
           } catch (e) {
             console.error('[必回重试] 出错:', e?.message || e);
@@ -844,6 +1047,22 @@ export class Orchestrator {
       }
     }
 
+
+    // 🔴 最后一道闸：私聊有思考却一条没发 → 至少把思考的结论发出去
+    //    （2026-10-28 补）
+    //
+    // 事故：主人私聊问"内核版本查到了吗"，她 round 2 已经写好了完整回答，
+    // 但一直没调 send_message，status=noreply，用户什么都没收到。
+    //
+    // 上面的"必回重试"是调模型再要一次回复 —— 但它有条件（不暂停/不中止/重试次数），
+    // 一旦哪条不满足就整段跳过，而且**跳过时不留痕迹**。
+    //
+    // 这一道不调模型、不依赖任何状态：直接把已经生成好的文字发出去。
+    // 宁可多发一句她想说的话，也不能让她想好了却一声不吭。
+    if (status === 'noreply') {
+      const saved = await this.rescueUnsent(session, ctx.chatKey, '最后兜底');
+      if (saved) status = 'done';
+    }
 
     this.sessions.finish(session.id, status);
     this.emit('session-end', {

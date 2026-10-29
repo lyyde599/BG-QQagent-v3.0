@@ -22,6 +22,59 @@ import { ROOT } from './config.js';
 
 const USER_SKILL_DIR = path.join(ROOT, 'skills');
 
+// ── 已删除的内置 skill 清单（2026-10-29）──────────────────────────────
+//
+// 解决什么：BUILTIN_SKILLS 是写死在代码里的常量，用户删不掉；
+//   今天把 aliyun-deploy 从界面删了，内核一更新又原样回来 —— 因为
+//   "删掉"只对 skills/ 目录里的用户文件有效，代码里那份压根没动过。
+//
+// 现在多一个黑名单：用户在界面上删内置 skill 时，把 id 记到
+//   data/deleted-skills.json（与 allow/deny 同级，内核更新不覆盖），
+//   之后 listSkills / getSkillBody 都跳过这些 id。
+//
+// 为什么不用"物理删文件"：内置 skill 指向仓库里的 .md，
+//   删文件既影响仓库完整性，下次 git pull 又回来，治标不治本。
+const DELETED_SKILLS_FILE = path.join(ROOT, 'data', 'deleted-skills.json');
+
+function loadDeletedSkills() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(DELETED_SKILLS_FILE, 'utf8'));
+    return new Set(Array.isArray(raw) ? raw.map(String) : []);
+  } catch { return new Set(); }   // 文件不存在 / 坏了都当空清单
+}
+
+let deletedSkills = loadDeletedSkills();
+
+function saveDeletedSkills() {
+  try {
+    fs.mkdirSync(path.dirname(DELETED_SKILLS_FILE), { recursive: true });
+    fs.writeFileSync(DELETED_SKILLS_FILE, JSON.stringify([...deletedSkills].sort(), null, 1));
+  } catch { /* 落盘失败不致命，下次启动会退回旧清单 */ }
+}
+
+/** 隐藏一个内置 skill（用户点了删除） */
+export function hideSkill(id) {
+  const key = String(id || '').trim();
+  if (!key) return false;
+  deletedSkills.add(key);
+  saveDeletedSkills();
+  return true;
+}
+
+/** 取消隐藏（用户想恢复） */
+export function unhideSkill(id) {
+  const key = String(id || '').trim();
+  if (!deletedSkills.has(key)) return false;
+  deletedSkills.delete(key);
+  saveDeletedSkills();
+  return true;
+}
+
+/** 当前被隐藏的 id 列表（给界面用） */
+export function listHiddenSkills() {
+  return [...deletedSkills].sort();
+}
+
 /**
  * 内核内置 skill。
  *
@@ -187,6 +240,8 @@ export function listSkills() {
   for (const s of BUILTIN_SKILLS) merged.set(s.id, s);
   for (const s of scanUserSkills()) merged.set(s.id, s);
   for (const [id, s] of pluginSkills) merged.set(id, s);
+  // 用户删过的内置 skill 一律不再出现（否则内核更新又"复活"）
+  for (const id of deletedSkills) merged.delete(id);
   return [...merged.values()].map((s) => ({
     id: s.id,
     name: s.name,
@@ -207,6 +262,7 @@ export function getSkillBody(id) {
   for (const s of scanUserSkills()) all.set(s.id, s);
   for (const [k, s] of pluginSkills) all.set(k, s);
 
+  if (deletedSkills.has(String(id || '').trim())) return null;  // 已隐藏
   const s = all.get(id);
   if (!s) return null;
 

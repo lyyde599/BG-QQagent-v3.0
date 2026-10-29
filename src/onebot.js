@@ -253,6 +253,26 @@ export class OneBotClient {
   async getGroupMemberInfo(groupId, userId) {
     return this.call('get_group_member_info', { group_id: Number(groupId), user_id: Number(userId) });
   }
+
+  /**
+   * 拉群历史消息（2026-10-28）
+   *
+   * 用途：启动补偿 —— 服务重启那几十秒里的消息本来永久丢失，
+   * 起来后回看一段，把错过的补进库，至少语境不断。
+   *
+   * @returns {Promise<Array>} 原始消息数组（最新的在后）
+   */
+  async getGroupMsgHistory(groupId, count = 20) {
+    try {
+      const r = await this.call('get_group_msg_history', {
+        group_id: Number(groupId),
+        count: Math.max(1, Math.min(100, Number(count) || 20))
+      });
+      // call() 已经返回 body.data，不要再取一层 .data
+      const list = r?.messages || [];
+      return Array.isArray(list) ? list : [];
+    } catch { return []; }
+  }
 }
 
 // ── 入站事件 → 文本（移植自原版 segmentsToText） ─────────────────────────

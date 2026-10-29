@@ -1,6 +1,6 @@
 {
-  "name": "bg-qqagent-linux",
-  "version": "3.0.7",
+  "name": "jingjie-bridge",
+  "version": "3.2.10",
   "private": true,
   "description": "Standalone QQ agent desktop app: event-driven stateless agent runs over an OpenAI-compatible API, with a session-style UI. Decoupled from DeepSeek Harness.",
   "type": "module",

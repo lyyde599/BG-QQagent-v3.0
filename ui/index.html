@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>QQ Agent</title>
+  <title>鲸界Bridge</title>
   <!-- ① 规范令牌（纸墨灰·浅色，唯一颜色源；本文件不含任何硬编码色） -->
   <link rel="stylesheet" href="/paper-ink-light.css" />
   <!-- 皮肤（2026-10-21）：5 套配色，靠 :root[data-skin] 覆盖令牌。
@@ -18,7 +18,7 @@
 </head>
 <body>
   <header id="topbar">
-    <div class="brand">QQ Agent <span class="brand-sub">无状态会话 · 按次计费</span></div>
+    <div class="brand">鲸界Bridge <span class="brand-sub">无状态会话 · 按次计费</span></div>
     <div class="top-status">
       <span id="onebot-dot" class="dot dot-off" title="OneBot 连接状态"></span>
       <span id="onebot-label" class="muted">OneBot 未连接</span>
@@ -36,7 +36,7 @@
 
   <div id="loading-overlay" class="loading-overlay">
     <div class="loading-card">
-      <div class="loading-title">QQ Agent 正在启动</div>
+      <div class="loading-title">鲸界Bridge 正在启动</div>
       <div class="loading-sub" id="loading-status">正在连接 OneBot 网关，请稍候…</div>
       <div class="loading-spinner"></div>
       <pre class="loading-logs" id="loading-logs"></pre>
@@ -50,7 +50,7 @@
     <!-- 插件自带的 tab 由 JS 按 manifest.uiTab 动态插入（插件卸载后自动消失）
          —— 原来写死在这里，导致"插件已卸载但页签还在，点进去报错" -->
     <span id="plugin-tabs"></span>
-    <button class="tab" data-tab="market">BG创造营</button>
+    <button class="tab" data-tab="market">创造营</button>
     <button class="tab" id="tab-plugins" data-tab="plugins">插件</button>
     <button class="tab" data-tab="skills">技能</button>
     <button class="tab" data-tab="settings">设置</button>

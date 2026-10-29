@@ -523,6 +523,52 @@ function syntaxCheck(dir) {
   LOG(`③ 语法自检通过（${files.length} 个文件）`);
 }
 
+/**
+ * 读用户在界面上删过的 skill id 清单
+ *
+ * 与 src/skill.js 共用 data/deleted-skills.json —— 那边负责界面隐藏，
+ * 这边负责"更新时别写回来"。少了任何一半，用户都会看到"删了又回来"。
+ */
+function deletedSkillIds() {
+  try {
+    const f = path.join(ROOT, 'data', 'deleted-skills.json');
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
+    return new Set(Array.isArray(raw) ? raw.map(String) : []);
+  } catch { return new Set(); }
+}
+
+/**
+ * 合并 skills/：只补缺失的文件，不动已有的
+ *
+ * @returns {number} 实际补进来的文件数
+ */
+function mergeSkills(srcDir, dstDir, skipIds = new Set()) {
+  let added = 0;
+  let skipped = 0;
+  const walk = (rel) => {
+    const src = path.join(srcDir, rel);
+    const dst = path.join(dstDir, rel);
+    let entries;
+    try { entries = fs.readdirSync(src, { withFileTypes: true }); } catch { return; }
+    fs.mkdirSync(dst, { recursive: true });
+    for (const ent of entries) {
+      const r = path.join(rel, ent.name);
+      if (ent.isDirectory()) { walk(r); continue; }
+      const base = path.basename(ent.name, '.md');
+      if (skipIds.has(base)) { skipped++; continue; }   // 用户删过 → 别再写回来
+      const target = path.join(dstDir, r);
+      if (fs.existsSync(target)) continue;   // 已有 → 绝不覆盖（可能是用户改过/故意留着）
+      try {
+        fs.copyFileSync(path.join(srcDir, r), target);
+        added++;
+      } catch (e) { LOG(`  ⚠️ 补入 skill ${r} 失败：${e?.message ?? e}`); }
+    }
+  };
+  walk('');
+  LOG(`   skills/ 合并：新增 ${added} 个，沿用 ${skipped} 个已删除，其余保持不变`);
+  return added;
+}
+
 /** 用新文件覆盖旧文件（保留 data/ plugins/ 等运行时目录） */
 function replace(newDir) {
   const items = ['src', 'ui', 'skills', 'scripts', 'test', 'electron', 'docs',
@@ -537,6 +583,21 @@ function replace(newDir) {
     if (!fs.existsSync(src)) continue;
     const dst = path.join(ROOT, it);
     try {
+      // 🔴 skills/ 走「合并拷贝」，其余走「先删再拷」（2026-10-29 修）
+      //
+      // 用户反馈：把用不上的内置技能（阿里云部署教程）删了，
+      // 一更新内核它又回来了 —— 因为这里对 skills/ 也是先 rm 再 cp，
+      // 用户删掉的文件被新包里的同名文件原样恢复。
+      //
+      // 现在对 skills/ 改成只补**缺失**文件：
+      //   用户删掉的不会被写回来，已有文件也不覆盖（用户可能改过）。
+      // 代价是新版本内置技能有更新时不会自动同步 —— 但内置技能本来就很少改，
+      // 且"用户能删掉自己不想要的东西"比"自动拿到新技能"更重要。
+      // 需要同步时可手动删掉旧文件，下次更新就会补回来。
+      if (it === 'skills') {
+        n += mergeSkills(src, dst, deletedSkillIds());
+        continue;
+      }
       // 先删再拷，避免旧文件残留（比如已删除的模块）
       fs.rmSync(dst, { recursive: true, force: true });
       fs.cpSync(src, dst, { recursive: true });

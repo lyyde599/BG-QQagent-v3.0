@@ -15,6 +15,8 @@ import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
 const WORKSPACE_DIR = path.join(ROOT, 'workspace');
 const DSH_WORK_DIR = path.join(ROOT, 'dsh-work');
 const TEMP_DIRS = ['/tmp', ...(process.env.TMPDIR ? [process.env.TMPDIR] : [])];
+// 工作目录（2026-10-28）：DSH 产物现在落这里，send_file 必须认
+const YUYU_DIR = process.env.QQ_AGENT_YUYU_DIR || '/home/lyy/鱼鱼的工作目录';
 const LOCAL_PATH_PREFIXES = [WORKSPACE_DIR, DSH_WORK_DIR, ...TEMP_DIRS];
 
 // 下载图片并转成 dataURL（供视觉模型读图）。
@@ -289,11 +291,11 @@ export function buildToolDefs() {
     {
       name: 'send_file',
       masterOnly: true,
-      description: '【主人专属】把本地文件（DSH 任务产物，位于本项目 dsh-work/ 下）作为文件消息发送到当前聊天。主人任务完成后要文件时用。',
+      description: '【主人专属】把本地文件作为文件消息发送到当前聊天。允许项目内产物、工作目录（鱼鱼的工作目录）、workspace、/tmp。主人任务完成后要文件时用。',
       parameters: {
         type: 'object',
         properties: {
-          filePath: { type: 'string', description: '本地文件绝对路径（限 dsh-work/ 或 workspace/ 或 /tmp）' },
+          filePath: { type: 'string', description: '本地文件绝对路径（限项目目录 / 鱼鱼的工作目录 / workspace / /tmp）' },
           fileName: { type: 'string', description: '可选：发送时显示的文件名' }
         },
         required: ['filePath']
@@ -302,9 +304,12 @@ export function buildToolDefs() {
         try {
           const raw = String(args.filePath ?? '').trim();
           if (!raw) return err('filePath 不能为空');
-          const allowedPrefixes = [DSH_WORK_DIR, WORKSPACE_DIR, ...TEMP_DIRS];
+          // 🔴 工作目录也要认（2026-10-28）
+          // 事故：DSH 产出的报告落在《鱼鱼的工作目录》，send_file 报"不在允许范围"，
+          // 她只好改用 send_local_file。两个工具的范围应当一致。
+          const allowedPrefixes = [DSH_WORK_DIR, WORKSPACE_DIR, YUYU_DIR, ROOT, ...TEMP_DIRS];
           const okPath = allowedPrefixes.some((p) => raw.startsWith(p)) && !raw.includes('..');
-          if (!okPath) return err('文件路径不在允许范围（仅 dsh-work/workspace/tmp）');
+          if (!okPath) return err(`文件路径不在允许范围（仅 ${[DSH_WORK_DIR, WORKSPACE_DIR, YUYU_DIR].join(' / ')} / tmp）`);
           const fs2 = await import('node:fs');
           if (!fs2.existsSync(raw)) return err(`文件不存在: ${raw}`);
           const stat = fs2.statSync(raw);
@@ -352,6 +357,25 @@ export function buildToolDefs() {
       }
     },
     
+    {
+      name: 'get_current_time',
+      masterOnly: false,
+      description: '查现在几点。有人问"现在几点/几号/今天星期几"时直接调它，**不要外派给 dshc**（那是几秒能答的事，派出去反而慢）。',
+      parameters: { type: 'object', properties: {}, required: [] },
+      async execute() {
+        const now = new Date();
+        // 统一北京时间（铁律 0.5）
+        const fmt = (opt) => now.toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai', ...opt });
+        return ok({
+          time: fmt({ hour: '2-digit', minute: '2-digit' }),
+          date: fmt({ year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\//g, '-'),
+          weekday: new Intl.DateTimeFormat('zh-CN', { weekday: 'short', timeZone: 'Asia/Shanghai' }).format(now),
+          full: fmt({ year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', weekday: 'long' }),
+          timezone: 'Asia/Shanghai (UTC+8)',
+          note: '这是北京时间。直接把这个时间告诉对方即可，不需要再做任何查询，也不要外派。'
+        });
+      }
+    },
     {
       name: 'get_recent_messages',
       description: '往前翻当前会话的更多历史消息（提示词里只带了最近一段；需要更早的上下文时用）。返回带 messageId（就是聊天记录里的 #数字），可用于引用或看图。',
@@ -542,7 +566,26 @@ export function buildToolDefs() {
             return ok({ config: redactSecrets(cfg), note: '密钥已脱敏，只显示长度。' });
           }
           const v = pick(cfg, pathStr);
-          if (v === undefined) return err(`配置里没有这一项：${pathStr}`);
+          if (v === undefined) {
+            // 🔴 报错要可操作（2026-10-28）
+            //
+            // 事故：她想读 dsh 的配置，猜了个 `plugins.dsh` → 报"没有这一项"，
+            // 她只好放弃。真相是那个插件的 id 叫 self-capability，
+            // 配置在 plugins['self-capability'] 下。
+            //
+            // 报错时把**同级可用的键**列出来，她就能自己找对。
+            const segs = String(pathStr).split('.');
+            const parentPath = segs.slice(0, -1).join('.');
+            const parent = parentPath ? pick(cfg, parentPath) : cfg;
+            let hint = '';
+            if (parent && typeof parent === 'object') {
+              const keys = Object.keys(parent).slice(0, 40);
+              if (keys.length) {
+                hint = `。${parentPath || '顶层'} 下可用的键：${keys.join(', ')}`;
+              }
+            }
+            return err(`配置里没有这一项：${pathStr}${hint}`);
+          }
           return ok({ path: pathStr, value: redactSecrets(v) });
         } catch (error) {
           return err(error?.message ?? error);
@@ -653,7 +696,47 @@ export async function executeTool(defs, ctx, name, argsJson) {
     return { content: `错误：工具 ${name} 的参数不是合法 JSON：${String(raw).slice(0, 200)}`, isError: true };
   }
   try {
-    return await def.execute(ctx, args ?? {});
+    const raw = await def.execute(ctx, args ?? {});
+
+    // 🔴 统一兜底：插件直接 return 普通对象时补成 { content }
+    //    （2026-10-28 修）
+    //
+    // 事故：heybox_ops_status / heybox_feed / heybox_ops_draft 全部返回 undefined，
+    // 模型据此断言"这些工具都用不了"，转而抓网页、编解释。
+    //
+    // 根因：工具契约要求返回 `{ content, isError? }`，
+    //      但内核的 ok() 包装不是强制的 —— 插件写 `return { ok:true, ... }`
+    //      也完全不报错。执行器读 `result.content` 得到 undefined，
+    //      String(undefined) 就是字面量 "undefined"，模型看到的就是它。
+    //
+    //      受影响的插件：heybox-ops / auto-review / errata / rl-growth
+    //      （都是直接 return 对象，没有走 ok()）。
+    //
+    // 与其逐个改插件，不如在这里统一兜住 —— 插件怎么写都不会丢结果。
+    if (raw == null) {
+      return { content: '', isError: false };
+    }
+    if (typeof raw === 'string') {
+      return { content: raw, isError: false };
+    }
+    if (typeof raw === 'object' && raw.content !== undefined) {
+      return raw;                       // 已经合规
+    }
+    if (Array.isArray(raw)) {
+      return { content: raw, isError: false };
+    }
+    if (typeof raw === 'object') {
+      // 普通对象 → 序列化成 JSON 文本（模型能读）
+      let text;
+      try {
+        text = JSON.stringify(raw, null, 1);
+      } catch {
+        text = String(raw);
+      }
+      return { content: text, isError: raw.ok === false || raw.isError === true };
+    }
+    // 数字/布尔等
+    return { content: String(raw), isError: false };
   } catch (error) {
     return { content: `错误：${error?.message ?? error}`, isError: true };
   }

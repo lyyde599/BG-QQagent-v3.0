@@ -97,6 +97,42 @@ export class SessionRegistry {
     return s ?? null;
   }
 
+  /**
+   * 启动清理：把上次进程里残留的 running 会话标成中断（2026-10-28）
+   *
+   * 事故：服务重启会把正在运行的会话打断，但会话文件里 status 永远是
+   *      'running' —— 因为 finish() 还没来得及调用进程就没了。
+   *
+   * 结果：控制台里一堆"正在运行"的僵尸会话，看着像机器人卡住了，
+   *      而且它们占了 current 之外的索引位置，统计也失真。
+   *
+   * 进程启动时跑一次，把不是本进程产生的 running 一律收敛成 interrupted。
+   */
+  reapStaleRunning() {
+    let n = 0;
+    try {
+      const files = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'));
+      for (const f of files) {
+        const full = path.join(SESSIONS_DIR, f);
+        try {
+          const s = JSON.parse(fs.readFileSync(full, 'utf8'));
+          if (s?.status !== 'running') continue;
+          if (this.current.has(s.id)) continue;     // 本进程正在跑的不动
+          s.status = 'interrupted';
+          s.endedAt = s.endedAt || Date.now();
+          s.interrupted = true;
+          fs.writeFileSync(full, JSON.stringify(s, null, 1), 'utf8');
+          n += 1;
+        } catch { /* 单个文件坏了不影响其它 */ }
+      }
+      // 索引里的同步收敛
+      for (const e of this.index) {
+        if (e.status === 'running' && !this.current.has(e.id)) e.status = 'interrupted';
+      }
+    } catch { /* 目录读不到就算了 */ }
+    return n;
+  }
+
   finish(id, status) {
     const s = this.current.get(id);
     if (!s) return null;

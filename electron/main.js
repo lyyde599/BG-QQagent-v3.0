@@ -42,7 +42,7 @@ function showWindow() {
 function createTray() {
   const icon = nativeImage.createFromPath(ICON_PATH);
   tray = new Tray(icon);
-  tray.setToolTip('QQ Agent');
+  tray.setToolTip('鲸界Bridge');
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '显示主界面', click: () => showWindow() },
     { label: '暂停 / 恢复', click: () => core?.orchestrator.setPaused(!core.orchestrator.paused) },
@@ -68,7 +68,7 @@ function createWindow(port) {
     height: 860,
     minWidth: 960,
     minHeight: 640,
-    title: 'QQ Agent',
+    title: '鲸界Bridge',
     backgroundColor: '#0f1115',
     autoHideMenuBar: true,
     icon: ICON_PATH,
