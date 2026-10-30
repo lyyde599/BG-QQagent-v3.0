@@ -1,16 +1,16 @@
 ---
-name: 阿里云部署 DSH 与 QQAgent
-summary: 从零在阿里云免费服务器上跑通 DeepSeek Harness 和 QQAgent 的完整步骤与踩坑
-when: 群友问怎么部署/安装 QQAgent、怎么买阿里云服务器跑机器人、DSH 怎么装、NapCat 怎么配、机器人不回话怎么查、内存 OOM 怎么办、端口要不要开放时
+name: 阿里云部署 DSH 与鲸界Bridge
+summary: 从零在阿里云免费服务器上跑通 DeepSeek Harness 和鲸界Bridge 的完整步骤与踩坑
+when: 群友问怎么部署/安装鲸界Bridge、怎么买阿里云服务器跑机器人、DSH 怎么装、NapCat 怎么配、机器人不回话怎么查、内存 OOM 怎么办、端口要不要开放时
 author: 白光
 version: 1.0.0
 license: MIT
 ---
 
-# 阿里云部署 DSH 与 QQAgent
+# 阿里云部署 DSH 与鲸界Bridge
 
 来源：B 站视频 `BV1W1n862EjW`（阿里云 300 代金券 + CDT 设置）
-与 `BV1Amn86LEvz`（DSH + QQAgent 部署），UP 主「爱听音乐的白熊」。
+与 `BV1Amn86LEvz`（DSH + 鲸界Bridge 部署），UP 主「爱听音乐的白熊」。
 第三～六章的端口、路径、命令与报错均来自实机验证，不是文档复述。
 
 ## 整条链路的四个阶段
@@ -18,7 +18,7 @@ license: MIT
 ```
 ①领券 → ②买机器（勾公网IP + 按流量计费） → ③SSH 进机器
                                             ↓
-        ⑥用 DSH 部署 QQAgent ← ⑤装 DSH ← ④装 Node 环境
+        ⑥用 DSH 部署 鲸界Bridge ← ⑤装 DSH ← ④装 Node 环境
               ↓
         ⑦扫码登录 → ⑧配置模型与白名单 → ⑨交给 systemd 长期托管
 ```
@@ -28,7 +28,7 @@ license: MIT
 | 一、拿到服务器 | 有公网 IP、能 SSH 登录的 Linux，实付 0 元 | 15 分钟 |
 | 二、拿到工作台 | 服务器上有 Node 20+ | 10 分钟 |
 | 三、装 DSH | `dsh --version` 有输出、`dsh web` 浏览器能开 | 10 分钟 |
-| 四、装 QQAgent | QQ 账号在线、控制台 :3210 能开、群里能回话 | 30 分钟 |
+| 四、装 鲸界Bridge | QQ 账号在线、控制台 :3210 能开、群里能回话 | 30 分钟 |
 
 **最容易翻车的地方不在安装，在第二阶段**——公网 IP 与计费模式没选对、安全组没放行 22。
 
@@ -56,7 +56,7 @@ license: MIT
 |:--|:--|:--|
 | 付费模式 | **包年包月** | 只有包年包月能用代金券；按量付费不吃券 |
 | 地域 | 离你近的（华东1/华南1） | 延迟低，内地流量便宜 |
-| 实例规格 | **2 核 2G**（经济型 e / 共享型 s6） | 跑一个 QQAgent 足够 |
+| 实例规格 | **2 核 2G**（经济型 e / 共享型 s6） | 跑一个 鲸界Bridge 足够 |
 | 镜像 | Ubuntu 22.04/24.04 或 Alibaba Cloud Linux 3 | 前者资料多，后者依赖少 |
 | 系统盘 | 40G 高效云盘 | LinuxQQ+NapCat 约 300MB，Node 依赖约 400MB |
 | **公网 IP** | ✅ **勾选「分配公网 IPv4 地址」** | 不勾 = 没公网 IP = 连不上 |
@@ -91,7 +91,7 @@ license: MIT
 | 端口 | 用途 | 建议 |
 |:--|:--|:--|
 | 22 | SSH 登录 | ✅ **必须**（否则进不去） |
-| 3210 | QQAgent 控制台 | 建议改用 SSH 隧道 |
+| 3210 | 鲸界Bridge 控制台 | 建议改用 SSH 隧道 |
 | 3080 | DSH Web UI | 建议隧道或域名反代 |
 | 6099 | NapCat WebUI | ⚠️ **不要公网放行**——几乎无认证，暴露=把机器人交出去 |
 
@@ -152,7 +152,7 @@ Host ali
 ### SSH 隧道（把不该暴露的端口变成本地端口）
 
 ```bash
-ssh -N -L 3210:127.0.0.1:3210 ali     # QQAgent 控制台
+ssh -N -L 3210:127.0.0.1:3210 ali     # 鲸界Bridge 控制台
 ```
 
 然后浏览器打开 `http://127.0.0.1:3210/` —— 走加密隧道，公网看不到这个端口。
@@ -167,7 +167,7 @@ ssh -N -L 3210:127.0.0.1:3210 ali     # QQAgent 控制台
 apt update && apt -y upgrade
 apt -y install curl git vim unzip htop tmux
 
-# Node.js 20 LTS（DSH 与 QQAgent 都要 >=20）
+# Node.js 20 LTS（DSH 与 鲸界Bridge 都要 >=20）
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt -y install nodejs
 
@@ -258,24 +258,24 @@ WantedBy=multi-user.target
 systemctl daemon-reload && systemctl enable --now dsh
 ```
 
-`MemoryMax` 不是装饰：2G 机器上不给上限，DSH + NapCat + QQAgent 抢内存时，内核会挑最大的那个杀——
+`MemoryMax` 不是装饰：2G 机器上不给上限，DSH + NapCat + 鲸界Bridge 抢内存时，内核会挑最大的那个杀——
 往往就是你正在用的那个。
 
-## 六、用 DSH 部署 QQAgent
+## 六、用 DSH 部署 鲸界Bridge
 
-**核心思路**：DSH 是操作台，QQAgent 是被部署的业务。
+**核心思路**：DSH 是操作台，鲸界Bridge 是被部署的业务。
 
 ### 架构：三个必须同时活着的东西
 
 ```
 NapCat（协议端插件） → 驱动 → LinuxQQ（真正的 QQ 客户端）
         ↕ OneBot WS 3001 / HTTP 3000
-QQAgent（Node 服务） → 调 → OpenAI 兼容接口（DeepSeek / 中转站）
+鲸界Bridge（Node 服务） → 调 → OpenAI 兼容接口（DeepSeek / 中转站）
         ↕
 控制台 :3210（看会话、改人设、勾群白名单）
 ```
 
-**Xvfb（虚拟显示）→ QQ 客户端（含 NapCat）→ QQAgent 服务**，任何一环挂了，
+**Xvfb（虚拟显示）→ QQ 客户端（含 NapCat）→ 鲸界Bridge 服务**，任何一环挂了，
 就会出现「进程都在跑但机器人不说话」。
 
 ### 拿到代码
@@ -325,7 +325,7 @@ qq --no-sandbox -q <你的机器人QQ号>
 **二维码怎么看**：NapCat 缓存目录里有 `qrcode.png`（约 2 分钟刷新一次）。
 服务器没桌面，最省事的是起临时小 HTTP 服务只对内网/隧道暴露，或把图片 `scp` 下来扫。
 
-### 配 QQAgent
+### 配 鲸界Bridge
 
 编辑 `data/config.json`（唯一配置文件，改完重启生效）：
 
@@ -485,7 +485,7 @@ journalctl -u napcat-qq -n 50 --no-pager   # 排障先看它
 | 3000 | NapCat OneBot HTTP | 仅 127.0.0.1 |
 | 3001 | NapCat OneBot WS | 仅 127.0.0.1 |
 | 3080 | DSH Web | 隧道 或 域名 + 认证 |
-| 3210 | QQAgent 控制台 | 隧道 或 域名 + Basic Auth |
+| 3210 | 鲸界Bridge 控制台 | 隧道 或 域名 + Basic Auth |
 | 6099 | NapCat WebUI | 仅 127.0.0.1 |
 
 ## 附：一页命令速查

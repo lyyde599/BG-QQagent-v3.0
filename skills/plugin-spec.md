@@ -8,7 +8,7 @@ license: MIT
 ---
 # 插件与 Skill 制作及使用规范
 
-> **适用**：为 鲸界Bridge（`qq-agent-v2`）编写插件与 Skill
+> **适用**：为鲸界Bridge（`whalebridge`）编写插件与 Skill
 > **内核 API 版本**：`1`（见 `src/core/manifest.js` 的 `PLUGIN_API_VERSION`）
 > **权威源**：本规范依据实际代码，不是设计稿。字段与行为以 `src/core/` 为准。
 

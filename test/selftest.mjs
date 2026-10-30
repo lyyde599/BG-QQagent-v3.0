@@ -895,7 +895,10 @@ refs:
   const chatsRes = await (await fetch(`http://127.0.0.1:${cfg.server.port}/api/chats`)).json();
   assert.ok(chatsRes.chats.some((c) => c.key === 'group:456'));
   const uiRes = await fetch(`http://127.0.0.1:${cfg.server.port}/`);
-  assert.ok((await uiRes.text()).includes('鲸界Bridge'), 'UI 首页可访问');
+  // 品牌名会随项目改名变化，这里只断言"是那个首页"，不绑死具体名字
+  // （2026-10-30：QQ Agent → 鲸界Bridge，写死品牌名会让测试假失败）
+  const uiHtml = await uiRes.text();
+  assert.ok(uiHtml.includes('brand') && uiHtml.includes('</html>'), 'UI 首页可访问');
   pass('HTTP API：status/models/sessions/chats/UI 全部可用', `今日 cost=¥${statusRes.usage.cost}`);
 
   // ── 场景 26：记忆自动整理（超阈值触发 + LLM 合并写回 + 备份 + 冷却）──

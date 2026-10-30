@@ -158,7 +158,7 @@ export async function activate(ctx) {
   //    换成 curl/8.0 或自定义 UA 就 200。
   //    所以必须显式带 UA，不能依赖运行时的默认值 ——
   //    否则市场在 Node 的 fetch 下也会莫名其妙 403。
-  const UA = 'QQAgent-Market/1.0 (+https://597457.xyz)';
+  const UA = 'WhaleBridge-Market/1.0 (+https://597457.xyz)';
   const HEADERS = {
     'User-Agent': UA,
     'Accept': 'application/json, application/gzip, */*',
@@ -277,19 +277,19 @@ export async function activate(ctx) {
   // 邮件文案模板（2026-10-25）：按用途区分，别让收件人以为点错了
   const MAIL_TPL = {
     register: {
-      subject: '【QQAgent 创造营】注册验证码',
-      lines: (c) => ['你好，', '', '你正在注册 QQAgent 创造营的作者账号。', '',
-        `验证码：${c}`, '', '10 分钟内有效。若不是你本人操作，忽略这封邮件。', '', '—— QQAgent 创造营'],
+      subject: '【鲸界Bridge 创造营】注册验证码',
+      lines: (c) => ['你好，', '', '你正在注册 鲸界Bridge 创造营的作者账号。', '',
+        `验证码：${c}`, '', '10 分钟内有效。若不是你本人操作，忽略这封邮件。', '', '—— 鲸界Bridge 创造营'],
     },
     submit: {
-      subject: '【QQAgent 创造营】投稿凭证验证码',
+      subject: '【鲸界Bridge 创造营】投稿凭证验证码',
       lines: (c) => ['你好，', '', '你正在获取「投稿到插件市场」的凭证，用于上传插件包。', '',
-        `验证码：${c}`, '', '10 分钟内有效。若不是你本人操作，请忽略这封邮件，你的账号没有变化。', '', '—— QQAgent 创造营'],
+        `验证码：${c}`, '', '10 分钟内有效。若不是你本人操作，请忽略这封邮件，你的账号没有变化。', '', '—— 鲸界Bridge 创造营'],
     },
     reset: {
-      subject: '【QQAgent 创造营】重置密码验证码',
-      lines: (c) => ['你好，', '', '你正在重置 QQAgent 创造营的登录密码。', '',
-        `验证码：${c}`, '', '10 分钟内有效。若不是你本人操作，请立即修改密码。', '', '—— QQAgent 创造营'],
+      subject: '【鲸界Bridge 创造营】重置密码验证码',
+      lines: (c) => ['你好，', '', '你正在重置 鲸界Bridge 创造营的登录密码。', '',
+        `验证码：${c}`, '', '10 分钟内有效。若不是你本人操作，请立即修改密码。', '', '—— 鲸界Bridge 创造营'],
     },
   };
 
@@ -1145,7 +1145,7 @@ export async function activate(ctx) {
   //   作者   —— 邮箱验证码注册的任何邮箱
   //
   // 🔴 安全边界（必须诚实说明）：
-  //   QQAgent 控制台只监听 127.0.0.1，公网走 nginx Basic Auth。
+  //   鲸界Bridge 控制台只监听 127.0.0.1，公网走 nginx Basic Auth。
   //   所以这里的"身份"防的是**误操作**，不是防黑客 ——
   //   能访问到 3210 的人，本来就已经越过了两道墙。
   //   真正要防的是：作者 A 手滑点了作者 B 的「下架」。
@@ -2696,7 +2696,7 @@ export async function activate(ctx) {
       //   用户点「发布」时不该被迫理解"素材要不要分离"这种事。
       let res = await localFetch(LOCAL_BASE.origin + `/api/market/package`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'User-Agent': 'QQAgent-Market/1.0' },
+        headers: { 'content-type': 'application/json', 'User-Agent': 'WhaleBridge-Market/1.0' },
         body: JSON.stringify({ id }),
         signal: AbortSignal.timeout(120000),
       });
@@ -2705,7 +2705,7 @@ export async function activate(ctx) {
         ctx.log(`[市场] ${id} 包体积 ${(pkg0.market.size/1024/1024).toFixed(1)}MB，改用剥离素材版`);
         res = await localFetch(LOCAL_BASE.origin + `/api/market/package`, {
           method: 'POST',
-          headers: { 'content-type': 'application/json', 'User-Agent': 'QQAgent-Market/1.0' },
+          headers: { 'content-type': 'application/json', 'User-Agent': 'WhaleBridge-Market/1.0' },
           body: JSON.stringify({ id, stripAssets: true }),
           signal: AbortSignal.timeout(120000),
         });
