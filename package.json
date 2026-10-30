@@ -1,6 +1,6 @@
 {
   "name": "whalebridge",
-  "version": "3.3.3",
+  "version": "3.3.4",
   "private": true,
   "description": "鲸界Bridge —— 可扩展的 QQ 群机器人框架",
   "type": "module",
