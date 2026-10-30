@@ -88,7 +88,7 @@ async function r2Put(env, key, body, contentType = 'application/json') {
       'x-amz-date': amz,
       'Content-Type': contentType,
       Authorization: `AWS4-HMAC-SHA256 Credential=${env.R2_ACCESS_KEY_ID}/${scope}, SignedHeaders=${sh}, Signature=${sig}`,
-      'User-Agent': 'QQAgent-PersonaMarket/1.0'
+      'User-Agent': 'WhaleBridge-PersonaMarket/1.0'
     },
     body,
     signal: AbortSignal.timeout(60000)
@@ -115,7 +115,7 @@ function parseFrontmatter(raw) {
 export async function fetchPersonaIndex() {
   try {
     const res = await fetch(PERSONA_INDEX, {
-      headers: { 'User-Agent': 'QQAgent-PersonaMarket/1.0' },
+      headers: { 'User-Agent': 'WhaleBridge-PersonaMarket/1.0' },
       signal: AbortSignal.timeout(20000)
     });
     if (!res.ok) {
@@ -266,7 +266,7 @@ export async function installPersona(id, { overwrite = false } = {}) {
   let raw;
   try {
     const res = await fetch(meta.download, {
-      headers: { 'User-Agent': 'QQAgent-PersonaMarket/1.0' },
+      headers: { 'User-Agent': 'WhaleBridge-PersonaMarket/1.0' },
       signal: AbortSignal.timeout(30000)
     });
     if (!res.ok) return { ok: false, error: `下载失败 HTTP ${res.status}` };

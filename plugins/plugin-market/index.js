@@ -1898,6 +1898,61 @@ export async function activate(ctx) {
     };
   }, { absolute: true });
 
+  /**
+   * 作者侧：别人对我插件的反馈（2026-10-30）
+   *
+   * 解决的问题：创作营只有「我提交的反馈」（按提交者邮箱过滤），
+   * 作者看不到别人给自己插件提的问题 —— 反馈等于石沉大海。
+   *
+   * 数据本来就有：每条反馈都带 plugin{id,name,version}，
+   * 只要拿当前用户发布过的插件 id 去筛就行。
+   *
+   * 判据：插件 manifest 的 author 与当前登录作者的昵称/邮箱匹配。
+   * 兼容 author 写成昵称、写成邮箱两种。
+   */
+  ctx.http.route('GET', '/api/market/feedback/for-me', async () => {
+    const w = whoAmI();
+    if (w.role === 'guest' || !w.me?.email) {
+      return { ok: false, error: '请先注册或登录作者账号' };
+    }
+
+    let fbm;
+    try { fbm = await import('../../src/feedback.js'); }
+    catch { return { ok: false, error: '当前内核版本不支持反馈' }; }
+
+    // ① 找出「我」发布的插件 id
+    const myNames = new Set(
+      [w.me.nickname, w.me.name, w.me.email].map((x) => String(x || '').trim()).filter(Boolean)
+    );
+    const myPluginIds = new Set();
+    try {
+      const __pdir = path.join(ctx.root, 'plugins');
+      for (const f of fs.readdirSync(__pdir, { withFileTypes: true })) {
+        if (!f.isDirectory()) continue;
+        try {
+          const mf = JSON.parse(fs.readFileSync(path.join(__pdir, f.name, 'manifest.json'), 'utf8'));
+          const author = String(mf?.author || '').trim();
+          if (author && myNames.has(author)) myPluginIds.add(String(mf.id || f.name));
+        } catch { /* 跳过坏 manifest */ }
+      }
+    } catch { /* 目录读不了就当没有 */ }
+
+    // ② 从全部反馈里筛出指向这些插件的
+    const all = fbm.listFeedback({ all: true });
+    const mine = all.filter((x) => {
+      const pid = String(x?.plugin?.id || '');
+      return pid && myPluginIds.has(pid);
+    });
+
+    return {
+      ok: true,
+      myPlugins: [...myPluginIds].sort(),
+      total: mine.length,
+      open: mine.filter((x) => x.status === 'open').length,
+      items: mine.map(({ dir, ...rest }) => rest)
+    };
+  }, { absolute: true });
+
   ctx.http.route('GET', '/api/market/admin/feedback', async (_req, _b, url) => {
     const g = requireAdmin();
     if (!g.ok) return g;
@@ -2247,7 +2302,20 @@ export async function activate(ctx) {
         const res = await fetch('https://market.baiguang211.top/api/bridge/review', {
           method: 'POST',
           headers: { 'x-bridge-key': key, 'content-type': 'application/json', 'User-Agent': UA },
-          body: JSON.stringify({ id, action, note: body?.note || '' }),
+          // 🔴 必须带上 inIndex（2026-10-30 修）
+          //
+          // `kind=published` 的条目是**已上架插件的重审标记**，
+          // 它记在 index.json 里、不在 pending/ 目录，
+          // bridge/review 查 pending/<id>.json 必然 404 →
+          // 界面表现为"点了通过没反应"。
+          //
+          // Worker 那边已经支持 inIndex 分支，但这里没传，等于白加。
+          body: JSON.stringify({
+            id,
+            action,
+            note: body?.note || '',
+            inIndex: body?.inIndex === true
+          }),
           signal: AbortSignal.timeout(60000),
         });
         const d = await res.json().catch(() => ({}));

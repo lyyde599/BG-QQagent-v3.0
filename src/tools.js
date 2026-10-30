@@ -16,7 +16,7 @@ const WORKSPACE_DIR = path.join(ROOT, 'workspace');
 const DSH_WORK_DIR = path.join(ROOT, 'dsh-work');
 const TEMP_DIRS = ['/tmp', ...(process.env.TMPDIR ? [process.env.TMPDIR] : [])];
 // 工作目录（2026-10-28）：DSH 产物现在落这里，send_file 必须认
-const YUYU_DIR = process.env.QQ_AGENT_YUYU_DIR || '/home/lyy/鱼鱼的工作目录';
+const YUYU_DIR = process.env.WB_YUYU_DIR || process.env.QQ_AGENT_YUYU_DIR || '/home/lyy/鱼鱼的工作目录';
 const LOCAL_PATH_PREFIXES = [WORKSPACE_DIR, DSH_WORK_DIR, ...TEMP_DIRS];
 
 // 下载图片并转成 dataURL（供视觉模型读图）。

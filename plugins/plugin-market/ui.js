@@ -690,6 +690,13 @@ license: MIT
         </div>
 
       <div class="cy-section-title" style="margin-top:20px">
+          别人对我插件的反馈
+          <span class="cy-badge" id="cy-forfb-count">加载中…</span>
+          <button class="btn tiny" id="cy-forfb-refresh" style="margin-left:8px">刷新</button>
+        </div>
+        <div id="cy-forfb-root"><div class="cy-empty">加载中…</div></div>
+
+      <div class="cy-section-title" style="margin-top:20px">
           我提交的反馈
           <span class="cy-badge" id="cy-myfb-count">加载中…</span>
           <button class="btn tiny" id="cy-myfb-refresh" style="margin-left:8px">刷新</button>
@@ -1153,7 +1160,62 @@ license: MIT
     };
 
     box.querySelector('#cy-myfb-refresh')?.addEventListener('click', loadMine);
+
+    // ── 别人对我插件的反馈（2026-10-30）──
+    //
+    // 作者最需要看到的东西：别人给自己插件提了什么。
+    // 原来只有「我提交的」，收不到任何回音。
+    const forRoot = box.querySelector('#cy-forfb-root');
+    const forCount = box.querySelector('#cy-forfb-count');
+
+    const loadForMe = async () => {
+      if (!forRoot) return;
+      forRoot.innerHTML = '<div class="cy-empty">加载中…</div>';
+      try {
+        const r = await api('/api/market/feedback/for-me');
+        if (!r?.ok) {
+          forRoot.innerHTML = `<div class="cy-empty">${esc(r?.error || '读取失败')}</div>`;
+          if (forCount) forCount.textContent = '—';
+          return;
+        }
+        const items = r.items || [];
+        if (forCount) {
+          forCount.textContent = r.open ? `共 ${items.length} 条 · 待处理 ${r.open}` : `共 ${items.length} 条`;
+        }
+        if (!items.length) {
+          forRoot.innerHTML = '<div class="cy-empty">还没有人给你的插件提反馈。'
+            + (r.myPlugins?.length ? '' : '（没识别到你名下的插件，先确认 manifest 里的 author 与账号昵称一致）')
+            + '</div>';
+          return;
+        }
+        forRoot.innerHTML = items.map((x) => `
+          <div class="cy-card" style="margin-bottom:8px">
+            <div class="cy-card-head">
+              <span class="cy-badge">${esc(typeLabel[x.type] || x.type)}</span>
+              <span class="cy-name" style="font-size:13px">${esc(x.title)}</span>
+              <span class="cy-spacer"></span>
+              <span class="cy-badge" style="color:${stColor[x.status] || 'inherit'}">${esc(stLabel[x.status] || x.status)}</span>
+            </div>
+            <div class="cy-meta" style="margin-bottom:2px">
+              来自 ${esc(x.plugin?.name || x.plugin?.id || '插件')} v${esc(x.plugin?.version || '')}
+            </div>
+            ${x.body ? `<div class="cy-summary" style="white-space:pre-wrap;max-height:120px;overflow:auto">${esc(x.body)}</div>` : ''}
+            <div class="cy-meta">
+              ${esc(fmtTime(x.submittedAt))}
+              ${(x.images || []).length ? ` · 图片 ${x.images.length} 张` : ''}
+              ${(x.files || []).length ? ` · 附件 ${x.files.length} 个` : ''}
+            </div>
+            ${x.reviewNote ? `<div class="cy-meta" style="margin-top:4px;color:#b7791f">回复：${esc(x.reviewNote)}</div>` : ''}
+          </div>`).join('');
+      } catch (e) {
+        forRoot.innerHTML = `<div class="cy-empty">读取失败：${esc(e.message)}</div>`;
+      }
+    };
+
+    box.querySelector('#cy-forfb-refresh')?.addEventListener('click', loadForMe);
+
     onPaneFirstShow('publish', loadMine);
+    onPaneFirstShow('publish', loadForMe);
   })();
 
   // ── 角色卡（2026-10-25）──
@@ -2734,8 +2796,8 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
                 <span style="color:${color};font-size:11.5px">${statusText}</span>
                 <span class="cy-spacer"></span>
                 ${s.status === 'pending' ? `
-                  <button class="btn tiny primary" data-sub-ok="${esc(s.id)}">通过</button>
-                  <button class="btn tiny" data-sub-no="${esc(s.id)}" style="color:#c00">驳回</button>
+                  <button class="btn tiny primary" data-sub-ok="${esc(s.id)}" data-in-index="${s.inIndex === true ? '1' : ''}">通过</button>
+                  <button class="btn tiny" data-sub-no="${esc(s.id)}" data-in-index="${s.inIndex === true ? '1' : ''}" style="color:#c00">驳回</button>
                 ` : ''}
               </div>
               <div class="cy-summary">${esc(s.summary || '')}</div>
@@ -2744,6 +2806,11 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
                 ${s.email ? ' · ' + esc(s.email) : ''}
                 ${s.bytes ? ' · ' + (s.bytes / 1024).toFixed(1) + ' KB' : ''}
                 ${(s.permissions || []).length ? ' · 权限：' + esc((s.permissions || []).join('、')) : ''}
+              </div>
+              <div class="cy-meta" style="margin-top:2px">
+                ${s.submittedAt ? '提交：' + esc(fmtTime(s.submittedAt)) : '提交：—'}
+                ${s.updatedAt && s.updatedAt !== s.submittedAt ? ' · 更新：' + esc(fmtTime(s.updatedAt)) : ''}
+                ${s.inIndex ? ' · <span style="color:#b7791f">已上架待确认</span>' : ''}
               </div>
               ${s.changelog ? `<div class="cy-meta" style="margin-top:4px">说明：${esc(s.changelog)}</div>` : ''}
             </div>`;
@@ -2757,7 +2824,8 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
             b.disabled = true;
             try {
               const r = await api('/api/market/submissions/review', {
-                method: 'POST', body: { id, action: 'approve' },
+                method: 'POST',
+                body: { id, action: 'approve', inIndex: b.dataset.inIndex === '1' },
               });
               ctx.toast?.(r?.ok ? '已通过，已上架' : (r?.error || '操作失败'));
               loadSubs();
@@ -2773,7 +2841,8 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
             b.disabled = true;
             try {
               const r = await api('/api/market/submissions/review', {
-                method: 'POST', body: { id, action: 'reject', note },
+                method: 'POST',
+                body: { id, action: 'reject', note, inIndex: b.dataset.inIndex === '1' },
               });
               ctx.toast?.(r?.ok ? '已驳回' : (r?.error || '操作失败'));
               loadSubs();

@@ -41,7 +41,7 @@ def main():
 
     msg = MIMEText(body, 'plain', 'utf-8')
     msg['Subject'] = Header(subject, 'utf-8')
-    msg['From'] = formataddr((str(Header('QQAgent 创造营', 'utf-8')), user))
+    msg['From'] = formataddr((str(Header('鲸界Bridge 创造营', 'utf-8')), user))
     msg['To'] = to_addr
 
     try:

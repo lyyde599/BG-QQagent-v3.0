@@ -574,7 +574,7 @@ export class Orchestrator {
     // 事故：机器人把「引用自己」认成「别人在引用别人」。
     // 根因之一：这里原来用的是 persona.selfNickname（手填的"小鲸鱼"）
     // 或 QQ 昵称（"l"）—— 但**群名片是群主设的**，可能是
-    // 「🐳鲸界魔王👿-白光-小鱼」这种完全不同的字符串。
+    // 「🐳某机器人名片-主人名-小鱼」这种完全不同的字符串。
     // 名字对不上，模型只能猜，于是认错人。
     //
     // 现在：进入群聊时**实时查一次本群名片**（带 5 分钟缓存，
@@ -660,6 +660,11 @@ export class Orchestrator {
     const __all = [...this.toolDefs, ...pluginTools];
     this.log?.(`[工具] 候选 ${__all.length} 个（内核 ${this.toolDefs.length} + 插件 ${pluginTools.length}），heybox 有 ${__all.filter((d) => String(d.name || '').includes('heybox')).length} 个`);
 
+    // 工具列表**稳定排序**（2026-10-30，缓存优化 P2）
+    //
+    // pluginTools 的顺序依赖插件加载顺序，装/卸插件时可能变。
+    // 而工具定义在提示词/请求里是前缀的一部分 —— 顺序一变，缓存全失效。
+    // 按 name 排序后，只要集合本身没变，顺序就固定。
     const toolDefs = [...this.toolDefs, ...pluginTools].filter((d) => {
       if (!gatedVision && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
@@ -677,7 +682,7 @@ export class Orchestrator {
       const kbNames = this.pluginHost?.kbToolNames?.() || KB_TOOL_NAMES;
       if (kbNames.has(d.name) && ident.mode !== 'tutor' && cfg.features?.tutorMode !== true) return false;
       return true;
-    });
+    }).sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')));
     const openAiTools = toOpenAiTools(toolDefs);
 
     // 组装提示词（无 LLM 历史）
@@ -690,7 +695,7 @@ export class Orchestrator {
     const systemPrompt = buildSystemPrompt({
       persona, extraSections: pluginSections, availableTools: mountedToolNames,
       // 传入自己的 QQ 号 + 群名片，让模型能按号判定 @/引用/点名（2026-10-27/28）
-      // selfCard 很关键：机器人群名片常与人设名不同（如「鲸界魔王-白光-小鱼」vs「小鲸鱼」），
+      // selfCard 很关键：机器人群名片常与人设名不同（如「某名片-主人名-小鱼」vs「小鲸鱼」），
       // 不给的话模型会因"名字不像我"把 @ 自己的消息当成别人。
       selfId: this.onebot.selfId,
       selfCard: selfNickname,

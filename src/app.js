@@ -10,7 +10,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { getConfig, updateConfig, ROOT, DATA_DIR, COMMUNITY } from './config.js';
 import { checkKernelUpdate, downloadKernelUpdate, localKernelVersion, listDownloaded, publishKernel, canPublishKernel, autoInstallKernel, readInstallLog, lastInstallResult, checkInstaller } from './kernel-update.js';
@@ -312,7 +312,7 @@ export function createApp({ log = console.log } = {}) {
 
   // SnowLuma 内置控制台日志（环形缓冲，最近 500 行）
   // 内置 SnowLuma 状态与日志。未采用多进程方案：由 Electron 主进程提供 IPC 控制与日志转发，
-  // 确保 SnowLuma 随 QQ Agent 退出、无需单独管理窗口。
+  // 确保 SnowLuma 随鲸界Bridge 退出、无需单独管理窗口。
   const snowlumaLogs = [];
   let snowlumaProc = null;
   let snowlumaStopping = false;
@@ -1001,9 +1001,35 @@ export function createApp({ log = console.log } = {}) {
     return req.headers['x-console-token'] === token || url.searchParams.get('token') === token;
   }
 
+  // ── API 路径别名（2026-10-30）──────────────────────────────
+  //
+  // 项目改名「鲸界Bridge」，路径要避开 QQagent/qq 这类旧品牌。
+  // 但**绝不能直接改路径** —— 用户更新后前端还在用旧地址会 404。
+  //
+  // 做法：这里做**前缀归一化**，新旧路径指向同一个处理逻辑。
+  //   /api/wb/napcat-qq/xxx  →  内部按 /api/napcat-qq/xxx 处理
+  //   /api/jj/napcat-qq/xxx  →  同上（jj 是 jingjie 简写，兼容两种习惯）
+  //
+  // 这样：
+  //   · 前端随时可以切到新路径，旧路径永久可用
+  //   · 第三方脚本调旧路径也不会断
+  //   · 未来真要下线旧路径，只需删掉这里的映射
+  const API_PREFIX_ALIASES = [
+    ['/api/wb/', '/api/'],
+    ['/api/jj/', '/api/'],
+  ];
+
   async function handleHttp(req, res) {
     const url = new URL(req.url, 'http://127.0.0.1');
-    const pathname = url.pathname;
+    let pathname = url.pathname;
+
+    // 别名归一化：命中前缀就改写（不重定向，用户看不到跳转）
+    for (const [from, to] of API_PREFIX_ALIASES) {
+      if (pathname.startsWith(from)) {
+        pathname = to + pathname.slice(from.length);
+        break;
+      }
+    }
 
     // SSE
     if (pathname === '/api/events' && req.method === 'GET') {
@@ -1330,7 +1356,7 @@ export function createApp({ log = console.log } = {}) {
       // 发布内核新版本（打包 → 上传 → 更新清单）
       if (pathname === '/api/kernel/publish' && method === 'POST') {
         const body = await readBody(req, { limitMB: 4 }).catch(() => ({}));
-        // 必须已注册作者，且昵称是白光（与创造营同一套归属判定）
+        // 必须已注册作者，且是**内核作者本人**（与创造营同一套归属判定）
         let author = null;
         try {
           const f = path.join(DATA_DIR, 'plugins', 'plugin-market', 'author.json');
@@ -1339,8 +1365,16 @@ export function createApp({ log = console.log } = {}) {
         if (!author?.verifiedAt) {
           return json(res, 403, { ok: false, error: '请先在「创造营」注册作者账号' });
         }
-        const mine = String(author.nickname || '') === '白光' || String(author.qq || '') === '3170037984';
-        if (!mine) {
+        // 🔴 2026-10-30：不再硬编码作者昵称/QQ（那是数据泄漏）。
+        //    改成读配置 kernel.publisherNickname / publisherQQ，两者任一匹配即可。
+        //    留空 = 只有 admin 角色能发（别人拿到核心包也发不了内核更新）。
+        const kc = getConfig().kernelUpdate || {};
+        const wantNick = String(kc.publisherNickname || '').trim();
+        const wantQQ = String(kc.publisherQQ || '').trim();
+        const nickOk = wantNick && String(author.nickname || '') === wantNick;
+        const qqOk = wantQQ && String(author.qq || '') === wantQQ;
+        const roleOk = String(author.role || '') === 'admin';
+        if (!nickOk && !qqOk && !roleOk) {
           return json(res, 403, { ok: false, error: '只有内核作者能发布内核更新' });
         }
         const r = await publishKernel({
@@ -1438,7 +1472,12 @@ export function createApp({ log = console.log } = {}) {
               const m = usage.cacheMissTokens || 0;
               const base = c + m;
               return base > 0 ? Math.round((c / base) * 1000) / 10 : null;
-            })()
+            })(),
+            // 诊断字段（2026-10-30，缓存优化 P5）
+            // 让用户能自己看「每轮首调用 / 末调用」的命中情况，
+            // 而不是只能看到一个整日汇总的数字。
+            calls: usage.calls || 0,
+            lastCache: usage.lastCache || null
           },
           paused: orchestrator.paused,
           pauseReason: orchestrator.pauseReason ?? null
@@ -1485,9 +1524,40 @@ export function createApp({ log = console.log } = {}) {
             || path.join(os.homedir(), '.secrets', 'sudo', 'password');
           let pw = '';
           try { pw = fs.readFileSync(pwFile, 'utf8').trim(); } catch { /* 无密码文件 */ }
-          // 服务名从环境变量读，默认 BG-QQagent-Linux（2026-10-28 改名）
-          // 这样目录/服务改名后不用再改代码
-          const svc = process.env.QQ_AGENT_SERVICE || 'BG-QQagent-Linux';
+          // 服务名：优先环境变量，其次**自动探测**当前进程属于哪个 systemd 单元。
+          //
+          // 🔴 2026-10-30：原来默认写死 'BG-QQagent-Linux'。
+          //    项目改名（鲸界Bridge / whalebridge）后这个默认值必然失效，
+          //    用户点「重启服务」会报 unit not found。
+          //
+          //    探测顺序：
+          //      ① 环境变量 QQ_AGENT_SERVICE（管理员显式指定）
+          //      ② /proc/self/cgroup 里的单元名（最准 —— 我们就在里面跑）
+          //      ③ systemctl 里 WorkingDirectory 匹配当前目录的单元
+          //      ④ 最后才退回旧默认（保证老部署仍可用）
+          const svc = (process.env.WB_SERVICE || process.env.QQ_AGENT_SERVICE)
+            || (() => {
+              try {
+                const cg = fs.readFileSync('/proc/self/cgroup', 'utf8');
+                const m = cg.match(/\/system\.slice\/([^\/\n]+\.service)/);
+                if (m && m[1]) return m[1];
+              } catch { /* 非 Linux 或读不到 */ }
+              try {
+                const out = execSync(
+                  `systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}'`,
+                  { encoding: 'utf8', timeout: 5000 }
+                );
+                const hits = out.split('\n').map((s) => s.trim())
+                  .filter((s) => s && s.endsWith('.service'));
+                for (const u of hits) {
+                  try {
+                    const wd = execSync(`systemctl show ${u} -p WorkingDirectory --value`, { encoding: 'utf8', timeout: 3000 }).trim();
+                    if (wd && path.resolve(wd) === path.resolve(ROOT)) return u;
+                  } catch { /* 跳过 */ }
+                }
+              } catch { /* 探测失败 */ }
+              return 'BG-QQagent-Linux';   // 老部署兜底
+            })();
           const child = spawn('sudo', ['-S', 'systemctl', 'restart', svc], {
             detached: true,
             stdio: pw ? ['pipe', 'ignore', 'ignore'] : 'ignore',
@@ -2254,7 +2324,9 @@ export function createApp({ log = console.log } = {}) {
       if (pathname === '/api/providers/models' && method === 'POST') {
         try {
           const body = await readBody(req);
-          const p = addModelsToProvider(String(body.providerId ?? ''), body.models || []);
+          // apiKey 可选：同一个端点换了新 Key 时，「加入列表」顺带把 Key 更新掉
+          // （原来只写模型不写 Key → 新 Key 存不进去 → 点模型又连回旧的）
+          const p = addModelsToProvider(String(body.providerId ?? ''), body.models || [], body.apiKey);
           if (!p) return json(res, 404, { ok: false, error: '提供商不存在' });
           return json(res, 200, { ok: true, provider: p });
         } catch (error) {
@@ -2510,16 +2582,16 @@ export function createApp({ log = console.log } = {}) {
         const purpose = String(body?.purpose || 'register').trim();
         const MAIL_TPL = {
           register: {
-            subject: '【QQAgent 创造营】注册验证码',
-            body: (c) => `你好，\n\n你正在注册 QQAgent 创造营的作者账号。\n\n验证码：${c}\n\n10 分钟内有效。若不是你本人操作，忽略这封邮件。\n\n—— QQAgent 创造营`,
+            subject: '【鲸界Bridge 创造营】注册验证码',
+            body: (c) => `你好，\n\n你正在注册 鲸界Bridge 创造营的作者账号。\n\n验证码：${c}\n\n10 分钟内有效。若不是你本人操作，忽略这封邮件。\n\n—— 鲸界Bridge 创造营`,
           },
           submit: {
-            subject: '【QQAgent 创造营】投稿凭证验证码',
-            body: (c) => `你好，\n\n你正在获取「投稿到插件市场」的凭证，用于上传插件包。\n\n验证码：${c}\n\n10 分钟内有效。若不是你本人操作，请忽略这封邮件，你的账号没有变化。\n\n—— QQAgent 创造营`,
+            subject: '【鲸界Bridge 创造营】投稿凭证验证码',
+            body: (c) => `你好，\n\n你正在获取「投稿到插件市场」的凭证，用于上传插件包。\n\n验证码：${c}\n\n10 分钟内有效。若不是你本人操作，请忽略这封邮件，你的账号没有变化。\n\n—— 鲸界Bridge 创造营`,
           },
           reset: {
-            subject: '【QQAgent 创造营】重置密码验证码',
-            body: (c) => `你好，\n\n你正在重置 QQAgent 创造营的登录密码。\n\n验证码：${c}\n\n10 分钟内有效。若不是你本人操作，请立即修改密码。\n\n—— QQAgent 创造营`,
+            subject: '【鲸界Bridge 创造营】重置密码验证码',
+            body: (c) => `你好，\n\n你正在重置 鲸界Bridge 创造营的登录密码。\n\n验证码：${c}\n\n10 分钟内有效。若不是你本人操作，请立即修改密码。\n\n—— 鲸界Bridge 创造营`,
           },
         };
         const tpl = MAIL_TPL[purpose] || MAIL_TPL.register;
@@ -2718,8 +2790,8 @@ export function createApp({ log = console.log } = {}) {
         const body = await readBody(req, { limitMB: 1 }).catch(() => ({}));
         const to = String(body?.to || '').trim();
         if (!to) return json(res, 400, { ok: false, error: '请填收件邮箱' });
-        const r = await sendMail(to, '【QQAgent】邮件通道测试',
-          '这是测试邮件。\n\n收到说明邮件通道配置正确，注册作者时可以收到验证码了。\n\n—— QQAgent');
+        const r = await sendMail(to, '【鲸界Bridge】邮件通道测试',
+          '这是测试邮件。\n\n收到说明邮件通道配置正确，注册作者时可以收到验证码了。\n\n—— 鲸界Bridge');
         return json(res, 200, r.ok ? { ok: true, message: '已发送，请查收（含垃圾箱）' } : { ok: false, error: r.error });
       }
 
@@ -2887,7 +2959,17 @@ export function createApp({ log = console.log } = {}) {
             const list = ST.listTasks().filter((t) => t.enabled);
             scheduled = { count: list.length, items: list.slice(0, 8).map((t) => ST.describeTask(t)) };
           } catch (e) { scheduled = { count: 0, items: [], error: String(e?.message || e) }; }
-          const hasAnyKey = !!(process.env.ANYSEARCH_API_KEY || process.env.ANYSEARCH_API_KEY_2);
+          // 🔴 2026-10-29 修：不能只看环境变量。
+          //
+          // 原来只查 process.env.ANYSEARCH_API_KEY，用户在面板里存了 Key
+          // 依然显示「未配置」—— 因为配置里那份没被算进去。
+          //
+          // 现在两处都认：环境变量优先，其次看 config.webSearch.anysearchKeys。
+          const envAnyKey = !!(process.env.ANYSEARCH_API_KEY || process.env.ANYSEARCH_API_KEY_2);
+          const cfgAnyKeys = Array.isArray(cfg.webSearch?.anysearchKeys)
+            ? cfg.webSearch.anysearchKeys.filter((k) => String(k || '').trim()).length
+            : 0;
+          const hasAnyKey = envAnyKey || cfgAnyKeys > 0;
           const searchProvider = String(cfg.webSearch?.provider || 'auto');
           return json(res, 200, {
             tools,
@@ -2932,8 +3014,9 @@ export function createApp({ log = console.log } = {}) {
       // 面板上能直接看，不用翻 dsh-work 那堆混合产物。
       // 工作记录目录（2026-10-28 用户指定）
       // "我创建了一个《鱼鱼的工作目录》，以后她的外包对话全部放到这里"
-      const DSH_DIALOG_DIR = process.env.QQ_AGENT_YUYU_DIR
-        ? path.join(process.env.QQ_AGENT_YUYU_DIR, '对话记录')
+      const _yuyuDir = process.env.WB_YUYU_DIR || process.env.QQ_AGENT_YUYU_DIR;
+      const DSH_DIALOG_DIR = _yuyuDir
+        ? path.join(_yuyuDir, '对话记录')
         : '/home/lyy/鱼鱼的工作目录/对话记录';
 
       if (pathname === '/api/dsh/dialog' && method === 'GET') {
@@ -3427,7 +3510,7 @@ export function createApp({ log = console.log } = {}) {
     await orchestrator.abortAll();
     onebot.close();
     server.close();
-    // 内置启动的 SnowLuma：QQ Agent 退出时一并关掉，避免留一个无窗口的后台进程
+    // 内置启动的 SnowLuma：鲸界Bridge 退出时一并关掉，避免留一个无窗口的后台进程
     try { snowlumaProc?.kill(); } catch { /* ignore */ }
   }
 

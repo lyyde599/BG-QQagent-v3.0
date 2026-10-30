@@ -65,7 +65,7 @@ async function fetchKernelIndex() {
   let res;
   try {
     res = await fetch(KERNEL_INDEX, {
-      headers: { 'User-Agent': `QQAgent-Kernel/${localKernelVersion()}` },
+      headers: { 'User-Agent': `WhaleBridge-Kernel/${localKernelVersion()}` },
       signal: AbortSignal.timeout(20000)
     });
   } catch (e) {
@@ -139,7 +139,7 @@ export async function downloadKernelUpdate() {
   let buf;
   try {
     const res = await fetch(r.download, {
-      headers: { 'User-Agent': `QQAgent-Kernel/${info.current}` },
+      headers: { 'User-Agent': `WhaleBridge-Kernel/${info.current}` },
       signal: AbortSignal.timeout(180000)
     });
     if (!res.ok) return { ok: false, error: `下载失败 HTTP ${res.status}` };
@@ -257,7 +257,7 @@ async function r2Put(env, key, body, contentType = 'application/json') {
       'x-amz-date': amz,
       'Content-Type': contentType,
       Authorization: `AWS4-HMAC-SHA256 Credential=${env.R2_ACCESS_KEY_ID}/${scope}, SignedHeaders=${sh}, Signature=${sig}`,
-      'User-Agent': 'QQAgent-KernelPublisher/1.0'
+      'User-Agent': 'WhaleBridge-KernelPublisher/1.0'
     },
     body,
     signal: AbortSignal.timeout(180000)
@@ -269,7 +269,7 @@ async function r2Put(env, key, body, contentType = 'application/json') {
 async function fetchIndexForPublish() {
   try {
     const res = await fetch(KERNEL_INDEX, {
-      headers: { 'User-Agent': 'QQAgent-KernelPublisher/1.0' },
+      headers: { 'User-Agent': 'WhaleBridge-KernelPublisher/1.0' },
       signal: AbortSignal.timeout(20000)
     });
     if (!res.ok) return { releases: [] };

@@ -1,4 +1,4 @@
-// QQ Agent 控制台前端：会话式（每次运行 = 一个会话）。
+// 鲸界Bridge 控制台前端：会话式（每次运行 = 一个会话）。
 'use strict';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -3569,7 +3569,9 @@ function renderApiSection(c) {
         <div class="row" style="gap:8px">
           <input type="password" id="cfg-apikey" value="${esc(c.api.apiKey)}" style="flex:1" autocomplete="off" />
           <button type="button" class="btn btn-small" id="toggle-apikey" title="显示/隐藏">显示</button>
+          <button type="button" class="btn btn-small" id="clear-apikey" title="清空并保存（删除已存的 Key）">清除</button>
         </div>
+        <div class="hint">换 Key 直接在框里粘贴新的保存即可；想彻底删掉就点「清除」。</div>
       </div>
     </div>
     <div class="field-row">
@@ -3593,6 +3595,7 @@ function renderApiSection(c) {
       <div style="display:flex;gap:8px;margin-top:6px;align-items:center">
         <button class="btn btn-small" type="button" id="add-search-key-btn">+ 添加一个 Key</button>
         <button class="btn btn-small btn-primary" type="button" id="save-search-keys-btn">保存 Key</button>
+        <button class="btn btn-small" type="button" id="clear-search-keys-btn" title="清空所有已保存的 Key">清除全部</button>
         <span id="search-key-result" class="muted"></span>
       </div>
       <div class="hint" style="margin-top:4px">
@@ -3645,6 +3648,14 @@ function renderPersonaSection(c) {
       <textarea id="cfg-roletext" class="persona-role-text" placeholder="例如：你是运维群里的老油条……">${esc(c.persona.roleText || '')}</textarea></div>
     <div class="field"><label>管理员附加规则（可选，追加到系统提示）</label>
       <textarea id="cfg-customrules" class="persona-role-text" style="min-height:100px">${esc(c.persona.customRules || '')}</textarea></div>
+    <div class="field"><label>主人关系设定（可选，只对你生效）</label>
+      <div class="hint" style="margin-bottom:6px">
+        写你和你家主人之间的关系：他怎么称呼你、你在他面前是什么位置、有什么默契。
+        这段**只在他跟你说话时注入**，群友永远看不到。<br>
+        留空 = 不注入（干净版默认）。想让机器人"认得"你，就在这里写两句。
+      </div>
+      <textarea id="cfg-masterbond" class="persona-role-text" style="min-height:120px"
+        placeholder="例如：&#10;他是我的主人（QQ 123456）—— 造我的那个人。&#10;他叫我「小助手」。&#10;我替他管群、答疑，办成的事要报清楚。">${esc(c.persona.masterBond || '')}</textarea></div>
     ${renderPersonaSaveBar()}`;
 }
 
@@ -3706,23 +3717,32 @@ async function loadSearchKeys() {
   } catch (e) { /* 忽略 */ }
 }
 
-async function saveSearchKeys() {
+async function saveSearchKeys({ allowClear = false } = {}) {
   const box = $('#search-key-rows');
   const out = $('#search-key-result');
   if (!box) return;
   const inputs = [...box.querySelectorAll('.search-key-input')];
   const keys = inputs.map((el) => el.value.trim()).filter(Boolean);
   // 只提交新填的（含 **** 的是遮影值，不提交）
+  //
+  // 🔴 allowClear：用户点「清除」时明确表达删除意图，后端才会真的清空。
+  //    不传的话，空提交会被当成「误点保存」而保留原值（防误删）。
   try {
     const r = await fetch('/api/search-keys', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ keys })
+      body: JSON.stringify({ keys, allowClear })
     });
     const j = await r.json();
     if (j.ok) {
       if (out) out.textContent = '已保存 ' + j.saved + ' 个 Key';
       await loadSearchKeys();
+      // 同步刷新 state.config（2026-10-29）
+      //
+      // 原来只刷 Key 输入框，state.config 里还是旧快照。虽然 saveConfig 已经
+      // 不再带 anysearchKeys 了（那是主修），但保持配置快照一致更稳：
+      // 万一以后别处又读 c.webSearch，也不会拿到过期数据。
+      try { state.config = await api('/api/config'); } catch { /* 忽略 */ }
     } else if (out) out.textContent = '保存失败：' + (j.error || '');
   } catch (e) {
     if (out) out.textContent = '保存失败：' + e.message;
@@ -4185,6 +4205,26 @@ function bindSettingsEvents(c) {
     toggleKey.textContent = show ? '隐藏' : '显示';
   });
 
+  // 清除已保存的 API Key（2026-10-29）
+  //
+  // 反馈：换 Key 时旧值删不掉 —— 因为空值保护会跳过写入。
+  // 这里用显式按钮表达「我确实要删」的意图，绕过那道保护。
+  const clearKey = $('#clear-apikey');
+  if (clearKey) clearKey.addEventListener('click', async () => {
+    if (!confirm('确定要清除已保存的 API Key？\n清除后模型调用会失败，直到你填入新的 Key。')) return;
+    const inp = $('#cfg-apikey');
+    if (inp) inp.value = '';
+    try {
+      await saveConfig({ quiet: true, allowEmptyApiKey: true });
+      const out = $('#cfg-save-result');
+      if (out) out.textContent = 'API Key 已清除 ✓';
+      toast('API Key 已清除');
+      await loadSettings();
+    } catch (e) {
+      toast('清除失败：' + e.message);
+    }
+  });
+
   // AnySearch Key 的添加/保存按钮
   const addKeyBtn = $('#add-search-key-btn');
   if (addKeyBtn) addKeyBtn.addEventListener('click', () => {
@@ -4201,6 +4241,21 @@ function bindSettingsEvents(c) {
   });
   const saveKeyBtn = $('#save-search-keys-btn');
   if (saveKeyBtn) saveKeyBtn.addEventListener('click', saveSearchKeys);
+
+  // 清除全部 AnySearch Key（2026-10-29）
+  const clearKeysBtn = $('#clear-search-keys-btn');
+  if (clearKeysBtn) clearKeysBtn.addEventListener('click', async () => {
+    if (!confirm('确定要清空所有已保存的 AnySearch Key？\n清空后搜索会回退到 Bing 网页抓取（免 key）。')) return;
+    const box = $('#search-key-rows');
+    if (box) box.querySelectorAll('.search-key-input').forEach((el) => { el.value = ''; });
+    try {
+      await saveSearchKeys({ allowClear: true });
+      const out = $('#search-key-result');
+      if (out) out.textContent = '已清除全部 Key（搜索将回退 Bing）';
+    } catch (e) {
+      toast('清除失败：' + e.message);
+    }
+  });
 
   // 保存当前区块设置（通用保存按钮）。只有当前区块的字段才会被读取，不会 null 报错。
   // 群管理区块：加载最近处理记录
@@ -4676,9 +4731,21 @@ function openModelPicker() {
         const pid = el.dataset.pid;
         const model = el.dataset.model;
         try {
+          // 🔴 2026-10-29 修：不能无条件用 provider 的 key 覆盖 api.apiKey
+          //
+          // 反馈：「清空了旧 key、手动导入新的，点一下上面的模型，又把刚删掉的旧 key 连回去了」
+          //
+          // 根因就在这里：原来无条件写 apiKey: p.apiKey || ''，
+          // 用户手填在输入框里的新 Key 被 provider 里存的旧值直接盖掉。
+          //
+          // 现在的规则：
+          //   · 输入框里**有值**（用户手填了）→ 以用户输入为准，不覆盖
+          //   · 输入框为空 → 才用 provider 存的 key（等价于"跟着这个提供商走"）
+          const boxKey = String(document.querySelector('#cfg-apikey')?.value || '').trim();
+          const nextKey = boxKey || p.apiKey || '';
           await api('/api/config', {
             method: 'POST',
-            body: JSON.stringify({ api: { provider: pid, model, baseUrl: p.baseURL, apiKey: p.apiKey || '' } })
+            body: JSON.stringify({ api: { provider: pid, model, baseUrl: p.baseURL, apiKey: nextKey } })
           });
           closeModelModal(overlay);
           loadSettings();
@@ -4722,8 +4789,13 @@ function openModelAddModal(baseUrl, apiKey, remoteModels) {
       return;
     }
     try {
+      // 🔴 2026-10-29：existingProvider 分支必须带上 apiKey
+      //
+      // 反馈：清空旧 Key、手动填了新的，点「加入列表」后再点模型，
+      // 又连回旧 Key 了 —— 因为这里原来只写模型不写 Key，
+      // 新 Key 压根没存进 provider，点模型时又被 provider 的旧值覆盖。
       const body = existingProvider
-        ? { providerId: existingProvider.id, models: newModels.map((m) => ({ id: m, name: m })) }
+        ? { providerId: existingProvider.id, apiKey, models: newModels.map((m) => ({ id: m, name: m })) }
         : { baseUrl, apiKey, models: newModels.map((m) => ({ id: m, name: m })) };
       const endpoint = existingProvider ? '/api/providers/models' : '/api/providers';
       await api(endpoint, { method: 'POST', body: JSON.stringify(body) });
@@ -4845,7 +4917,7 @@ function parseList(s) {
   return String(s || '').split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean);
 }
 
-async function saveConfig({ quiet = false } = {}) {
+async function saveConfig({ quiet = false, allowEmptyApiKey = false } = {}) {
   const c = state.config;
   // 只在当前区块的元素存在时才读取，避免“每个区块保存时读取其他区块元素”导致的 null 报错。
   const el = (sel) => document.querySelector(sel);
@@ -4872,15 +4944,29 @@ async function saveConfig({ quiet = false } = {}) {
       temperature: Number(val('#cfg-temperature', c.api.temperature)) || 0.8,
       maxRounds: Number(val('#cfg-maxrounds', c.api.maxRounds)) || 12
     };
-    // 只在用户真的改了才覆盖（避免空值把已有配置清掉）
+    // 只在用户真的改了才覆盖（避免空值误把已有配置清掉）
+    //
+    // 🔴 但「清除」是明确的删除意图，必须能写空值 —— 所以这里认 allowEmptyApiKey。
+    //    原来空串被 && 短路掉，用户想删旧 Key 却删不掉（反馈的问题）。
     if (baseUrlInput && baseUrlInput !== String(c.api.baseUrl || '')) {
       patch.api.baseUrl = baseUrlInput;
     }
-    if (apiKeyInput && apiKeyInput !== String(c.api.apiKey || '')) {
+    if (allowEmptyApiKey || (apiKeyInput && apiKeyInput !== String(c.api.apiKey || ''))) {
       patch.api.apiKey = apiKeyInput;
     }
+    // 🔴 2026-10-29 修：不要再把 anysearchKeys 带进 patch
+    //
+    // 原因：c.webSearch 是**页面打开时**的快照，里面的 anysearchKeys 是旧值（通常是空数组）。
+    // 而「保存 Key」只调 loadSearchKeys()（刷新 Key 输入框），**没有刷新 state.config**。
+    // 于是这里再点「保存设置」时，会拿旧空数组覆盖刚存进去的 Key。
+    //
+    // 服务端 deepMerge 对数组是**整体替换**（config.js:255 structuredClone），
+    // 不是合并 —— 所以旧空数组直接把新值冲掉。
+    //
+    // 正确做法：Key 的增删只走 /api/search-keys 那条独立通道，saveConfig 不碰这个字段。
+    const { anysearchKeys: _dropKeys, ...wsRest } = (c.webSearch || {});
     patch.webSearch = {
-      ...c.webSearch,
+      ...wsRest,
       enabled: chk('#cfg-websearch', c.webSearch?.enabled !== false),
       provider: val('#cfg-searchprovider', c.webSearch?.provider || 'auto'),
       searchUrl: val('#cfg-searchurl', c.webSearch?.searchUrl || 'https://cn.bing.com/search').trim() || 'https://cn.bing.com/search'
@@ -4893,7 +4979,9 @@ async function saveConfig({ quiet = false } = {}) {
       selfNickname: val('#cfg-selfnick', c.persona.selfNickname || '').trim(),
       participation: val('#cfg-participation', c.persona.participation),
       roleText: val('#cfg-roletext', c.persona.roleText || ''),
-      customRules: val('#cfg-customrules', c.persona.customRules || '')
+      customRules: val('#cfg-customrules', c.persona.customRules || ''),
+      // 主人关系设定（2026-10-30）：原来这段是内核硬编码的作者人设，现已改为用户自填
+      masterBond: val('#cfg-masterbond', c.persona.masterBond || '')
     };
   }
 
@@ -5009,7 +5097,7 @@ $$('.tab').forEach((tab) => {
 // ── 启动 ──
 (async function init() {
   // 启动 loading：先等 HTTP 服务可用（页面可能先于服务打开）
-  setLoadingStatus('正在启动 鲸界Bridge 服务…');
+  setLoadingStatus('正在启动鲸界Bridge 服务…');
   await bootLoop();
 
   // 首启引导：关键配置（模型/白名单）没填就直接带去设置页

@@ -70,7 +70,7 @@ async function r2Put(env, key, body, contentType = 'application/json') {
       'x-amz-date': amz,
       'Content-Type': contentType,
       Authorization: `AWS4-HMAC-SHA256 Credential=${env.R2_ACCESS_KEY_ID}/${scope}, SignedHeaders=${sh}, Signature=${sig}`,
-      'User-Agent': 'QQAgent-SkillMarket/1.0'
+      'User-Agent': 'WhaleBridge-SkillMarket/1.0'
     },
     body,
     signal: AbortSignal.timeout(60000)
@@ -115,7 +115,7 @@ export async function fetchSkillIndex(opts = {}) {
 
   try {
     const res = await fetch(SKILL_INDEX, {
-      headers: { 'User-Agent': 'QQAgent-SkillMarket/1.0' },
+      headers: { 'User-Agent': 'WhaleBridge-SkillMarket/1.0' },
       // 原来 20000：域名卡住时面板要空白 20 秒。
       // 清单只是个 json，4 秒足够；超了就用旧的。
       signal: AbortSignal.timeout(4000)
@@ -227,7 +227,11 @@ export async function publishSkill(id, { version = '1.0.0', notes = '', dryRun =
     const hit = skills.find((s) => s.id === id);
     const item = {
       id, name: meta.name || id, summary: meta.summary || '',
-      author: meta.author || '白光', version: ver,
+      // 🔴 2026-10-30 修：不能兜底成作者昵称
+      //
+      // 原来写死 '白光'，别人发布技能时若没填 author，就会被冒名成作者。
+      // 与插件市场 2026-10-25 修的是同一类问题（那时改成了「未署名」）。
+      author: meta.author || '未署名', version: ver,
       download, updatedAt: new Date().toISOString()
     };
     if (hit) Object.assign(hit, item); else skills.push(item);
@@ -396,7 +400,7 @@ export async function installSkill(id, { overwrite = false } = {}) {
   let raw;
   try {
     const res = await fetch(item.download, {
-      headers: { 'User-Agent': 'QQAgent-SkillMarket/1.0' },
+      headers: { 'User-Agent': 'WhaleBridge-SkillMarket/1.0' },
       signal: AbortSignal.timeout(60000)
     });
     if (!res.ok) return { ok: false, error: `下载失败 HTTP ${res.status}` };

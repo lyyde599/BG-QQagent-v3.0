@@ -135,14 +135,33 @@ export function formatStickerList(entries, query = '', limit = 48) {
 export function buildStickerContext(entries, max = 10) {
   const list = (Array.isArray(entries) ? entries : []).map(normalizeStickerEntry).filter(Boolean);
   if (!list.length) return '';
+  // 🔴 2026-10-30 缓存优化 P3：不再按 useCount 排序、不再输出「用过 N 次」
+  //
+  // 原来：按使用次数排序 + 每条带「（用过 N 次）」。
+  // 结果每用一次表情，提示词这一段就变一次 —— 尾部缓存失效。
+  //
+  // 现在：
+  //   · 排序键改成「是否常用」的**布尔阈值**（用过 ≥3 次就算常用），
+  //     这样常用/不常用的相对顺序稳定，不会因为 5 次变 6 次而重排
+  //   · 输出里去掉具体次数，只保留稳定的标签/备注
+  //
+  // 代价：模型看不到「哪个用得最多」，但本来也只是参考，不影响选表情。
+  const POPULAR_AT = 3;
   const top = [...list]
-    .sort((a, b) => (b.useCount || 0) - (a.useCount || 0) || ((b.desc || b.localNote) ? 1 : 0) - ((a.desc || a.localNote) ? 1 : 0))
+    .sort((a, b) => {
+      const pa = (a.useCount || 0) >= POPULAR_AT ? 1 : 0;
+      const pb = (b.useCount || 0) >= POPULAR_AT ? 1 : 0;
+      if (pa !== pb) return pb - pa;                      // 常用的排前面
+      const da = (a.desc || a.localNote) ? 1 : 0;
+      const db = (b.desc || b.localNote) ? 1 : 0;
+      if (da !== db) return db - da;                      // 有备注的优先
+      return String(a.id || a.key || '').localeCompare(String(b.id || b.key || ''));  // 其余按 id 稳定排序
+    })
     .slice(0, Math.max(1, Math.min(30, Number(max) || 10)));
   const lines = top.map((e) => {
     const label = e.desc || e.localNote || '（无备注，可先看图）';
     const extra = e.tags?.length ? ` [${e.tags.join('/')}]` : '';
-    const used = e.useCount ? `（用过${e.useCount}次）` : '';
-    return `- ${label}${extra}${used}`;
+    return `- ${label}${extra}`;
   });
   return `【可用表情包】你的 QQ 收藏表情里有 ${list.length} 个表情（以下为常用/有备注的 ${top.length} 个，完整列表可用 list_stickers 查询）：\n${lines.join('\n')}`;
 }

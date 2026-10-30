@@ -31,3 +31,9 @@ data/plugins/*/quota.json
 /manifest.json
 /index.js
 /ui.js
+
+# 运行产物：AI 生成的图片、临时工作文件（2026-10-30 补）
+# 实测这些会累积成大文件（单张图 4MB），推上去拖慢克隆
+workspace/*.png
+workspace/*.jpg
+workspace/*.webp

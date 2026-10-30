@@ -87,7 +87,7 @@ const BUILTIN_SKILLS = [
     name: '插件开发规范',
     summary: 'manifest 字段、权限分组、ctx 能力、打包发布与常见坑',
     when: '主人要求新增/修改插件，或问"插件怎么写"时',
-    author: '白光',
+    author: '内置',
     // 内容不内联：指向仓库里的文档，避免同一份规范维护两处
     file: '插件与Skill制作及使用规范.md'
   },
@@ -96,7 +96,7 @@ const BUILTIN_SKILLS = [
     name: 'Skill 编写规范',
     summary: 'frontmatter 怎么写、when 怎么描述、什么样的知识适合做成 skill',
     when: '主人要求新增/修改 skill，或问"skill 怎么写"时',
-    author: '白光',
+    author: '内置',
     body: `# Skill 编写规范
 
 ## 什么是 skill
@@ -110,7 +110,7 @@ const BUILTIN_SKILLS = [
 name: 技能名（必填，缺了会退回文件名）
 summary: 一句话说清这个技能是干什么的（必填）
 when: 什么时候该读它（越具体越好）
-author: 白光
+author: 内置
 version: 1.0.0
 license: MIT
 ---
@@ -287,7 +287,13 @@ export function getSkillBody(id) {
  * 没有 skill 时返回空串，调用方据此跳过插入。
  */
 export function buildSkillIndex() {
-  const skills = listSkills();
+  // 稳定排序（2026-10-30，缓存优化 P2）
+  //
+  // listSkills 返回的是 Map 插入序，装/卸技能或加载顺序变化时会变。
+  // 技能索引在提示词里属于前缀的一部分 —— 顺序一变前缀就失效。
+  // 按 id 排序后，只要集合没变，顺序固定。
+  const skills = listSkills().slice()
+    .sort((a, b) => String(a?.id || '').localeCompare(String(b?.id || '')));
   if (!skills.length) return '';
   const lines = skills.map((s) => {
     const when = s.when ? ` ｜ 何时用：${s.when}` : '';

@@ -27,7 +27,8 @@ const SCRIPT = path.join(HERE, 'mail', 'send_mail.py');
 //   ② <项目根>/.secrets/smtp        —— 部署时把凭据放这里
 //   ③ ~/.secrets/smtp               —— 本机开发时的位置
 const SECRET_DIR = (() => {
-  if (process.env.QQAGENT_SECRETS_DIR) return path.join(process.env.QQAGENT_SECRETS_DIR, 'smtp');
+  const secretsDir = process.env.WB_SECRETS_DIR || process.env.QQAGENT_SECRETS_DIR;
+  if (secretsDir) return path.join(secretsDir, 'smtp');
   const cands = [
     path.join(HERE, '..', '..', '.secrets', 'smtp'),
     path.join(os.homedir(), '.secrets', 'smtp')

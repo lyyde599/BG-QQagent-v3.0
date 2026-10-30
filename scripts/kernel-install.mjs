@@ -56,7 +56,7 @@ const ROOT = process.env.KERNEL_ROOT
 // 为什么放在脚本最前面：必须在任何 systemctl stop 之前完成。
 //
 // 用环境变量 QQAGENT_INSTALLER_DETACHED 防无限递归。
-if (process.env.INVOCATION_ID && !process.env.QQAGENT_INSTALLER_DETACHED) {
+if (process.env.INVOCATION_ID && !process.env.QQAGENT_INSTALLER_DETACHED && !process.env.WB_INSTALLER_DETACHED) {
   const self = fileURLToPath(import.meta.url);
   const logFile = path.join(ROOT, 'data', 'kernel-updates', 'install.log');
   try {
@@ -74,6 +74,7 @@ if (process.env.INVOCATION_ID && !process.env.QQAGENT_INSTALLER_DETACHED) {
       `--property=StandardOutput=append:${logFile}`,
       `--property=StandardError=append:${logFile}`,
       '--setenv=QQAGENT_INSTALLER_DETACHED=1',
+      '--setenv=WB_INSTALLER_DETACHED=1',
       `--setenv=KERNEL_ROOT=${ROOT}`,
       process.execPath, self, ...process.argv.slice(2)
     ];
@@ -162,8 +163,9 @@ function detectUnit() {
   unitResolved = true;
 
   // ① 显式指定最优先
-  if (process.env.QQ_AGENT_UNIT) {
-    UNIT = String(process.env.QQ_AGENT_UNIT).replace(/\.service$/, '');
+  const _unitEnv = process.env.WB_UNIT || process.env.QQ_AGENT_UNIT;
+  if (_unitEnv) {
+    UNIT = String(_unitEnv).replace(/\.service$/, '');
     return UNIT;
   }
 
@@ -205,10 +207,12 @@ function detectUnit() {
 
   // ④ 兜底：常见的几个名字
   //
-  // 顺序按"版本从新到旧"排（2026-10-28 补）：
-  // 3.0 起改名 BG-QQagent-Linux，老的 qq-agent-v2 仍然保留在列表里 ——
-  // 老用户升级后目录名变了但服务名可能还是旧的，两个都得能认出来。
-  for (const n of ['BG-QQagent-Linux', 'qq-agent-v3', 'qq-agent-v2', 'qq-agent', 'bg-qqagent']) {
+  // 顺序按"版本从新到旧"排：
+  //   3.3 起改名 whalebridge（2026-10-30）
+  //   3.0 曾用 BG-QQagent-Linux
+  //   2.x 用 qq-agent-v2 / qq-agent
+  // 老用户升级后目录名变了但服务名可能还是旧的，全都得能认出来。
+  for (const n of ['whalebridge', 'BG-QQagent-Linux', 'qq-agent-v3', 'qq-agent-v2', 'qq-agent', 'bg-qqagent']) {
     const s = spawnSync('systemctl', ['show', n, '-p', 'LoadState', '--value'], { encoding: 'utf8', timeout: 10000 });
     if (String(s.stdout || '').trim() === 'loaded') return (UNIT = n);
   }

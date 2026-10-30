@@ -1,7 +1,7 @@
 {
   "id": "plugin-market",
   "name": "鲸界Bridge 创造营",
-  "version": "1.13.3",
+  "version": "1.13.5",
   "apiVersion": 1,
   "description": "鲸界Bridge 创造营：装插件、发技能。支持作者注册（邮箱验证码走中心服务）、插件打包发布下架卸载、版本自动检查与覆盖更新、Skill 发布管理。核心功能，不可停用。",
   "author": "白光",

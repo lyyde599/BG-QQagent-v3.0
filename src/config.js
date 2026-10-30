@@ -6,8 +6,30 @@ import { PERSONAS } from './personas.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..');
-// 测试/便携场景可重定向数据目录
-export const DATA_DIR = process.env.QQ_AGENT_DATA_DIR || path.join(ROOT, 'data');
+
+/**
+ * 读环境变量，新旧前缀都认（2026-10-30 改名鲸界Bridge）
+ *
+ * 项目原名 QQAgent，环境变量前缀是 QQ_AGENT_* / QQAGENT_*。
+ * 改名后新前缀是 WB_*，但**旧的必须继续有效** ——
+ * 老用户的 systemd 单元、启动脚本、docker-compose 里都写着旧名，
+ * 直接换掉会让他们的部署起不来。
+ *
+ * 优先级：WB_XXX  >  QQ_AGENT_XXX  >  QQAGENT_XXX
+ * （新名优先，但旧名永不失效）
+ *
+ * @param {string} name 不带前缀的名字，如 'DATA_DIR'
+ * @param {string} [fallback]
+ */
+export function envAny(name, fallback = undefined) {
+  const v = process.env['WB_' + name]
+    ?? process.env['QQ_AGENT_' + name]
+    ?? process.env['QQAGENT_' + name];
+  return v === undefined || v === '' ? fallback : v;
+}
+
+// 测试/便携场景可重定向数据目录（新旧前缀都认）
+export const DATA_DIR = envAny('DATA_DIR', path.join(ROOT, 'data'));
 export const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
 export const DEFAULT_CONFIG = {
@@ -67,7 +89,13 @@ export const DEFAULT_CONFIG = {
     selfNickname: '',                       // 在群里的展示名（留空用 QQ 昵称）
     roleText: PERSONAS.xiaojingyu.text,     // 默认人设：原版"小鲸鱼"角色卡（适配版）
     participation: 'medium',                // low | medium | high —— 参与度参考
-    customRules: ''                         // 追加自定义规则（可选）
+    customRules: '',                        // 追加自定义规则（可选）
+    // 主人专属关系段（2026-10-30）
+    //
+    // 之前内核里硬编码了一份作者本人的关系设定（谁造的你、怎么称呼、
+    // 你在他面前是什么位置），随核心包分发给所有人 —— 已移除。
+    // 现在由使用者自己写，留空则不注入。
+    masterBond: ''
   },
   // 用户自定义人设库（保存在配置里，可在设置页添加/选择）
   customPersonas: [],
@@ -183,6 +211,14 @@ export const DEFAULT_CONFIG = {
   // autoDownload：查到新版自动下载并校验（**不安装**）
   // 真正的替换永远由人手动做 —— 见 src/kernel-update.js 顶部的说明。
   kernelUpdate: {
+    // 内核作者归属（2026-10-30）
+    //
+    // 判定「谁能发布内核更新」。原来写死在 src/app.js 里（作者昵称 + QQ 号），
+    // 随核心包分发就等于把作者身份公开了。现在配置化：
+    //   · 留空 → 只有创造营 admin 角色能发
+    //   · 填了 → 昵称或 QQ 匹配即可
+    publisherNickname: '',
+    publisherQQ: '',
     autoCheck: true,
     checkIntervalHours: 24,
     autoDownload: false,
@@ -328,8 +364,13 @@ let saveTimers = new Map();
 //   ③ 不写进任何一个 Tab 的首屏，用户不主动看就看不到
 //
 // 想改群号/群名只需要动这里一处。
+//
+// 2026-10-30：项目更名「鲸界Bridge」。
+// 为避免与腾讯产生不必要的误会，原名中的 QQagent 字样逐步退出，
+// 但**仓库地址保持不变**（GitHub/Gitee 仍是 BG-QQagent-v3.0，
+// 改名迁移成本高于收益，且地址变更会打断已发布的下载链接）。
 export const COMMUNITY = {
-  name: '白光AI技术交流群',
+  name: '白光AI技术交流群（鲸界Bridge-Linux）',
   number: '1127063335',
   intro: '插件开发、部署踩坑、模型接入，都在这里聊',
   // 加群链接：QQ 群的分享链接，手机点开可直接跳转

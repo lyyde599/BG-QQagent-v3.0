@@ -49,8 +49,8 @@ async function resolveDshBase() {
 // 用户："我创建了一个《鱼鱼的工作目录》，以后她的外包对话全部放到这里"
 // 原来散在项目里的 dsh-work/，用户看不到她干了什么。
 // 现在统一放到 /home/lyy/鱼鱼的工作目录/，她自己也能在里面按任务建子目录。
-const YUYU_DIR = process.env.QQ_AGENT_YUYU_DIR || '/home/lyy/鱼鱼的工作目录';
-const WORK_ROOT = process.env.QQ_AGENT_WORK_ROOT || YUYU_DIR;
+const YUYU_DIR = process.env.WB_YUYU_DIR || process.env.QQ_AGENT_YUYU_DIR || '/home/lyy/鱼鱼的工作目录';
+const WORK_ROOT = process.env.WB_WORK_ROOT || process.env.QQ_AGENT_WORK_ROOT || YUYU_DIR;
 const WORKSPACE_DIR = path.join(ROOT, 'workspace');
 
 let rpcSeq = 1;

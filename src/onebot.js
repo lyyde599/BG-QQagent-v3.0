@@ -303,9 +303,9 @@ export async function segmentsToText(segments, { resolveReply = null, resolveAtN
           try { name = resolveAtName ? await resolveAtName(String(d.qq)) : null; } catch { name = null; }
           // 🔴 @ 文本必须带 QQ 号（2026-10-28 修）
           //
-          // 事故：机器人有自己的群名片「鲸界魔王-白光-小鱼」，
+          // 事故：机器人有自己的群名片（形如「某某-主人名-小鱼」），
           // 但身份块告诉模型"你的名字是小鲸鱼"。别人 @ 它时，
-          // 渲染出来是「@鲸界魔王-白光-小鱼」——名字对不上，
+          // 渲染出来是「@某名片-主人名-小鱼」——名字对不上，
           // 模型判定"@ 的不是我"，该回的不回。
           //
           // 带上号后，模型能直接比对：@xxx#3170037984 里那个号就是自己。

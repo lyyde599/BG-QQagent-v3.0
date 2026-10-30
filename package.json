@@ -1,8 +1,8 @@
 {
-  "name": "jingjie-bridge",
-  "version": "3.2.10",
+  "name": "whalebridge",
+  "version": "3.3.2",
   "private": true,
-  "description": "Standalone QQ agent desktop app: event-driven stateless agent runs over an OpenAI-compatible API, with a session-style UI. Decoupled from DeepSeek Harness.",
+  "description": "鲸界Bridge —— 可扩展的 QQ 群机器人框架",
   "type": "module",
   "main": "electron/main.js",
   "engines": {
@@ -26,5 +26,6 @@
   },
   "devDependencies": {
     "electron": "^33.2.0"
-  }
+  },
+  "homepage": "https://market.baiguang211.top"
 }

@@ -254,11 +254,22 @@ export function upsertProvider({ baseUrl, apiKey, models = [] }) {
 }
 
 /** 给指定提供商追加模型（合并 modelNames）。 */
-export function addModelsToProvider(providerId, models = []) {
+/**
+ * 往提供商里加模型。
+ *
+ * @param {string} providerId
+ * @param {Array} models
+ * @param {string} [apiKey] 可选：同时更新该提供商的 Key
+ *   （2026-10-29 加）用户在同一端点换了把新 Key 时，「加入列表」
+ *   原本只写模型、不写 Key，于是新 Key 永远存不进去 —— 点模型又连回旧的。
+ */
+export function addModelsToProvider(providerId, models = [], apiKey = undefined) {
   const entries = normalizeModelInput(models);
   const providers = currentProviders().map((p) => ({ ...p, models: [...(p.models || [])] }));
   const p = providers.find((x) => x.id === providerId);
   if (!p) return null;
+  // 显式传了非空 apiKey 才更新，传 undefined/空串保持原样（防误清）
+  if (typeof apiKey === 'string' && apiKey.trim()) p.apiKey = apiKey.trim();
   p.modelNames = { ...(p.modelNames || {}) };
   for (const m of entries) {
     if (!p.models.includes(m.id)) p.models.push(m.id);

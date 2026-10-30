@@ -91,7 +91,7 @@ function archiveUrl(host, owner, repo, branch) {
 async function fetchText(url, timeout = 20000) {
   try {
     const res = await fetch(url, {
-      headers: { 'User-Agent': 'QQAgent-Market/1.0' },
+      headers: { 'User-Agent': 'WhaleBridge-Market/1.0' },
       signal: AbortSignal.timeout(timeout)
     });
     if (!res.ok) return null;
@@ -212,7 +212,7 @@ export async function downloadRepoPackage(input, { branch = '' } = {}) {
   let res;
   try {
     res = await fetch(url, {
-      headers: { 'User-Agent': 'QQAgent-Market/1.0' },
+      headers: { 'User-Agent': 'WhaleBridge-Market/1.0' },
       signal: AbortSignal.timeout(120000),
       redirect: 'follow'
     });
