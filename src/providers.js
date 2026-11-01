@@ -293,6 +293,26 @@ export function removeModelFromProvider(providerId, modelId) {
   return p;
 }
 
+/**
+ * 删除整个提供商（2026-10-31 补）。
+ *
+ * 原来只能删模型、不能删提供商 —— 用户试了几个端点后，目录里
+ * 会堆一堆废条目，只能手改 config.json。
+ *
+ * @param {string} providerId
+ * @returns {object|null} 被删掉的提供商；找不到返回 null
+ */
+export function removeProvider(providerId) {
+  const id = String(providerId || '').trim();
+  if (!id) return null;
+  const all = currentProviders();
+  const p = all.find((x) => x.id === id);
+  if (!p) return null;
+  const providers = all.filter((x) => x.id !== id);
+  updateConfig({ providers });
+  return p;
+}
+
 // ── 连通性测试：GET {baseURL}/models（OpenAI 兼容探测） ────────────────────
 
 /**

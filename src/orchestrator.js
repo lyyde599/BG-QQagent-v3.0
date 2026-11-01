@@ -668,6 +668,10 @@ export class Orchestrator {
     const toolDefs = [...this.toolDefs, ...pluginTools].filter((d) => {
       if (!gatedVision && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
       if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
+      // 文件接收开关（2026-10-31）：关掉后模型看不到这两个工具，
+      // 不会去尝试下载 —— 下载常失败、取下来也没用的场景直接省掉
+      if (cfg.features?.fileReceive === false
+          && (d.name === 'receive_file' || d.name === 'fetch_file')) return false;
       // 主人专属工具：仅主人触发时挂载（群友/他人触发时模型看不到这些工具）
       if (d.masterOnly && !isMaster) return false;
       // 工具自带可用性判定（插件可用它做细粒度开关，如 teacher_control 的双开关）。
@@ -975,7 +979,50 @@ export class Orchestrator {
     if (String(ctx.chatKey || '').startsWith('private:')) {
       this.log?.(`[私聊兜底] chatKey=${ctx.chatKey} status=${status} sent=${session.sent.length} error=${session.error ? 'yes' : 'no'}`);
     }
-    if (!session.error && status === 'noreply' && String(ctx.chatKey || '').startsWith('private:')) {
+    // 群聊补发条件（2026-10-31）：**只在被明确点名时**
+    //
+    // 用户反馈："思考里说要回复，实际没回复"。
+    // 查证：模型把回复写在 content 里、没调 send_message，整轮零发送 → noreply。
+    //       私聊有兜底，群聊没有，所以这条回复就丢了。
+    //
+    // 为什么群聊不能无条件兜底：群里允许潜水，"不发"很多时候是正确选择。
+    // 判据 —— 只有下列情况才补发：
+    //   ① 本轮触发消息里明确 @ 了我，或引用了我
+    //   ② 或者模型自己在 content 里写了明显是回复的话（由下面的 looksLikeMonologue 把关）
+    const isPrivate = String(ctx.chatKey || '').startsWith('private:');
+    let groupAddressed = false;
+    if (!isPrivate) {
+      try {
+        const selfId = String(this.onebot?.selfId || '');
+        const trg = Array.isArray(ctx.triggerEntries) ? ctx.triggerEntries : [];
+        groupAddressed = trg.some((m) => {
+          const txt = String(m?.text || '');
+          // 文本里的 @我 / 引用我（store 把 at 段渲染成 [at]/[reply] 文本）
+          if (selfId && new RegExp(`@[^#\\s]*#${selfId}\\b`).test(txt)) return true;
+          if (selfId && new RegExp(`\\[引用[^\\]]*#${selfId}\\b`).test(txt)) return true;
+          // 主动机会 / 主人发言也算"该有反应"
+          if (m?.self) return false;
+          return false;
+        });
+      } catch { /* 判定失败就当没点名，不补发 */ }
+    }
+
+    // 私聊必回开关（2026-10-31）
+    //
+    // 默认 true = 保持原行为（私聊一定回）。
+    // 关掉之后私聊和群聊一个待遇：模型不说话就不发。
+    // 适用场景：有人用私聊做纯工具调用 / 不想被"必回"打扰 / 省 token。
+    const privateMustReply = getConfig().features?.privateMustReply !== false;
+    const shouldRetry = !session.error && status === 'noreply'
+      && ((isPrivate && privateMustReply) || groupAddressed);
+    if (status === 'noreply') {
+      const why = isPrivate
+        ? (privateMustReply ? '私聊(必回开启)' : '私聊(必回已关闭)')
+        : '群聊';
+      this.log?.(`[补发判定] ${why} | 被点名=${groupAddressed} | 将${shouldRetry ? '' : '不'}尝试补发`);
+    }
+
+    if (shouldRetry) {
       // 私聊必回：不限 masterQQ —— 任何人私聊都该有回复
       {
         let retried = 0;
@@ -993,7 +1040,9 @@ export class Orchestrator {
                 isMaster: true,
                 masterQQ: String(getConfig().persona?.masterQQ || '')
               }) },
-              { role: 'user', content: '【系统提醒】你刚才收到主人的私聊消息，但没有给出任何回复就结束了。私聊规则：主人私聊你时必须回复，不能不吭声。请立即补上回复：如果刚才在查资料/思考，现在把结论发给主人（用 send_message）；如果没什么可说的，也至少要回一句简短的回应（比如"收到~刚在查，马上给你说"）。' }
+              { role: 'user', content: isPrivate
+                ? '【系统提醒】你刚才收到主人的私聊消息，但没有给出任何回复就结束了。私聊规则：主人私聊你时必须回复，不能不吭声。请立即补上回复：如果刚才在查资料/思考，现在把结论发给主人（用 send_message）；如果没什么可说的，也至少要回一句简短的回应（比如"收到~刚在查，马上给你说"）。'
+                : '【系统提醒】群里有人 @ 了你（或引用你的话）在找你，但你这轮没有发出任何消息就结束了。被点名的消息必须回应，不能当作没看见。请立即用 send_message 把回复发出去：如果你刚才已经想好了要说什么（哪怕只写在思考里），现在把它发出来；如果确实没什么可回，也发一句最简短的（比如"在"）。' }
             ];
             const { chatCompletion } = await import('./llm.js');
             // 🔴 重试必须**带工具**，并要求模型调 send_message（2026-10-21）

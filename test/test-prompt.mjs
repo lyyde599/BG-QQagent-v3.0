@@ -1,9 +1,35 @@
 // 提示词组装的单元自测：验证"零历史"成本模型的关键性质。
+//
+// 🔴 2026-10-31 修：这个测试原来会**污染线上数据目录**。
+//
+//    ChatStore / MemoryStore 默认写到 DATA_DIR（也就是线上 data/），
+//    于是每跑一次测试，就在 data/messages/group_123.json 和
+//    data/memory/group_123.json 里造 100 条假消息与假记忆。
+//
+//    后果不只是"文件脏了" —— 机器人会把 group:123 当成真实会话，
+//    定时任务对着一个不存在的群发言，OneBot 返回 retcode 110，
+//    后台还显示"被移出群 123"。群友实际踩到过。
+//
+//    修法：**先**把数据目录指到临时目录，**再**动态 import 业务模块。
+//    顺序不能反 —— DATA_DIR 是 config.js 在模块加载时读的，
+//    静态 import 会提前执行，那时 env 还没设。
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import assert from 'node:assert';
-import { ChatStore } from '../src/store.js';
-import { MemoryStore } from '../src/memory.js';
-import { buildSystemPrompt, buildUserPrompt, buildPastState } from '../src/prompt.js';
-import { setRuntimeConfig, DEFAULT_CONFIG } from '../src/config.js';
+
+const TMP_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-test-prompt-'));
+process.env.WB_DATA_DIR = TMP_DATA;
+process.env.QQ_AGENT_DATA_DIR = TMP_DATA;   // 兼容旧前缀
+process.on('exit', () => {
+  try { fs.rmSync(TMP_DATA, { recursive: true, force: true }); } catch { /* 忽略 */ }
+});
+
+// 必须在设完 env 之后再导入（动态 import 才会延后执行）
+const { ChatStore } = await import('../src/store.js');
+const { MemoryStore } = await import('../src/memory.js');
+const { buildSystemPrompt, buildUserPrompt, buildPastState } = await import('../src/prompt.js');
+const { setRuntimeConfig, DEFAULT_CONFIG } = await import('../src/config.js');
 
 // 注入测试配置
 const cfg = structuredClone(DEFAULT_CONFIG);

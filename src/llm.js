@@ -14,10 +14,10 @@ function authHeaders(apiKey) {
  * 单次对话请求。messages 为 OpenAI 格式；tools 为 OpenAI function 格式（可为空）。
  * 返回 { message, usage, raw }；usage 形如 { prompt_tokens, completion_tokens, total_tokens }。
  */
-export async function chatCompletion({ messages, tools = null, toolChoice = 'auto', temperature = null, signal = null }) {
+async function chatOnce(ep, { messages, tools = null, toolChoice = 'auto', temperature = null, signal = null }) {
   const cfg = getConfig().api;
   const body = {
-    model: cfg.model,
+    model: ep.model || cfg.model,
     messages,
     stream: false
   };
@@ -45,9 +45,9 @@ export async function chatCompletion({ messages, tools = null, toolChoice = 'aut
 
   let res;
   try {
-    res = await fetch(joinUrl(cfg.baseUrl, '/chat/completions'), {
+    res = await fetch(joinUrl(ep.baseUrl, '/chat/completions'), {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...authHeaders(cfg.apiKey) },
+      headers: { 'content-type': 'application/json', ...authHeaders(ep.apiKey) },
       body: JSON.stringify(body),
       signal: controller.signal
     });
@@ -69,9 +69,100 @@ export async function chatCompletion({ messages, tools = null, toolChoice = 'aut
     message: choice.message ?? {},
     finishReason: choice.finish_reason ?? null,
     usage: data.usage ?? null,
-    model: data.model ?? cfg.model,
+    model: data.model ?? ep.model ?? cfg.model,
     raw: data
   };
+}
+
+/**
+ * 端点候选列表（2026-10-30）
+ *
+ * 顺序：主配置（baseUrl/apiKey）→ api.endpoints[] 里的备用端点。
+ * 主配置永远参与，即使配了备用端点也能兜底。
+ *
+ * @returns {Array<{baseUrl:string, apiKey:string, model:string, label:string}>}
+ */
+function endpointCandidates() {
+  const cfg = getConfig().api;
+  const list = [];
+  // ① 主端点（永远在候选里）
+  if (cfg.baseUrl) {
+    list.push({
+      baseUrl: cfg.baseUrl,
+      apiKey: cfg.apiKey,
+      model: cfg.model,
+      label: '主端点'
+    });
+  }
+  // ② 备用端点
+  for (const [i, ep] of (Array.isArray(cfg.endpoints) ? cfg.endpoints : []).entries()) {
+    const baseUrl = String(ep?.baseUrl || '').trim();
+    if (!baseUrl) continue;   // 空条目跳过（允许只填 1~2 个）
+    list.push({
+      baseUrl,
+      apiKey: String(ep?.apiKey || '').trim(),
+      model: String(ep?.model || '').trim(),
+      label: `备用${i + 1}`
+    });
+  }
+  return list;
+}
+
+/**
+ * 对话请求（带多端点轮询）。
+ *
+ * 行为：
+ *   · 只配主端点 → 与原来完全一致，行为不变
+ *   · 配了备用端点 → 从上次成功的端点开始试，失败就换下一个
+ *   · 全部失败 → 抛出最后一个错误（带每个端点的失败原因）
+ *
+ * 成功的端点会记到 api.activeIndex，下次优先用它 ——
+ * 这样主端点挂掉后，后续请求不再每次都先撞一次失败。
+ */
+export async function chatCompletion({ messages, tools = null, toolChoice = 'auto', temperature = null, signal = null }) {
+  const cfg = getConfig().api;
+  const all = endpointCandidates();
+  if (!all.length) throw new Error('没有配置任何模型端点（api.baseUrl 为空）');
+
+  // 起点：上次成功的端点（找不到就从头）
+  const remembered = Number(cfg.activeIndex);
+  let start = 0;
+  if (Number.isInteger(remembered) && remembered >= 0 && remembered < all.length) {
+    start = remembered;
+  }
+
+  // 轮询顺序：从起点开始绕一圈
+  const order = [];
+  for (let k = 0; k < all.length; k++) order.push((start + k) % all.length);
+
+  const errors = [];
+  for (const idx of order) {
+    const ep = all[idx];
+    try {
+      const result = await chatOnce(ep, { messages, tools, toolChoice, temperature, signal });
+      // 成功 → 记住这个端点（只在变了的时候写盘，省一次 IO）
+      if (Number(cfg.activeIndex) !== idx) {
+        try {
+          const { updateConfig } = await import('./config.js');
+          updateConfig({ api: { activeIndex: idx } });
+        } catch { /* 记不住不影响本次请求 */ }
+      }
+      if (errors.length) {
+        result.__failover = { switched: true, failed: errors.map((e) => `${e.label}: ${e.msg}`) };
+      }
+      return result;
+    } catch (e) {
+      // 用户主动中止 / 超时不再换端点（换也没意义）
+      if (e?.name === 'AbortError' || /aborted/i.test(String(e?.message))) throw e;
+      errors.push({ label: ep.label, msg: String(e?.message ?? e) });
+    }
+  }
+
+  // 全部失败
+  const detail = errors.map((e) => `  · ${e.label}：${e.msg}`).join('\n');
+  const err = new Error(`所有模型端点都不可用（共 ${all.length} 个）：\n${detail}`);
+  err.failover = errors;
+  throw err;
 }
 
 /** 获取模型列表（GET /models）。返回 [{ id }]；失败抛错。 */

@@ -855,22 +855,60 @@ export async function checkAllWithSnowluma() {
         napcat: p.napcat, qq: p.qq, note: p.note, verifiedAt: p.verifiedAt
       }))
     },
-    snowluma: {
-      installed: slInstalled,
-      local: localSl,
-      latest: sl.ok ? sl.latest : null,
-      error: sl.ok ? null : sl.error,
-      needInstall: !slInstalled,
-      needUpdate: slInstalled && sl.ok && cmpVersion(sl.latest, localSl) > 0,
-      url: sl.url || '',
-      size: sl.size || 0,
-      variant: sl.variant || '',
-      notes: sl.notes || '',
-      publishedAt: sl.publishedAt || '',
-      // 备用通道的运行信息
-      home: snowlumaHome(),
-      webuiPort: 5099,
-    },
+    snowluma: await (async () => {
+      // ── Docker 部署支持（2026-11-01，P3）──
+      //
+      // 群友反馈：Docker 跑 SnowLuma 时，版本页显示「当前 未安装」+「安装 2.3.2」，
+      // 点安装等于又装一份原生的，跟容器冲突。
+      //
+      // 这里补容器探测：容器在就用容器的状态与镜像版本，
+      // 并且**不再给安装按钮**（needInstall=false）。
+      const ctnExists = await containerExists('snowluma');
+      const ctnRunning = ctnExists ? await isContainerRunning('snowluma') : false;
+      let image = '';
+      let imageVer = '';
+      if (ctnExists) {
+        try {
+          image = await new Promise((resolve) => {
+            const p = spawn('docker', ['inspect', '-f', '{{.Config.Image}}', 'snowluma'],
+              { stdio: ['ignore', 'pipe', 'ignore'] });
+            let out = '';
+            p.stdout?.on('data', (d) => { out += String(d); });
+            p.on('error', () => resolve(''));
+            p.on('close', () => resolve(out.trim()));
+          });
+          // 镜像 tag 里通常带版本号（如 snowluma:v2.2.0）
+          const m = String(image).match(/[vV]?(\d+\.\d+\.\d+)/);
+          if (m) imageVer = m[1];
+        } catch { /* 忽略 */ }
+      }
+      const isDocker = !slInstalled && ctnExists;
+
+      return {
+        installed: slInstalled || ctnExists,
+        deploy: isDocker ? 'docker' : (slInstalled ? 'native' : 'none'),
+        docker: isDocker ? {
+          container: 'snowluma', running: ctnRunning, image, imageVersion: imageVer
+        } : null,
+        local: isDocker ? (imageVer || 'Docker') : localSl,
+        latest: sl.ok ? sl.latest : null,
+        error: sl.ok ? null : sl.error,
+        // Docker 部署不给安装/更新按钮 —— 该用 docker pull 换镜像
+        needInstall: !slInstalled && !ctnExists,
+        needUpdate: !isDocker && slInstalled && sl.ok && cmpVersion(sl.latest, localSl) > 0,
+        hint: isDocker
+          ? `Docker 部署（容器 snowluma${imageVer ? `，镜像含 ${imageVer}` : ''}）：升级请用 docker pull 换镜像，不要在这里装原生版`
+          : '',
+        url: sl.url || '',
+        size: sl.size || 0,
+        variant: sl.variant || '',
+        notes: sl.notes || '',
+        publishedAt: sl.publishedAt || '',
+        // 备用通道的运行信息
+        home: snowlumaHome(),
+        webuiPort: 5099,
+      };
+    })(),
   };
 }
 
@@ -889,6 +927,8 @@ export const BACKENDS = {
   napcat: {
     label: 'NapCat',
     service: 'napcat-qq',
+    // Docker 部署时容器名（2026-10-31）—— systemd 查不到就查它
+    container: 'napcat',
     wsUrl: 'ws://127.0.0.1:3001',
     httpUrl: 'http://127.0.0.1:3000',
     home: () => napcatRoot(),
@@ -897,6 +937,7 @@ export const BACKENDS = {
   snowluma: {
     label: 'SnowLuma',
     service: 'snowluma',
+    container: 'snowluma',
     wsUrl: 'ws://127.0.0.1:3011',
     httpUrl: 'http://127.0.0.1:3010',
     home: () => snowlumaHome(),
@@ -904,12 +945,121 @@ export const BACKENDS = {
   },
 };
 
-/** 当前用的是哪条通道（按 wsUrl 反查，认不出就返回空） */
+/**
+ * 当前用的是哪条通道。
+ *
+ * 🔴 2026-10-31 修：不能只靠端口号判断。
+ *
+ * 群友反馈（Docker + SnowLuma）：把 SnowLuma 映射到 3001 端口后，
+ * 面板把他当成了 NapCat —— 接着去查 napcat 的 systemd 服务，
+ * 发现没跑，就判「机器人现在是断的」。实际机器人一直在线。
+ *
+ * 更危险的是那个「启动它」按钮：它会 systemctl start napcat，
+ * Docker + 原生混装时可能抢占同一个 QQ 号，把正在跑的容器顶掉。
+ *
+ * 现在的判定顺序：
+ *   ① 配置里显式指定 channel（napcat/snowluma）—— 用户说了算
+ *   ② wsUrl 能对上一个通道的默认端口 → 用它
+ *      但如果两个通道都认得出（Docker 常见），优先选**容器/服务真在跑**的那个
+ *   ③ 实在认不出 → 返回 ''，由调用方结合探活结果决定
+ */
 export function currentBackend(cfgSnowluma) {
+  // ① 显式配置优先
+  const explicit = String(cfgSnowluma?.channel || '').trim().toLowerCase();
+  if (explicit === 'napcat' || explicit === 'snowluma') return explicit;
+
   const ws = String(cfgSnowluma?.wsUrl || '');
-  if (ws.includes(':3011')) return 'snowluma';
-  if (ws.includes(':3001')) return 'napcat';
+  const httpUrl = String(cfgSnowluma?.httpUrl || '');
+
+  // ② 端口反查（含 httpUrl，Docker 场景两个端口常交叉映射）
+  const looksNapcat = ws.includes(':3001') || httpUrl.includes(':3000');
+  const looksSnowluma = ws.includes(':3011') || httpUrl.includes(':3010');
+  if (looksNapcat && !looksSnowluma) return 'napcat';
+  if (looksSnowluma && !looksNapcat) return 'snowluma';
+  if (looksNapcat && looksSnowluma) {
+    // 两个都像 → 让调用方（异步）用容器/服务状态裁决；
+    // 同步函数里先给 napcat（历史默认），异步版会纠正
+    return 'napcat';
+  }
   return '';
+}
+
+/** 通道候选（两个都像时，异步裁决用） */
+export function backendAmbiguous(cfgSnowluma) {
+  const ws = String(cfgSnowluma?.wsUrl || '');
+  const httpUrl = String(cfgSnowluma?.httpUrl || '');
+  const n = ws.includes(':3001') || httpUrl.includes(':3000');
+  const s = ws.includes(':3011') || httpUrl.includes(':3010');
+  return n && s;
+}
+
+/**
+ * 容器是否在跑（2026-10-31）
+ *
+ * Docker 部署下 systemctl is-active 永远是 inactive，
+ * 光看 systemd 会误判"没运行"。这里补一条容器探测。
+ */
+export async function isContainerRunning(name) {
+  const container = String(name || '').trim();
+  if (!container) return false;
+  return new Promise((resolve) => {
+    const p = spawn('docker', ['inspect', '-f', '{{.State.Running}}', container],
+      { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    p.stdout?.on('data', (d) => { out += String(d); });
+    p.on('error', () => resolve(false));   // 没装 docker 或权限不足
+    p.on('close', () => resolve(out.trim() === 'true'));
+  });
+}
+
+/** 容器是否存在（不管跑没跑） */
+export async function containerExists(name) {
+  const container = String(name || '').trim();
+  if (!container) return false;
+  return new Promise((resolve) => {
+    const p = spawn('docker', ['inspect', '-f', '{{.State.Status}}', container],
+      { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    p.stdout?.on('data', (d) => { out += String(d); });
+    p.on('error', () => resolve(false));
+    p.on('close', () => resolve(out.trim().length > 0));
+  });
+}
+
+/**
+ * OneBot 探活（2026-10-31）—— **这才是机器人是否在线的唯一可靠依据**
+ *
+ * 服务跑没跑、容器在不在，都只是"进程层面"的状态。
+ * 真正的问题是：OneBot 协议接口能不能响应。
+ * Docker 部署、远程部署、反向代理……这些场景下端口是通的就够了。
+ *
+ * @returns {{alive:boolean, userId?:number, nickname?:string, error?:string}}
+ */
+export async function onebotAlive(httpUrl, accessToken) {
+  const base = String(httpUrl || '').trim().replace(/\/+$/, '');
+  if (!base) return { alive: false, error: '未配置 httpUrl' };
+  try {
+    const res = await fetch(`${base}/get_login_info`, {
+      headers: accessToken ? { authorization: `Bearer ${String(accessToken).trim()}` } : {},
+      signal: AbortSignal.timeout(2500)
+    });
+    if (!res.ok) return { alive: false, error: `HTTP ${res.status}` };
+    const j = await res.json().catch(() => null);
+    if (!j) return { alive: false, error: '返回非 JSON' };
+    // OneBot v11 多种返回形态，兼容处理
+    const d = j?.data ?? j;
+    const uid = d?.user_id ?? d?.userId ?? null;
+    if (j?.status === 'failed' || j?.retcode === 100) {
+      return { alive: false, error: String(j?.message || j?.wording || '未登录') };
+    }
+    return {
+      alive: true,
+      userId: uid == null ? null : Number(uid),
+      nickname: String(d?.nickname || d?.nick || '')
+    };
+  } catch (e) {
+    return { alive: false, error: String(e?.message || e).slice(0, 80) };
+  }
 }
 
 /** 异步版：systemctl is-active <name> */
@@ -1005,8 +1155,74 @@ export async function switchBackend(target, { writeConfig, onLog = () => {} } = 
 /** SnowLuma（备用通道）运行状态，供面板展示（2026-10-27） */
 export async function snowlumaAltStatus() {
   const home = snowlumaHome();
-  const installed = isSnowlumaInstalled();
-  if (!installed) return { ok: true, installed: false, running: false, loggedIn: false };
+  const nativeInstalled = isSnowlumaInstalled();
+
+  // ── Docker 部署支持（2026-11-01，P2）──
+  //
+  // 群友反馈：Docker 跑 SnowLuma 时，这块永远显示「读取失败」、
+  // 账号密码一直「读取中…」。
+  //
+  // 根因：整个函数只认原生安装 ——
+  //   · isSnowlumaInstalled() 查的是原生目录，Docker 下必然 false
+  //   · 密码读 ~/.secrets/snowluma/password，Docker 的密码在容器卷里
+  //     而且存的是 passwordHash + salt，**不可逆**，拿不到明文
+  //
+  // 这里改成：Docker 场景返回真实状态 + 明确原因，不再假装能自动登录。
+  const ctnRunning = await isContainerRunning('snowluma');
+  const ctnExists = await containerExists('snowluma');
+  const isDocker = !nativeInstalled && ctnExists;
+
+  if (!nativeInstalled && !ctnExists) {
+    return {
+      ok: true, installed: false, running: false, loggedIn: false,
+      deploy: 'none',
+      reason: '未安装 SnowLuma（原生和 Docker 都没找到）'
+    };
+  }
+
+  if (isDocker) {
+    // Docker：能看状态，但密码拿不到（哈希不可逆），不假装能自动登录
+    let image = '';
+    try {
+      image = await new Promise((resolve) => {
+        const p = spawn('docker', ['inspect', '-f', '{{.Config.Image}}', 'snowluma'],
+          { stdio: ['ignore', 'pipe', 'ignore'] });
+        let out = '';
+        p.stdout?.on('data', (d) => { out += String(d); });
+        p.on('error', () => resolve(''));
+        p.on('close', () => resolve(out.trim()));
+      });
+    } catch { /* 忽略 */ }
+
+    // 探一下 WebUI 端口通不通（不通就是没起来）
+    const webuiOk = await (async () => {
+      try {
+        await fetch('http://127.0.0.1:5099/', { signal: AbortSignal.timeout(1500) });
+        return true;
+      } catch { return false; }
+    })();
+
+    return {
+      ok: true,
+      installed: true,
+      deploy: 'docker',
+      running: ctnRunning,
+      enabled: 'unknown',
+      loggedIn: false,
+      uin: '',
+      qqCount: 0,
+      home: '',
+      webui: 'http://127.0.0.1:5099',
+      webuiReachable: webuiOk,
+      image,
+      container: 'snowluma',
+      // 说清楚为什么读不到密码 —— 不是故障，是设计
+      reason: ctnRunning
+        ? 'Docker 部署：WebUI 密码存在容器卷里且是哈希（不可逆），面板无法自动读取'
+        : 'Docker 容器已创建但没在运行',
+      canAutoLogin: false
+    };
+  }
 
   const running = await isServiceActive('snowluma');
   if (!running) {
@@ -1017,7 +1233,11 @@ export async function snowlumaAltStatus() {
       p.on('error', () => resolve('unknown'));
       p.on('close', () => resolve(out.trim() || 'unknown'));
     });
-    return { ok: true, installed: true, running: false, enabled: en, loggedIn: false, home };
+    return {
+      ok: true, installed: true, deploy: 'native', running: false,
+      enabled: en, loggedIn: false, home,
+      reason: '原生安装但服务没在运行'
+    };
   }
 
   // 用 WebUI 的 /api/qq-list 判断有没有登录 QQ
@@ -1065,6 +1285,7 @@ export async function snowlumaAltStatus() {
   return {
     ok: true,
     installed: true,
+    deploy: 'native',
     running: true,
     enabled,
     loggedIn,
@@ -1072,6 +1293,7 @@ export async function snowlumaAltStatus() {
     qqCount,
     home,
     webui: 'http://127.0.0.1:5099',
+    canAutoLogin: true,
   };
 }
 

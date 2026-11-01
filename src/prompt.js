@@ -319,10 +319,6 @@ export function buildSystemPrompt({ persona, extraSections = [], availableTools 
   const parts = [
     `你是「${cfg.botName}」，一个混在 QQ 群里的群友/角色。你的具体人设（自称、口吻、性格）以【角色设定】为准。你的所有行为都通过工具完成，发言要自然像真人。`,
     '',
-    // 主人关系 —— 只对 masterQQ 注入（2026-10-28）
-    // 群友的会话里完全没有这一段，所以不会漏、也不会误触发。
-    (isMaster ? masterBond() : ''),
-    '',
     // 🔴 自己的 QQ 号 —— 判"是不是在说我"的唯一客观依据（2026-10-27）
     (selfId
       ? `【你自己的身份】你的 QQ 号是 **${selfId}**（人设名：${cfg.botName}${selfCard && selfCard !== cfg.botName ? `；群名片：${selfCard}` : ''}）。
@@ -408,15 +404,58 @@ export function buildSystemPrompt({ persona, extraSections = [], availableTools 
       '5. 群聊里有人问就正常介绍；key 和券码**绝不**在群里公开发。'
     );
   }
-  // 插件贡献的提示词段（如福利活动说明、圣杯战争说明）。
-  // 顺序由插件宿主按 priority 排好；这里只按顺序拼，不感知谁写了什么。
-  for (const sec of extraSections) {
-    const t = String(sec || '').trim();
-    if (t) parts.push('', t);
-  }
   if (cfg.customRules && String(cfg.customRules).trim()) {
     parts.push('', '【管理员附加规则】', String(cfg.customRules).trim());
   }
+
+  // 🔴 主人关系段放**最后**（2026-10-31，缓存优化）
+  //
+  // 原来它在第 2 段（紧跟开场白）。但这段**只在主人说话时注入** ——
+  // 主人发言与群友发言交替时，systemPrompt 从第 76 个字符就分叉，
+  // 后面 17k 字符全部缓存失效。实测命中率在 17.8% / 95.9% 之间反复跳。
+  //
+  // 移到末尾后：无论是否注入这段，前面所有内容（身份 / 工具 / 技能索引）
+  // 都是稳定前缀，能连续命中。代价只是"主人关系"出现在提示词更靠后的位置，
+  // 不影响模型理解（它是补充设定，不是行为骨架）。
+  // 🔴 插件贡献的提示词段放**最后**（2026-10-31，缓存优化）
+  //
+  // 这些段落大多带**动态内容**（"空间隔了很久"、"本周还没发满"之类），
+  // 每轮都可能变。原来它们排在 customRules 之前、大约 65% 的位置 ——
+  // 一变动，后面 35% 全失效，实测命中率在 17%~96% 之间乱跳。
+  //
+  // 挪到最末尾后：无论插件段怎么变，前面（身份 / 工具 / 技能索引 /
+  // 管理员规则 / 主人关系）都是稳定前缀，能连续命中。
+  // 顺序仍由插件宿主按 priority 排好，这里只负责"放在哪"，不介入排序。
+  for (const sec of extraSections) {
+    const text = String(sec || '').trim();
+    if (text) parts.push('', text);
+  }
+
+  // 🔴 关系段改为**无条件常驻**（2026-10-31）
+  //
+  // 原来是 `isMaster ? masterBond() : ''` —— 主人一说话，systemPrompt 就多 1869 字符，
+  // 整条前缀缓存作废。实测：sys 恒为 17636 时命中 64~70%，
+  // 一旦变成 19507 就掉到 18%。
+  //
+  // 改成无条件拼接后 sys 长度恒定，多花约 600 token（占比 2%），
+  // 换来整段前缀稳定命中 —— 这笔账很划算。
+  //
+  // 副作用要处理：群里人人都会看到这段。所以补一句使用边界，
+  // 避免她对着群友也叫"爸爸"、或者把私下的亲密话搬到群里。
+  const bond = masterBond();
+  if (bond && String(bond).trim()) {
+    parts.push('', String(bond).trim());
+    parts.push('',
+      '【这段关系的使用边界】',
+      '- 上面这段是你和主人之间的关系底色，**始终有效**，不管当下在跟谁说话。',
+      '- 但它不是对所有人开放的台词：群里面对其他群友时，',
+      '  你对主人的称呼、亲昵、私下的默契，**不要直接搬到公共场合**。',
+      '  被问起时点到为止，别说细节。',
+      '- 主人不在场时，这段内容仍然影响你的态度（你从哪来、站在谁那边），',
+      '  但不要主动提起、也不要对别人复述。'
+    );
+  }
+
   return parts.join('\n');
 }
 
@@ -654,6 +693,40 @@ export function buildUserPrompt(ctx) {
   //    每轮都在变，放在【过去状态】前面会让后面整段失效。
   //    计算逻辑保留，实际拼装挪到末尾（和【当前时间】一起）。
 
+  // ── 稳定段提前（2026-10-31 缓存优化）──
+  //
+  // 原来顺序：角色设定 → 【过去状态】聊天记录 → 本次唤醒 → 参与度/记忆/印象/表情包
+  //
+  // 问题：聊天记录每轮都在变，它一变，**后面全部无法命中缓存**。
+  // 实测同一系统提示词（sha 相同）的会话，命中率在 19.9% ~ 91.3% 之间乱跳。
+  //
+  // 而"参与度/记忆/印象/表情包"这几段内容本身是**稳定的**
+  //（同一个人设、同一批记忆，短时间内不变），却排在了易变内容之后。
+  //
+  // 现在把它们提到【过去状态】之前 —— 前缀更长、更稳，命中率随之提升。
+  const __isPrivate = String(ctx.chatKey || '').startsWith('private:');
+  if (!__isPrivate) {
+    parts.push(`【参与度参考】${participationText(persona.participation)}`);
+  } else {
+    parts.push([
+      '【私聊】',
+      '这是对方**单独找你**说话，不是群聊，不需要判断"要不要插话"。',
+      '对方说了什么就回应什么：要你做事就做事（调用对应工具），问你问题就回答。',
+      '只有确实没内容可说时，才简短回一句，不要沉默。',
+    ].join(String.fromCharCode(10)));
+  }
+
+  // 记忆
+  const memText = ctx.memory.formatForPrompt(ctx.chatKey);
+  if (memText) parts.push(`【记忆】\n${memText}`);
+
+  // 表情包
+  if (cfg.sticker?.enabled !== false) {
+    const stickerCtx = buildStickerContext(ctx.stickerEntries || [], Number(cfg.sticker?.promptMaxStickers) || 10);
+    if (stickerCtx) parts.push(stickerCtx);
+  }
+
+
   // 过去状态
   if (past.text) {
     parts.push(`【过去状态】以下是这个会话最近的聊天记录（按时间排序，你的发言标为"我"；这些都已经看过，不需要逐条回应；带图的消息前有 #消息id，看图/收藏表情工具要用它）：\n${past.text}`);
@@ -750,28 +823,6 @@ export function buildUserPrompt(ctx) {
   // 原因：userPrompt 里塞了群聊的【参与度参考】安静型——
   // "只在被 @/点名/直接提问时才开口"。私聊里没有 @ 这回事，
   // 模型据此判定"不该说话"，用户就看到卡死。
-  const __isPrivate = String(ctx.chatKey || '').startsWith('private:');
-  if (!__isPrivate) {
-    parts.push(`【参与度参考】${participationText(persona.participation)}`);
-  } else {
-    parts.push([
-      '【私聊】',
-      '这是对方**单独找你**说话，不是群聊，不需要判断"要不要插话"。',
-      '对方说了什么就回应什么：要你做事就做事（调用对应工具），问你问题就回答。',
-      '只有确实没内容可说时，才简短回一句，不要沉默。',
-    ].join(String.fromCharCode(10)));
-  }
-
-  // 记忆
-  const memText = ctx.memory.formatForPrompt(ctx.chatKey);
-  if (memText) parts.push(`【记忆】\n${memText}`);
-
-  // 表情包
-  if (cfg.sticker?.enabled !== false) {
-    const stickerCtx = buildStickerContext(ctx.stickerEntries || [], Number(cfg.sticker?.promptMaxStickers) || 10);
-    if (stickerCtx) parts.push(stickerCtx);
-  }
-
   // 引导说明
   parts.push([
     '【引导说明】',

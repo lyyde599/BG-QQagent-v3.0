@@ -16,7 +16,9 @@ import { getConfig, updateConfig, ROOT, DATA_DIR, COMMUNITY } from './config.js'
 import { checkKernelUpdate, downloadKernelUpdate, localKernelVersion, listDownloaded, publishKernel, canPublishKernel, autoInstallKernel, readInstallLog, lastInstallResult, checkInstaller } from './kernel-update.js';
 import { checkAll as checkNapcatQQ, installNapcat, installQQ, restartNapcatService, listKnownAccounts, currentUin, setAutoLoginUin, deleteAccountState,
   checkAllWithSnowluma, installSnowluma, restartSnowlumaService, isSnowlumaInstalled, localSnowlumaVersion, snowlumaHome,
-  BACKENDS, currentBackend, switchBackend, isServiceActive, snowlumaAltStatus, snowlumaCredentials, changeSnowlumaPassword, controlSnowluma } from './napcat-updater.js';
+  BACKENDS, currentBackend, backendAmbiguous, switchBackend, isServiceActive,
+  isContainerRunning, containerExists, onebotAlive,
+  snowlumaAltStatus, snowlumaCredentials, changeSnowlumaPassword, controlSnowluma } from './napcat-updater.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments } from './onebot.js';
 import { ChatStore } from './store.js';
 import { MemoryStore } from './memory.js';
@@ -218,16 +220,41 @@ async function allowedAsync(kind, id, cfg) {
  * 用于面板的「账号总览 / 一键切号」—— 复用桌面侧已实现且已做安全校验的能力
  * （桌面侧已限制 URL 白名单 + 改配置前自动备份），避免两处重复实现。
  */
-async function deskApi(pathname, method = 'GET', body) {
-  // 桌面端配置路径：可用环境变量覆盖，默认放在项目同级（不写死别人的绝对路径）
-  const cfgPath = process.env.DESK_CONFIG_PATH || path.join(ROOT, '..', 'desk', 'data', 'config.json');
-  let token = '';
+/**
+ * 桌面端是否可用（2026-10-31）
+ *
+ * 账号总览 / 一键切号依赖桌面端（Electron 配套的 desk 项目）。
+ * 纯 Linux 服务端部署根本没有这个项目 —— 原来会抛
+ * 「读不到桌面令牌（/opt/desk/data/config.json）」，
+ * 每台 Linux 服务器打开面板都能看到这条红字，像出了故障。
+ *
+ * 它不是故障，是**可选能力**。这里先探测，不可用时前端直接隐藏。
+ */
+function deskConfigPath() {
+  return process.env.DESK_CONFIG_PATH || path.join(ROOT, '..', 'desk', 'data', 'config.json');
+}
+
+function deskAvailable() {
   try {
-    token = JSON.parse(fs.readFileSync(cfgPath, 'utf8')).authToken || '';
-  } catch (error) {
-    throw new Error('读不到桌面令牌（' + cfgPath + '）');
+    const p = deskConfigPath();
+    if (!fs.existsSync(p)) return { ok: false, reason: '未安装桌面端' };
+    const tok = JSON.parse(fs.readFileSync(p, 'utf8')).authToken || '';
+    if (!tok) return { ok: false, reason: '桌面端令牌为空' };
+    return { ok: true, token: tok, path: p };
+  } catch (e) {
+    return { ok: false, reason: String(e?.message ?? e).slice(0, 80) };
   }
-  if (!token) throw new Error('桌面令牌为空');
+}
+
+async function deskApi(pathname, method = 'GET', body) {
+  const av = deskAvailable();
+  if (!av.ok) {
+    // 用带标记的错误，让上层能区分「没装」和「真出错」
+    const err = new Error(av.reason);
+    err.deskUnavailable = true;
+    throw err;
+  }
+  const token = av.token;
   const res = await fetch('http://127.0.0.1:8090' + pathname, {
     method,
     headers: { 'Content-Type': 'application/json', 'X-Desk-Token': token },
@@ -1354,6 +1381,95 @@ export function createApp({ log = console.log } = {}) {
       }
 
       // 发布内核新版本（打包 → 上传 → 更新清单）
+      // ── 一键打包（2026-10-31）────────────────────────────
+      //
+      // 三个动作：导出部署包 / 导出用户数据 / 列出已有包。
+      // 数据包默认脱敏（API Key 替换成占位符），要原样必须显式传 sanitize:false。
+      if (pathname === '/api/export/deploy' && method === 'POST') {
+        try {
+          const body = await readBody(req).catch(() => ({}));
+          const { buildDeployPack } = await import('./export-pack.js');
+          const plugins = Array.isArray(body?.plugins) && body.plugins.length
+            ? body.plugins.map((x) => String(x))
+            : ['plugin-market'];
+          const r = buildDeployPack({ plugins });
+          log(`[导出] 部署包 ${r.file}（${Math.round(r.size / 1024)}K，插件 ${r.plugins.join(',')}）`);
+          return json(res, 200, r);
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e?.message ?? e).slice(0, 300) });
+        }
+      }
+
+      if (pathname === '/api/export/data' && method === 'POST') {
+        try {
+          const body = await readBody(req).catch(() => ({}));
+          const { buildDataPack } = await import('./export-pack.js');
+          const r = buildDataPack({
+            sanitize: body?.sanitize !== false,           // 默认脱敏
+            includeSessions: body?.includeSessions === true,
+            includeInbox: body?.includeInbox === true,
+            includePluginData: body?.includePluginData !== false
+          });
+          log(`[导出] 用户数据 ${r.file}（${Math.round(r.size / 1024)}K，脱敏=${r.sanitized}, 含会话=${r.includeSessions}）`);
+          return json(res, 200, r);
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e?.message ?? e).slice(0, 300) });
+        }
+      }
+
+      // 删除导出包（2026-10-31）
+      //   { file }  → 删一个
+      //   { all:true } → 清空全部
+      if (pathname === '/api/export/delete' && method === 'POST') {
+        try {
+          const body = await readBody(req).catch(() => ({}));
+          const mod = await import('./export-pack.js');
+          if (body?.all === true) {
+            const r = mod.clearExports();
+            log(`[导出] 已清空导出包：${r.removed} 个，释放 ${Math.round(r.freed / 1024)}K`);
+            return json(res, 200, r);
+          }
+          const r = mod.removeExport(String(body?.file || ''));
+          if (!r.ok) return json(res, 400, r);
+          log(`[导出] 已删除 ${r.file}（${Math.round((r.size || 0) / 1024)}K）`);
+          return json(res, 200, r);
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e?.message ?? e).slice(0, 300) });
+        }
+      }
+
+      if (pathname === '/api/export/list' && method === 'GET') {
+        try {
+          const { listExports, exportDir } = await import('./export-pack.js');
+          return json(res, 200, { ok: true, dir: exportDir(), files: listExports() });
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e?.message ?? e).slice(0, 300) });
+        }
+      }
+
+      // 下载导出包（文件名白名单校验，防目录穿越）
+      if (pathname === '/api/export/download' && method === 'GET') {
+        try {
+          const { exportDir } = await import('./export-pack.js');
+          const f = String(url.searchParams.get('file') || '');
+          if (!/^[^/\\]+\.tar\.gz$/.test(f) || f.includes('..')) {
+            return json(res, 400, { ok: false, error: '文件名不合法' });
+          }
+          const full = path.join(exportDir(), f);
+          if (!fs.existsSync(full)) return json(res, 404, { ok: false, error: '文件不存在' });
+          const stat = fs.statSync(full);
+          res.writeHead(200, {
+            'content-type': 'application/gzip',
+            'content-length': stat.size,
+            'content-disposition': `attachment; filename="${encodeURIComponent(f)}"`
+          });
+          fs.createReadStream(full).pipe(res);
+          return;
+        } catch (e) {
+          return json(res, 500, { ok: false, error: String(e?.message ?? e).slice(0, 300) });
+        }
+      }
+
       if (pathname === '/api/kernel/publish' && method === 'POST') {
         const body = await readBody(req, { limitMB: 4 }).catch(() => ({}));
         // 必须已注册作者，且是**内核作者本人**（与创造营同一套归属判定）
@@ -1636,38 +1752,70 @@ export function createApp({ log = console.log } = {}) {
       // 原理：内核连谁取决于 config.snowluma 的 wsUrl/httpUrl，
       // 所以切换 = 停另一个 + 改地址 + 启目标 + 让内核重连。
       if (pathname === '/api/napcat-qq/backend' && method === 'GET') {
-        const cur = currentBackend(getConfig().snowluma || {});
+        const cfgSnow = getConfig().snowluma || {};
+        let cur = currentBackend(cfgSnow);
         const items = [];
         for (const [key, b] of Object.entries(BACKENDS)) {
+          const svcActive = await isServiceActive(b.service);
+          // Docker 兜底：systemd 查不到就查容器（2026-10-31）
+          const ctnRunning = svcActive ? false : await isContainerRunning(b.container);
+          const ctnExists = await containerExists(b.container);
           items.push({
             key,
             label: b.label,
             service: b.service,
-            installed: b.installed(),
-            active: await isServiceActive(b.service),
+            container: b.container,
+            installed: b.installed() || ctnExists,
+            active: svcActive || ctnRunning,
+            how: svcActive ? 'systemd' : (ctnRunning ? 'docker' : (ctnExists ? 'stopped' : 'none')),
             current: key === cur,
             wsUrl: b.wsUrl,
             httpUrl: b.httpUrl,
           });
         }
-        // ── 通道健康判定（2026-10-28）──
+
+        // ── 通道识别裁决（2026-10-31）──
+        // 端口有歧义（两个都像）时，看谁真的在跑，别一口咬定 napcat
+        if (backendAmbiguous(cfgSnow)) {
+          const napcatItem = items.find((x) => x.key === 'napcat');
+          const snowItem = items.find((x) => x.key === 'snowluma');
+          if (snowItem?.active && !napcatItem?.active) cur = 'snowluma';
+          else if (napcatItem?.active && !snowItem?.active) cur = 'napcat';
+          // 两个都在跑 → 保持配置端口推断的结果
+        }
+        for (const it of items) it.current = it.key === cur;
+
+        // ── 健康判定改为「OneBot 探活」（2026-10-31，P0 修复）──
         //
-        // 群友截图：SnowLuma「已停止」却标「✓ 使用中」。
-        // 那是配置指向它、但服务没跑 —— 用户以为正常，实际机器人是断的。
+        // 群友反馈（Docker + SnowLuma，映射到 3001）：
+        //   面板把它当 NapCat → 查 napcat 的 systemd → 没跑 →
+        //   判「机器人现在是断的」，实际一直在线。
         //
-        // 这里给出明确结论和可执行建议，前端照着显示即可。
+        // 根因：拿"进程在不在"当"机器人通不通"，这在 Docker /
+        // 远程 / 反代部署下全是错的。
+        //
+        // 现在：**以 OneBot 接口能否响应为准**，服务状态只作展示。
+        const probe = await onebotAlive(cfgSnow.httpUrl, cfgSnow.accessToken);
         const curItem = items.find((x) => x.key === cur);
-        const currentHealthy = !!(curItem && curItem.active);
+        const currentHealthy = probe.alive;
+
         // 有没有"在跑但没被使用"的通道可以切过去
         const fallback = items.find((x) => x.key !== cur && x.active && x.installed);
 
         let healthHint = '';
-        if (!cur) {
-          healthHint = '没能从配置里识别出当前通道（wsUrl 不是 3001/3011）。';
-        } else if (!currentHealthy) {
-          healthHint = `当前通道「${curItem?.label || cur}」没在运行，机器人现在是断的。`
-            + (fallback ? `可以切到正在运行的「${fallback.label}」，或先启动当前通道。`
-                        : '请先启动它，否则连接不上。');
+        if (probe.alive) {
+          healthHint = `连接正常${probe.nickname ? `（${probe.nickname}）` : ''}`
+            + (probe.userId ? `，QQ ${probe.userId}` : '');
+          if (curItem && !curItem.active) {
+            healthHint += `。注意：这个通道不是用 systemd/docker 起在本机的（可能是远程或反代），所以下面显示「未运行」是正常的。`;
+          }
+        } else if (!cur) {
+          healthHint = `没能识别出当前通道（wsUrl 不是 3001/3011，也没有显式配置 channel）`
+            + (probe.error ? `。探活失败：${probe.error}` : '');
+        } else {
+          healthHint = `连不上 OneBot（${probe.error || '无响应'}），机器人现在是断的。`
+            + `当前配置：${cfgSnow.httpUrl || '未设置 httpUrl'}`
+            + (fallback ? `。可以切到正在运行的「${fallback.label}」` : '。请先启动通道，或检查地址与 accessToken。');
         }
 
         return json(res, 200, {
@@ -1675,7 +1823,11 @@ export function createApp({ log = console.log } = {}) {
           current: cur,
           currentHealthy,
           healthHint,
-          // 建议动作：switch = 切到别的可用通道；start = 重启当前通道
+          probe: { alive: probe.alive, userId: probe.userId ?? null, nickname: probe.nickname || '', error: probe.error || '' },
+          httpUrl: cfgSnow.httpUrl || '',
+          // 建议动作：switch = 切到别的可用通道；start = 启动当前通道
+          // 🔴 探活通过时**不给任何建议动作** —— 之前误判会怂恿用户
+          //    去 systemctl start napcat，Docker 混装时可能抢占同一个 QQ 号。
           suggest: !currentHealthy
             ? (fallback ? { action: 'switch', to: fallback.key, label: fallback.label }
                         : (cur ? { action: 'start', to: cur } : null))
@@ -2066,6 +2218,11 @@ export function createApp({ log = console.log } = {}) {
       // 原「快速登录」按钮调 SetQuickLoginQQ 只是**设定**、不触发登录，点了没反应（已查明）。
       // 这里改为：透传桌面端已实现好的账号总览与切号能力。
       if (pathname === '/api/accounts/overview' && method === 'GET') {
+        const av = deskAvailable();
+        if (!av.ok) {
+          // 没装桌面端不是错误，是「这个功能不适用」—— 前端据此隐藏整块
+          return json(res, 200, { ok: false, unavailable: true, reason: av.reason });
+        }
         try {
           const data = await deskApi('/api/qq/accounts');
           return json(res, 200, { ok: true, data });
@@ -2081,6 +2238,7 @@ export function createApp({ log = console.log } = {}) {
           const r = await deskApi('/api/qq/switch', 'POST', body);
           return json(res, 200, r);
         } catch (error) {
+          if (error?.deskUnavailable) return json(res, 200, { ok: false, unavailable: true, reason: error.message });
           return json(res, 200, { ok: false, error: String(error?.message ?? error) });
         }
       }
@@ -2315,6 +2473,32 @@ export function createApp({ log = console.log } = {}) {
             models: body.models || []
           });
           return json(res, 200, { ok: true, ...r });
+        } catch (error) {
+          return json(res, 400, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+
+      // 删除整个提供商（2026-10-31 补）
+      //
+      // 安全设计：如果删的正好是**当前在用的那个**，拒绝删除并说明原因 ——
+      // 直接删会让 api.provider 指向不存在的 id，模型调用全部失败，
+      // 用户还找不到是哪出的问题。
+      if (pathname === '/api/providers' && method === 'DELETE') {
+        try {
+          const body = await readBody(req).catch(() => ({}));
+          const id = String(body?.id ?? '').trim();
+          if (!id) return json(res, 400, { ok: false, error: '缺少 id' });
+          const cur = String(getConfig().api?.provider || '');
+          if (cur && cur === id) {
+            return json(res, 409, {
+              ok: false,
+              error: '这是当前正在使用的提供商，不能直接删除。\n请先把模型切换到别的提供商，再回来删它。'
+            });
+          }
+          const { removeProvider } = await import('./providers.js');
+          const gone = removeProvider(id);
+          if (!gone) return json(res, 404, { ok: false, error: '提供商不存在' });
+          return json(res, 200, { ok: true, removed: { id: gone.id, baseURL: gone.baseURL } });
         } catch (error) {
           return json(res, 400, { ok: false, error: String(error?.message ?? error) });
         }

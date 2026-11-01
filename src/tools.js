@@ -30,14 +30,37 @@ async function downloadImageAsDataUrl(url, timeoutMs = 30000) {
   const safeUrl = await validateImageUrl(url);
   const delays = [600, 1500, 3000];
   let lastError = null;
+  // ── 图片大小上限（2026-11-01，缓存优化）──
+  //
+  // 原来 safeFetchBinary 默认放行 12MB。base64 后膨胀 33% ≈ 16MB，
+  // 塞进上下文就是**几十万 token**，而且这张图会随每一轮工具调用重发 ——
+  // 实测一次读图让整轮命中率从 90% 掉到 24%（prompt 13 万 token，只命中 3.2 万）。
+  //
+  // 现在默认限 2MB（base64 后约 2.7MB），够看清表情包和截图。
+  // 确实需要原图时把 vision.maxImageMB 调大。
+  const maxMB = Number(getConfig().api?.maxImageMB) || 2;
+  const maxBytes = Math.max(1, maxMB) * 1024 * 1024;
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
-      const { buffer, contentType } = await safeFetchBinary(safeUrl);
+      // 先探一下大小：safeFetchBinary 超限会**静默截断**，
+      // 拿到半张图模型会瞎猜内容。这里改成超限明确拒绝。
+      const head = await fetch(safeUrl, { method: 'HEAD', signal: AbortSignal.timeout(8000) }).catch(() => null);
+      const declared = Number(head?.headers?.get('content-length') || 0);
+      if (declared && declared > maxBytes) {
+        throw new Error(`图片太大（${(declared / 1024 / 1024).toFixed(1)}MB > ${maxMB}MB 上限），已跳过。`
+          + `需要看原图就把「设置 → 模型 API → 单张图片大小上限」调大。`);
+      }
+      const { buffer, contentType } = await safeFetchBinary(safeUrl, maxBytes);
+      if (buffer.length >= maxBytes) {
+        throw new Error(`图片超过 ${maxMB}MB 上限（可能被截断），已跳过。可在设置里调大「单张图片大小上限」。`);
+      }
       if (!buffer || !buffer.length) throw new Error("图片内容为空");
       const mime = detectMime(buffer) || String(contentType || "image/jpeg").split(";")[0];
       return `data:${mime};base64,${buffer.toString("base64")}`;
     } catch (e) {
       lastError = e;
+      // 超限不是瞬时故障，重试没意义，直接抛
+      if (/图片太大|超过 .* 上限/.test(String(e?.message || ''))) throw e;
       if (attempt < delays.length) await new Promise((r) => setTimeout(r, delays[attempt]));
     }
   }
@@ -267,8 +290,14 @@ export function buildToolDefs() {
           const dest = pathmod.join(inbox, `${stamp}_${safeName}`);
 
           // NapCat get_file：拿下载地址，再取回文件
-          const info = await ctx.onebot.call('get_file', { file_id: f.fileId }, 30000).catch((e) => {
-            throw new Error('get_file 失败：' + (e?.message || e));
+          // 超时 30s → 90s（2026-10-31）
+          //
+          // 实测报错「get_file 失败：The operation was aborted due to timeout」：
+          // NapCat 要先从腾讯服务器拉一遍文件才返回下载地址，
+          // 大文件（视频/压缩包）30 秒根本不够。
+          const info = await ctx.onebot.call('get_file', { file_id: f.fileId }, 90000).catch((e) => {
+            throw new Error('get_file 超时或失败（NapCat 拉取文件较慢时会这样）：' + (e?.message || e)
+              + '。可以先用 fetch_file 试试（它会走另一条路径直接下载）。');
           });
           const urls = [info?.url, info?.file, info?.data?.url, info?.data?.file].filter((u) => typeof u === 'string' && /^https?:\/\//.test(u));
           if (!urls.length) return err('NapCat 没有返回可下载地址：' + JSON.stringify(info).slice(0, 200));

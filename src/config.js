@@ -37,6 +37,20 @@ export const DEFAULT_CONFIG = {
   api: {
     baseUrl: 'http://127.0.0.1:8787/v1',   // 例如本机 buddy2api 网关或任何 OpenAI 兼容端点
     apiKey: '',
+    // ── 多端点轮询（2026-10-30）────────────────────────────
+    //
+    // 可选功能：配 1~3 个备用端点，主端点报错时自动切换下一个。
+    // 不配 = 只用上面的 baseUrl/apiKey/model（原有行为完全不变）。
+    //
+    // 每项格式：{ baseUrl, apiKey, model }（model 可留空 → 沿用主配置的 model）
+    //
+    // 调度逻辑在 src/llm.js：
+    //   · 当前端点成功 → 记住它，下次优先用
+    //   · 当前端点失败 → 试下一个（含主端点），整轮都失败才抛错
+    //   · 成功的端点会回写 api.activeIndex，重启后从上次可用的继续
+    endpoints: [],
+    // 上次成功的端点下标（-1 = 用主配置 baseUrl）
+    activeIndex: -1,
     model: '',                              // UI 里选择/填写
     // 输出 token 上限（2026-10-27 整合）：思考型模型给太小会只剩空正文，
     // 不设则完全交给上游默认，不可控。0 或 null 表示不显式传。
@@ -46,6 +60,10 @@ export const DEFAULT_CONFIG = {
     billing: 'token',
     provider: '',                           // 当前模型所属提供商（多提供商目录的选中项）
     vision: true,                           // 模型是否支持图片输入（关掉则移除看图工具）
+    // 单张图片大小上限（MB，2026-11-01 缓存优化）
+    //   base64 后膨胀 33%，且会随每轮工具调用重发 —— 大图会毁掉缓存命中。
+    //   实测 12MB 的图让整轮命中率从 90% 掉到 24%。默认 2MB 够看清表情包/截图。
+    maxImageMB: 2,
     temperature: 0.8,
     maxRounds: 12,                          // 单次运行的最多工具轮数
     timeoutMs: 180000,
@@ -143,6 +161,24 @@ export const DEFAULT_CONFIG = {
     hardSplitAt: 4000       // QQ 硬限制切分（0 = 不限制）
   },
   // 主动开话题（可选）
+  // 功能开关（松散段，历史上按需写入）
+  features: {
+    // 私聊必回（2026-10-31 做成开关）
+    //
+    // true（默认）= 模型在私聊里没说话时，强制再催一次让它回复
+    // false       = 私聊与群聊一致，模型选择不说话就不发
+    //
+    // 关掉的典型场景：私聊只用来做工具调用、或者不想被"必回"打扰省 token。
+    privateMustReply: true,
+
+    // 文件接收（receive_file / fetch_file）开关（2026-10-31）
+    //
+    // 关掉后模型看不到这两个工具，也不会去尝试下载 QQ 文件。
+    // 适用场景：下载经常失败、取下来也没用（比如只是让它看看文件名）、
+    // 或者不想让机器人往 data/inbox 里堆文件。
+    fileReceive: true
+  },
+
   proactive: {
     enabled: false,
     checkIntervalMinMs: 1800000,

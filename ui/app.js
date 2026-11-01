@@ -483,11 +483,26 @@ async function refreshStatus() {
     }
     $('#model-label').textContent = `模型：${s.orchestrator.model || '未设置'}`;
     const u = s.usage;
-    // 缓存命中率（2026-10-26）：有真实数据才显示，没有就不占位置
-    const cachePart = (u.cacheHitRate !== null && u.cacheHitRate !== undefined)
-      ? ` · 缓存 ${u.cacheHitRate}%`
-      : '';
-    $('#usage-label').textContent = `今日：${u.runs} 次运行 · ${fmtTokens(u.totalTokens)}${cachePart}${u.cost ? ` · ¥${u.cost.toFixed(2)}` : ''}`;
+    // 缓存命中率（2026-10-31 增强）
+    //
+    // 原来只显示今日汇总的一个百分比。用户反馈"每轮差异很大看不到细节" ——
+    // 现在把**最近一次调用**的命中率也带上（u.lastCache），
+    // 并用颜色区分好坏，一眼能看出这轮是不是没命中。
+    const pct = (c, m) => {
+      const b = (c || 0) + (m || 0);
+      return b > 0 ? Math.round((c / b) * 1000) / 10 : null;
+    };
+    const today = (u.cacheHitRate !== null && u.cacheHitRate !== undefined) ? u.cacheHitRate : null;
+    const last = u.lastCache ? pct(u.lastCache.cached, u.lastCache.miss) : null;
+    const cacheTone = (v) => (v === null ? '' : v >= 80 ? 'cache-good' : v >= 50 ? 'cache-mid' : 'cache-bad');
+    let cachePart = '';
+    if (today !== null || last !== null) {
+      const bits = [];
+      if (today !== null) bits.push(`今日 <span class="${cacheTone(today)}">${today}%</span>`);
+      if (last !== null) bits.push(`上轮 <span class="${cacheTone(last)}">${last}%</span>`);
+      cachePart = ' · 缓存 ' + bits.join(' / ');
+    }
+    $('#usage-label').innerHTML = `今日：${u.runs} 次运行 · ${fmtTokens(u.totalTokens)}${cachePart}${u.cost ? ` · ¥${u.cost.toFixed(2)}` : ''}`;
     // 显式展示时区（记忆系统 01 第六节：页面时间必须让用户看到北京时间）
     const tzEl = document.getElementById('tz-label');
     if (tzEl) {
@@ -1101,21 +1116,54 @@ function bindSnowlumaEvents() {
     el.textContent = '检查中…';
     try {
       const d = await api('/api/snowluma-alt/status');
-      if (!d?.ok) { el.textContent = '读取失败'; return; }
-      if (!d.installed) { el.textContent = '未安装'; return; }
+      // 2026-11-01：读取失败要说清原因，别只丢一句「读取失败」
+      if (!d?.ok) { el.textContent = '读取失败' + (d?.error ? '：' + d.error : ''); return; }
+      if (!d.installed) { el.textContent = d.reason || '未安装'; return; }
+
+      // Docker 部署：状态能看，但密码拿不到（哈希不可逆），不假装能自动登录
+      if (d.deploy === 'docker') {
+        const parts = [d.running ? '容器运行中' : '容器未运行'];
+        if (d.image) parts.push(d.image);
+        if (d.webuiReachable === false && d.running) parts.push('WebUI 未就绪');
+        el.textContent = parts.join(' · ');
+        el.style.color = d.running ? '#2f855a' : 'var(--muted)';
+        // 按钮换成重启容器
+        const tgl = slEl('sl3-toggle');
+        if (tgl) { tgl.textContent = '重启容器'; tgl.dataset.dockerAction = 'restart'; }
+        const auto = slEl('sl3-autostart');
+        if (auto) { auto.textContent = '开机自启（容器）'; auto.disabled = true; }
+        // 密码相关按钮禁用 + 说明
+        const hint = slEl('sl3-hint');
+        if (hint) {
+          hint.textContent = d.reason || 'Docker 部署：WebUI 密码存在容器卷里且是哈希，面板无法自动读取。请直接打开 WebUI 手动登录。';
+          hint.style.display = '';
+        }
+        const cp = slEl('sl3-getpw');
+        if (cp) cp.disabled = true;
+        const chpw = slEl('sl3-chpw');
+        if (chpw) chpw.disabled = true;
+        return;
+      }
+
       const parts = [d.running ? '运行中' : '未运行'];
       if (d.running) parts.push(d.loggedIn ? `已登录 ${d.uin || ''}`.trim() : '未登录 QQ');
       // 自启状态标出来，避免用户以为"停了就不会再起来"
       if (d.enabled === 'enabled') parts.push('开机自启');
       el.textContent = parts.join(' · ');
       el.style.color = d.running && d.loggedIn ? '#2f855a' : (d.running ? '#b7791f' : 'var(--muted)');
+      const hint2 = slEl('sl3-hint');
+      if (hint2) hint2.style.display = 'none';
 
       // 按钮文案跟着状态走
       const tgl = slEl('sl3-toggle');
-      if (tgl) tgl.textContent = d.running ? '停止' : '启动';
+      if (tgl) { tgl.textContent = d.running ? '停止' : '启动'; delete tgl.dataset.dockerAction; }
       const auto = slEl('sl3-autostart');
-      if (auto) auto.textContent = d.enabled === 'enabled' ? '取消自启' : '设为自启';
-    } catch (e) { el.textContent = '读取失败'; }
+      if (auto) { auto.textContent = d.enabled === 'enabled' ? '取消自启' : '设为自启'; auto.disabled = false; }
+      const cp2 = slEl('sl3-getpw');
+      if (cp2) cp2.disabled = false;
+      const chpw2 = slEl('sl3-chpw');
+      if (chpw2) chpw2.disabled = false;
+    } catch (e) { el.textContent = '读取失败：' + e.message; }
   };
   slEl('sl3-check')?.addEventListener('click', sl3Check);
 
@@ -1172,24 +1220,27 @@ function bindSnowlumaEvents() {
       const label = d?.current
         ? ((d.backends || []).find((x) => x.current)?.label || d.current)
         : '未识别';
-      cur.textContent = d?.currentHealthy === false
-        ? `当前：${label}（异常）`
-        : `当前：${label}`;
-      cur.style.color = d?.currentHealthy === false ? '#c00' : '';
-      cur.style.fontWeight = d?.currentHealthy === false ? '600' : '';
+      // 2026-10-31：健康与否以**探活**为准，不看服务在不在
+      const bad = d?.currentHealthy === false;
+      cur.textContent = bad ? `当前：${label}（连不上）` : `当前：${label}`;
+      cur.style.color = bad ? '#c00' : '';
+      cur.style.fontWeight = bad ? '600' : '';
     }
 
     // 通道异常时补一句明确结论 + 一键修复按钮
     const hintBox = slEl('be-hint');
     if (hintBox) {
-      if (d?.currentHealthy === false && d?.healthHint) {
+      if (d?.healthHint) {
         const sg = d.suggest || {};
         const act = sg.action === 'switch'
           ? `<button class="btn btn-small primary" data-be-switch="${esc(sg.to)}" style="margin-left:8px">切到 ${esc(sg.label || sg.to)}</button>`
           : (sg.action === 'start'
             ? `<button class="btn btn-small primary" data-be-switch="${esc(sg.to)}" style="margin-left:8px">启动它</button>`
             : '');
-        hintBox.innerHTML = `<span style="color:#c00">⚠ ${esc(d.healthHint)}</span>${act}`;
+        // 连不上才用红色警告；正常时用常规灰字说明（含 QQ 号）
+        hintBox.innerHTML = d?.currentHealthy === false
+          ? `<span style="color:#c00">⚠ ${esc(d.healthHint)}</span>${act}`
+          : `<span class="muted">✓ ${esc(d.healthHint)}</span>`;
         hintBox.style.display = '';
       } else {
         hintBox.innerHTML = '';
@@ -1207,14 +1258,25 @@ function bindSnowlumaEvents() {
       //   使用中 + 运行中  → 正常
       //   使用中 + 已停止  → **红色警告：配置指向它但它没在跑**
       //   未使用           → 给切换按钮
+      // 2026-10-31：Docker / 远程部署下 systemd 查不到是正常的，
+      // 只要探活通过就别再报「配置指向它但没在跑」吓人。
+      const probeOk = d?.currentHealthy === true;
       let btn = '';
-      if (!b.installed) {
-        btn = '<span class="muted">未安装</span>';
+      const howLabel = b.how === 'docker' ? '（Docker）' : '';
+      if (b.current && probeOk) {
+        btn = `<span style="color:#2f855a">✓ 使用中</span>`;
       } else if (b.current && b.active) {
-        btn = '<span style="color:#2f855a">✓ 使用中</span>';
+        btn = `<span style="color:#2f855a">✓ 使用中${howLabel}</span>`;
+      } else if (b.current && !b.active && !b.installed) {
+        // 不是本机装的，但可能是远程/反代 —— 探活已通过就不算错
+        btn = probeOk
+          ? `<span class="muted">✓ 使用中（不在本机）</span>`
+          : `<span class="muted">未在本机找到</span>`;
       } else if (b.current && !b.active) {
         btn = `<span style="color:#c00;font-weight:600">⚠ 配置指向它，但没在跑</span>`
           + `<button class="btn btn-small" data-be-switch="${esc(b.key)}" style="margin-left:8px">重启它</button>`;
+      } else if (!b.installed) {
+        btn = '<span class="muted">未安装</span>';
       } else {
         btn = `<button class="btn btn-small primary" data-be-switch="${esc(b.key)}">切到 ${esc(b.label)}</button>`;
       }
@@ -1418,10 +1480,35 @@ function bindSnowlumaEvents() {
     }
     for (const [key, label] of [['napcat', 'NapCat'], ['qq', 'QQ 客户端'], ['snowluma', 'SnowLuma']]) {
       const x = (d && d[key]) || {};
-      const loc = x.local || '未安装';
       const lat = x.latest || '未知';
       let status = '';
       let btn = '';
+
+      // ── Docker 部署单独走一套（2026-11-01，P3）──
+      //
+      // 群友反馈：容器跑着 SnowLuma，版本页却显示「当前 未安装」+「安装 2.3.2」。
+      // 点安装等于又装一份原生的，跟容器抢端口。
+      if (x.deploy === 'docker' && x.docker) {
+        const dk = x.docker;
+        const loc = dk.image || 'Docker';
+        status = dk.running
+          ? '<span style="color:#2f855a">Docker 运行中</span>'
+          : '<span class="muted">Docker 已停止</span>';
+        btn = '<span class="muted" style="font-size:11.5px">'
+          + '容器部署，升级请用 <code>docker pull</code> 换镜像 —— 这里不提供安装按钮'
+          + '</span>';
+        rows.push(`
+          <div class="row" style="padding:9px 0;border-bottom:1px solid var(--line);align-items:center;gap:10px;flex-wrap:wrap">
+            <span style="min-width:120px;font-size:13px">${esc(label)}</span>
+            <span class="muted" style="font-size:12px;min-width:120px">当前 ${esc(loc)}${dk.imageVersion ? `（${esc(dk.imageVersion)}）` : ''}</span>
+            <span style="min-width:110px">${status}</span>
+            <span style="flex:1"></span>
+            ${btn}
+          </div>`);
+        continue;
+      }
+
+      const loc = x.local || '未安装';
       // 地址失效时不要给一个"点了必然 404"的按钮（2026-10-28）
       const dead = x.urlAlive === false;
       if (dead && (x.needInstall || x.needUpdate)) {
@@ -1745,7 +1832,19 @@ async function renderAccountsPanel() {
   let d;
   try {
     const r = await api('/api/accounts/overview');
-    if (!r.ok) { box.innerHTML = '<div class="muted" style="font-size:12px">账号总览不可用：' + (r.error || '') + '</div>'; return; }
+    if (!r.ok) {
+      // 没装桌面端 → 整块隐藏，不报红（2026-10-31）
+      // 纯 Linux 服务端部署本来就没有 desk 项目，那不是故障。
+      if (r.unavailable) {
+        box.innerHTML = '<div class="muted" style="font-size:12px;line-height:1.7">'
+          + '账号总览需要桌面端配合（' + esc(r.reason || '未安装桌面端') + '）。<br>'
+          + '<span style="opacity:.75">纯服务器部署用不到这块，不影响机器人运行。'
+          + '如需启用，设置 <code>DESK_CONFIG_PATH</code> 指向桌面端 config.json。</span></div>';
+        return;
+      }
+      box.innerHTML = '<div class="muted" style="font-size:12px">账号总览不可用：' + esc(r.error || '') + '</div>';
+      return;
+    }
     d = r.data;
   } catch (e) {
     box.innerHTML = '<div class="muted" style="font-size:12px">账号总览读取失败：' + e.message + '</div>';
@@ -3019,6 +3118,45 @@ function renderAboutSection(c) {
     <div id="about-autocheck" style="margin-top:10px"></div>
     <div id="about-publish" style="margin-top:14px"></div>
 
+    <h3 style="margin-top:24px">一键打包</h3>
+    <div class="hint" style="margin-bottom:12px">
+      把当前这套东西打成 tar.gz，可分别导出。文件存在 <code>data/exports/</code>，打完可直接下载。<br>
+      <b>部署包</b> = 内核代码 + 你选的插件（不含配置和数据，可直接分发给别人）<br>
+      <b>用户数据</b> = 配置 + 记忆 + 插件数据。<b>默认脱敏</b>，API Key 会替换成 <code>__REPLACE_ME__</code>
+    </div>
+
+    <div style="padding:14px 16px;border:1px solid var(--line);border-radius:var(--r);margin-bottom:12px">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">部署包（代码 + 插件）</div>
+      <div class="field-row">
+        <div class="field">
+          <label>一起打包的插件</label>
+          <input type="text" id="exp-plugins" value="plugin-market"
+            placeholder="plugin-market,context-strategy（逗号分隔，留空=只带市场）" />
+          <div class="hint">默认只带 创造营。多个用英文逗号分隔。</div>
+        </div>
+      </div>
+      <div class="row" style="gap:8px;align-items:center;margin-top:8px">
+        <button class="btn btn-primary btn-small" id="exp-deploy-btn">生成部署包</button>
+        <span id="exp-deploy-msg" class="muted" style="font-size:12px"></span>
+      </div>
+    </div>
+
+    <div style="padding:14px 16px;border:1px solid var(--line);border-radius:var(--r);margin-bottom:12px">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px">用户数据</div>
+      <div class="checkbox-row"><input type="checkbox" id="exp-sanitize" checked />
+        <label for="exp-sanitize"><b>脱敏</b>（API Key / Token 替换成占位符 —— 建议保持勾选）</label></div>
+      <div class="checkbox-row"><input type="checkbox" id="exp-sessions" />
+        <label for="exp-sessions">包含会话记录（体积大，本机约 23MB）</label></div>
+      <div class="checkbox-row"><input type="checkbox" id="exp-inbox" />
+        <label for="exp-inbox">包含收到的文件（图/视频等，本机约 300MB）</label></div>
+      <div class="row" style="gap:8px;align-items:center;margin-top:8px">
+        <button class="btn btn-primary btn-small" id="exp-data-btn">生成数据包</button>
+        <span id="exp-data-msg" class="muted" style="font-size:12px"></span>
+      </div>
+    </div>
+
+    <div id="exp-list" style="margin-top:12px"></div>
+
     <h3 style="margin-top:24px">运行环境</h3>
     <div class="muted" style="font-size:13px;line-height:1.9">
       Node ${esc(String((c && c.node) || '').replace(/^v/, ''))}${(c && c.version) ? ` · 版本 ${esc(c.version)}` : ''}<br>
@@ -3276,6 +3414,103 @@ function renderSettings() {
       api('/api/kernel/version').then((v) => {
         if (verEl) verEl.textContent = v?.version || '未知';
       }).catch(() => { if (verEl) verEl.textContent = '未知'; });
+
+      // ── 一键打包（2026-10-31）────────────────────────
+      const fmtSize = (n) => n > 1024 * 1024
+        ? (n / 1024 / 1024).toFixed(1) + ' MB'
+        : Math.max(1, Math.round(n / 1024)) + ' KB';
+
+      const renderExports = async () => {
+        const box = $('#exp-list');
+        if (!box) return;
+        try {
+          const d = await api('/api/export/list');
+          const files = d.files || [];
+          if (!files.length) { box.innerHTML = '<div class="muted" style="font-size:12px">还没有导出过。</div>'; return; }
+          const total = files.reduce((s, f) => s + (f.size || 0), 0);
+          box.innerHTML =
+            '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+            + '<span style="font-size:13px;font-weight:600">已有导出包</span>'
+            + `<span class="muted" style="font-size:12px">共 ${files.length} 个 · ${fmtSize(total)}</span>`
+            + '<span style="flex:1"></span>'
+            + '<button class="btn btn-small btn-danger" id="exp-clear-all">清空全部</button>'
+            + '</div>'
+            + files.map((f) => `
+              <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)">
+                <span style="flex:1;font-size:12.5px;word-break:break-all">${esc(f.file)}</span>
+                <span class="muted" style="font-size:12px;white-space:nowrap">${fmtSize(f.size)}</span>
+                <a class="btn btn-small" href="/api/export/download?file=${encodeURIComponent(f.file)}">下载</a>
+                <button class="btn btn-small btn-danger" data-del-exp="${esc(f.file)}">删除</button>
+              </div>`).join('');
+
+          // 单个删除（事件委托，避免重渲染后监听叠加）
+          box.querySelectorAll('[data-del-exp]').forEach((btn) => {
+            btn.addEventListener('click', async () => {
+              const file = btn.dataset.delExp;
+              if (!confirm(`删除导出包？\n\n${file}\n\n删了就找不回来，需要时重新生成即可。`)) return;
+              btn.disabled = true;
+              try {
+                await api('/api/export/delete', { method: 'POST', body: { file } });
+                toast('已删除');
+                await renderExports();
+              } catch (e) {
+                toast('删除失败：' + e.message);
+                btn.disabled = false;
+              }
+            });
+          });
+
+          // 清空全部
+          box.querySelector('#exp-clear-all')?.addEventListener('click', async () => {
+            if (!confirm(`清空全部 ${files.length} 个导出包？\n\n共 ${fmtSize(total)}，不可恢复。`)) return;
+            try {
+              const r = await api('/api/export/delete', { method: 'POST', body: { all: true } });
+              toast(`已清空 ${r.removed} 个，释放 ${fmtSize(r.freed || 0)}`);
+              await renderExports();
+            } catch (e) {
+              toast('清空失败：' + e.message);
+            }
+          });
+        } catch (e) {
+          box.innerHTML = '<div class="muted" style="font-size:12px">读取失败：' + esc(e.message) + '</div>';
+        }
+      };
+
+      $('#exp-deploy-btn')?.addEventListener('click', async () => {
+        const btn = $('#exp-deploy-btn'), msg = $('#exp-deploy-msg');
+        const raw = String($('#exp-plugins')?.value || '').trim();
+        const plugins = raw ? raw.split(/[,，\s]+/).filter(Boolean) : ['plugin-market'];
+        btn.disabled = true;
+        if (msg) msg.textContent = '打包中…（大项目可能要几十秒）';
+        try {
+          const r = await api('/api/export/deploy', { method: 'POST', body: { plugins } });
+          if (msg) msg.textContent = `✅ ${r.file}（${fmtSize(r.size)}）`;
+          await renderExports();
+        } catch (e) {
+          if (msg) msg.textContent = '❌ ' + e.message;
+        } finally { btn.disabled = false; }
+      });
+
+      $('#exp-data-btn')?.addEventListener('click', async () => {
+        const btn = $('#exp-data-btn'), msg = $('#exp-data-msg');
+        const sanitize = $('#exp-sanitize')?.checked !== false;
+        const includeSessions = $('#exp-sessions')?.checked === true;
+        const includeInbox = $('#exp-inbox')?.checked === true;
+        if (!sanitize) {
+          if (!confirm('不脱敏导出的包里会带着**真实 API Key**。\n一旦外发就是密钥泄漏。\n\n确定要继续吗？')) return;
+        }
+        btn.disabled = true;
+        if (msg) msg.textContent = '打包中…（含大文件时较慢）';
+        try {
+          const r = await api('/api/export/data', { method: 'POST', body: { sanitize, includeSessions, includeInbox } });
+          if (msg) msg.textContent = `✅ ${r.file}（${fmtSize(r.size)}${r.sanitized ? ' · 已脱敏' : ' · ⚠️ 含真实密钥'}）`;
+          await renderExports();
+        } catch (e) {
+          if (msg) msg.textContent = '❌ ' + e.message;
+        } finally { btn.disabled = false; }
+      });
+
+      renderExports();
 
       $('#about-check')?.addEventListener('click', async () => {
         setMsg('检查中…'); setBody('');
@@ -3574,6 +3809,19 @@ function renderApiSection(c) {
         <div class="hint">换 Key 直接在框里粘贴新的保存即可；想彻底删掉就点「清除」。</div>
       </div>
     </div>
+
+    <h3>备用端点（可选）</h3>
+    <div class="hint" style="margin-bottom:8px">
+      主端点报错时自动切到下一个，连不上就继续往下试。<b>不配也能正常用</b>，配了更抗故障。<br>
+      典型的用法：主端点 + 一个备用，或者三家不同厂商互相兜底。<br>
+      <span id="ep-status" class="muted"></span>
+    </div>
+    <div id="endpoint-rows"></div>
+    <div style="display:flex;gap:8px;margin-top:6px">
+      <button class="btn btn-small" type="button" id="add-endpoint-btn">＋ 加一个端点</button>
+      <button class="btn btn-small btn-primary" type="button" id="save-endpoints-btn">保存端点</button>
+      <span id="endpoint-result" class="muted"></span>
+    </div>
     <div class="field-row">
       <div class="field"><label>温度</label><input type="number" id="cfg-temperature" step="0.1" min="0" max="2" value="${esc(c.api.temperature)}" /></div>
       <div class="field"><label>单次运行最大工具轮数</label><input type="number" id="cfg-maxrounds" min="1" max="40" value="${esc(c.api.maxRounds)}" /></div>
@@ -3581,6 +3829,16 @@ function renderApiSection(c) {
     <div class="checkbox-row"><input type="checkbox" id="cfg-vision" ${c.api.vision !== false ? 'checked' : ''} />
       <label for="cfg-vision">图片输入（关闭则移除看图工具，模型只会看到 [图片] 占位符）</label>
       <span id="vision-switch-hint" class="muted" style="font-size:12px;align-self:center"></span></div>
+    <div class="field" style="margin-left:24px">
+      <label style="font-size:12.5px">单张图片大小上限（MB）
+        <input type="number" id="cfg-maximagemb" min="0.5" max="20" step="0.5"
+          value="${esc(c.api.maxImageMB ?? 2)}" style="width:90px;display:inline-block;margin-left:8px" />
+      </label>
+      <div class="hint" style="margin-top:2px">
+        base64 后膨胀 33%，且随每次工具调用重发 —— 大图很吃 token。
+        实测一张 4MB 的图让整轮缓存命中从 90% 掉到 24%。默认 2MB 够用。
+      </div>
+    </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-websearch" ${c.webSearch?.enabled !== false ? 'checked' : ''} />
       <label for="cfg-websearch">联网搜索：启用 web_search / web_fetch 工具</label></div>
     <div class="field"><label>搜索引擎</label>
@@ -3715,6 +3973,88 @@ async function loadSearchKeys() {
     state.searchKeys = await api('/api/search-keys');
     renderSearchKeyRows();
   } catch (e) { /* 忽略 */ }
+}
+
+// ── 备用端点（2026-10-30）────────────────────────────
+//
+// 可选功能：配 0~3 个备用端点，主端点报错自动切换。
+// 存到 config.api.endpoints，调度逻辑在 src/llm.js 的 chatCompletion。
+
+function renderEndpointRows() {
+  const box = $('#endpoint-rows');
+  if (!box) return;
+  const list = Array.isArray(state.config?.api?.endpoints) ? state.config.api.endpoints : [];
+  const rows = [];
+  // 🔴 行数 = 主端点(1) + 备用端点数（2026-10-30）
+  //    原来写成 Math.max(list.length, 1)，把主端点算进了 list.length，
+  //    导致有 2 个备用端点时只渲染 2 行（主 + 备用1），少一行。
+  const n = list.length + 1;
+  for (let i = 0; i < n; i++) {
+    // i=0 是主端点，用上方 baseUrl/apiKey，这里不放值
+    const ep = i === 0 ? {} : (list[i - 1] || {});
+    rows.push(
+      '<div class="ep-row" data-idx="' + i + '" style="border:1px solid var(--line);border-radius:6px;padding:10px;margin-bottom:8px">'
+      + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+      + '<b style="font-size:13px">' + (i === 0 ? '主端点（当前生效）' : '备用 ' + i) + '</b>'
+      + (i === 0 ? '' : '<button class="btn btn-small" type="button" data-del-ep="' + i + '" title="删掉这个端点">✕</button>')
+      + '</div>'
+      + '<div style="display:flex;gap:8px;margin-bottom:6px">'
+      + '<input type="text" class="ep-baseurl" data-idx="' + i + '" placeholder="https://api.example.com/v1" value="' + esc(ep.baseUrl || '') + '" style="flex:1" />'
+      + '</div>'
+      + '<div style="display:flex;gap:8px">'
+      + '<input type="password" class="ep-apikey" data-idx="' + i + '" placeholder="API Key（' + (i === 0 ? '与上方相同可留空' : '必填') + '）" value="' + esc(ep.apiKey || '') + '" style="flex:1" autocomplete="off" />'
+      + '<input type="text" class="ep-model" data-idx="' + i + '" placeholder="模型名（留空=沿用 ' + esc(state.config?.api?.model || '当前模型') + '）" value="' + esc(ep.model || '') + '" style="flex:1" />'
+      + '</div>'
+      + '</div>'
+    );
+  }
+  box.innerHTML = rows.join('');
+  // 更新状态提示
+  const st = $('#ep-status');
+  if (st) {
+    const active = Number(state.config?.api?.activeIndex);
+    const usable = list.filter((e) => String(e?.baseUrl || '').trim()).length;
+    st.textContent = usable
+      ? '已配置 ' + usable + ' 个端点' + (active >= 0 ? '，当前用第 ' + (active === 0 ? '主端点' : '备用 ' + active) : '')
+      : '还没配备用端点';
+  }
+}
+
+/** 从 DOM 收集备用端点（跳过第 0 行主端点，跳过空行） */
+function collectEndpointsFromDom() {
+  const rows = [...document.querySelectorAll('.ep-row')];
+  const list = [];
+  rows.forEach((row, i) => {
+    if (i === 0) return;   // 第 0 行是主端点，用上方的 baseUrl/apiKey
+    const baseUrl = String(row.querySelector('.ep-baseurl')?.value || '').trim();
+    if (!baseUrl) return;  // 空行跳过
+    list.push({
+      baseUrl,
+      apiKey: String(row.querySelector('.ep-apikey')?.value || '').trim(),
+      model: String(row.querySelector('.ep-model')?.value || '').trim()
+    });
+  });
+  return list;
+}
+
+/** 删行后同步保存 */
+async function syncEndpointsFromDom() {
+  await saveEndpoints(collectEndpointsFromDom());
+}
+
+async function saveEndpoints(list) {
+  const out = $('#endpoint-result');
+  try {
+    const r = await api('/api/config', {
+      method: 'POST',
+      body: { api: { endpoints: list, activeIndex: -1 } }
+    });
+    state.config = r.config || state.config;
+    if (out) out.textContent = '已保存 ' + list.length + ' 个端点';
+    renderEndpointRows();
+  } catch (e) {
+    if (out) out.textContent = '保存失败：' + e.message;
+  }
 }
 
 async function saveSearchKeys({ allowClear = false } = {}) {
@@ -3861,6 +4201,14 @@ function renderChatSection(c) {
     <h3>会话与访问</h3>
     <div class="checkbox-row"><input type="checkbox" id="cfg-feat-allowgroupmembers" ${c.privateAllowGroupMembers !== false ? 'checked' : ''} />
       <label for="cfg-feat-allowgroupmembers">功能群成员可私聊（白名单群里的成员私聊机器人也会回复）</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-feat-private-must-reply" ${c.features?.privateMustReply !== false ? 'checked' : ''} />
+      <label for="cfg-feat-private-must-reply">私聊必回（模型没吭声时强制再催一次，保证每条私聊都有回应）</label></div>
+    <div class="checkbox-row"><input type="checkbox" id="cfg-feat-file-receive" ${c.features?.fileReceive !== false ? 'checked' : ''} />
+      <label for="cfg-feat-file-receive">允许接收文件（receive_file / fetch_file）</label></div>
+    <div class="hint" style="margin-left:24px;margin-top:-4px;margin-bottom:8px">
+      关掉后模型看不到这两个工具，不会去下载 QQ 文件。
+      下载经常超时、或者取下来也用不上时，关掉更省事。
+    </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-feat-proactive-private" ${c.features?.proactivePrivate !== false ? 'checked' : ''} />
       <label for="cfg-feat-proactive-private">私聊主动开话题（机器人主动找人聊天，需要能主动发起会话的通道）</label></div>
 
@@ -4242,6 +4590,64 @@ function bindSettingsEvents(c) {
   const saveKeyBtn = $('#save-search-keys-btn');
   if (saveKeyBtn) saveKeyBtn.addEventListener('click', saveSearchKeys);
 
+  // 备用端点：加一行 / 保存（2026-10-30）
+  //
+  // 🔴 加行直接操作 DOM，不改 state 再重渲染 ——
+  //    实测重渲染这条路在 state.config 为空时会静默失败（点按钮没反应）。
+  //    直接 append 一行最稳，用户填完点保存时再统一从 DOM 读。
+  const addEpBtn = $('#add-endpoint-btn');
+  if (addEpBtn) addEpBtn.addEventListener('click', () => {
+    const box = $('#endpoint-rows');
+    if (!box) return;
+    const n = box.querySelectorAll('.ep-row').length;
+    if (n - 1 >= 2) return toast('最多 2 个备用端点（连主端点共 3 个）');
+    const modelHint = String($('#cfg-model')?.value || state.config?.api?.model || '当前模型');
+    const div = document.createElement('div');
+    div.className = 'ep-row';
+    div.style.cssText = 'border:1px solid var(--line);border-radius:6px;padding:10px;margin-bottom:8px';
+    div.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+      + '<b style="font-size:13px">备用 ' + (n) + '</b>'
+      + '<button class="btn btn-small" type="button" data-del-ep="1" title="删掉这个端点">✕</button>'
+      + '</div>'
+      + '<div style="display:flex;gap:8px;margin-bottom:6px">'
+      + '<input type="text" class="ep-baseurl" placeholder="https://api.example.com/v1" style="flex:1" />'
+      + '</div>'
+      + '<div style="display:flex;gap:8px">'
+      + '<input type="password" class="ep-apikey" placeholder="API Key（必填）" style="flex:1" autocomplete="off" />'
+      + '<input type="text" class="ep-model" placeholder="模型名（留空=沿用 ' + esc(modelHint) + '）" style="flex:1" />'
+      + '</div>';
+
+    box.appendChild(div);
+  });
+
+  const saveEpBtn = $('#save-endpoints-btn');
+  if (saveEpBtn) saveEpBtn.addEventListener('click', async () => {
+    const box = $('#endpoint-rows');
+    if (!box) return;
+    await saveEndpoints(collectEndpointsFromDom());
+  });
+
+  // 进页面时渲染一次
+  if ($('#endpoint-rows')) renderEndpointRows();
+
+  // 🔴 删除按钮用**事件委托**（2026-10-30）
+  //
+  // 原来在 renderEndpointRows 和"加行"两处各自 addEventListener，
+  // 重渲染后旧监听失效/重复，导致点一次删除把别的端点也清掉。
+  // 委托到容器上：不管行是谁加的、重渲染几次，一个监听全管。
+  const epBox = $('#endpoint-rows');
+  if (epBox && !epBox.dataset.delegated) {
+    epBox.dataset.delegated = '1';
+    epBox.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-del-ep]');
+      if (!btn) return;
+      e.preventDefault();
+      btn.closest('.ep-row')?.remove();
+      syncEndpointsFromDom();
+    });
+  }
+
   // 清除全部 AnySearch Key（2026-10-29）
   const clearKeysBtn = $('#clear-search-keys-btn');
   if (clearKeysBtn) clearKeysBtn.addEventListener('click', async () => {
@@ -4416,6 +4822,8 @@ function bindSettingsEvents(c) {
 
   // 图片输入开关联动（视觉扫描结果）
   function syncVisionSwitch(pid, model) {
+    const maxImg = Number(val('#cfg-maximagemb', c.api.maxImageMB ?? 2));
+    if (Number.isFinite(maxImg) && maxImg > 0) patch.api.maxImageMB = Math.min(20, Math.max(0.5, maxImg));
     const box = $('#cfg-vision');
     const hint = $('#vision-switch-hint');
     if (!box) return;
@@ -4731,18 +5139,28 @@ function openModelPicker() {
         const pid = el.dataset.pid;
         const model = el.dataset.model;
         try {
-          // 🔴 2026-10-29 修：不能无条件用 provider 的 key 覆盖 api.apiKey
+          // 选模型时的 Key 取值规则（2026-10-31 二次修正）
           //
-          // 反馈：「清空了旧 key、手动导入新的，点一下上面的模型，又把刚删掉的旧 key 连回去了」
+          // 历史教训（两个方向都错过，所以现在的规则要按情况分）：
           //
-          // 根因就在这里：原来无条件写 apiKey: p.apiKey || ''，
-          // 用户手填在输入框里的新 Key 被 provider 里存的旧值直接盖掉。
+          // ① 2026-10-29 之前：无条件用 provider 的 key
+          //    → 用户手填了新 Key，点一下模型就被旧值盖回去。
           //
-          // 现在的规则：
-          //   · 输入框里**有值**（用户手填了）→ 以用户输入为准，不覆盖
-          //   · 输入框为空 → 才用 provider 存的 key（等价于"跟着这个提供商走"）
+          // ② 2026-10-29 的"修复"：只要输入框有值就用输入框的
+          //    → 切换 provider 时，输入框里还留着**上一个 provider 的 Key**，
+          //      新 provider 的 Key 永远用不上，用户以为"密钥没跟着换、被风控了"。
+          //
+          // ✅ 正确规则：**看是不是同一个提供商**
+          //    · 同一个 provider（只换模型）→ 保留用户手填的 Key（支持同端点换 Key）
+          //    · 换了 provider → 用新 provider 自己的 Key（绝不能沿用旧的）
+          //
+          //    判据：当前生效的 api.provider 与目标 pid 是否相同。
+          const curProvider = String(state.config?.api?.provider || '');
+          const sameProvider = curProvider && curProvider === pid;
           const boxKey = String(document.querySelector('#cfg-apikey')?.value || '').trim();
-          const nextKey = boxKey || p.apiKey || '';
+          const nextKey = sameProvider
+            ? (boxKey || p.apiKey || '')   // 同一个：用户手填优先
+            : (p.apiKey || '');            // 换了厂商：一律用新厂商的 Key
           await api('/api/config', {
             method: 'POST',
             body: JSON.stringify({ api: { provider: pid, model, baseUrl: p.baseURL, apiKey: nextKey } })
@@ -4838,12 +5256,39 @@ function openModelDeleteModal() {
     const p = providers.find((x) => x.id === activePid);
     if (!p) { right.innerHTML = ''; return; }
     const names = p.modelNames || {};
-    right.innerHTML = p.models.map((m) => `
+    const isActive = String(state.config?.api?.provider || '') === p.id;
+    // 顶部条：显示 baseURL + 删除整个提供商（2026-10-31 补）
+    // 当前在用的不允许删（后端也会拦），这里提前禁用并说明原因。
+    const provBar = `
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--line);margin-bottom:6px">
+        <span class="muted" style="font-size:12px;flex:1">
+          ${esc(p.baseURL || '')}${isActive ? ' · <b>当前在用</b>' : ''}
+        </span>
+        <button class="btn btn-small btn-danger" id="md-del-prov" ${isActive ? 'disabled' : ''}>删除此提供商</button>
+      </div>`;
+    right.innerHTML = provBar + (p.models.map((m) => `
       <div class="mm-model" data-model="${esc(m)}">
         <span>${esc(names[m] || m)}</span>
         <span class="muted" style="font-size:11px">${esc(m)}</span>
         <button class="mm-del">删除</button>
-      </div>`).join('') || '<div class="muted" style="padding:10px">该提供商下没有模型</div>';
+      </div>`).join('') || '<div class="muted" style="padding:10px">该提供商下没有模型</div>');
+    // 删整个提供商（2026-10-31 补）
+    const delProvBtn = right.querySelector('#md-del-prov');
+    if (delProvBtn && !isActive) {
+      delProvBtn.addEventListener('click', async () => {
+        const label = p.displayName || p.baseURL || p.id;
+        if (!confirm(`确定删除整个提供商「${label}」？\n\n它会连同下面 ${p.models.length} 个模型一起从目录移除。\n其他提供商不受影响。`)) return;
+        try {
+          await api('/api/providers', { method: 'DELETE', body: JSON.stringify({ id: p.id }) });
+          await loadSettings();
+          closeModelModal(overlay);
+          toast('已删除提供商「' + label + '」');
+        } catch (err) {
+          alert(`删除失败：${err.message}`);
+        }
+      });
+    }
+
     right.querySelectorAll('.mm-model').forEach((el) => {
       el.querySelector('.mm-del').addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -4999,6 +5444,10 @@ async function saveConfig({ quiet = false, allowEmptyApiKey = false } = {}) {
     patch.privateAllowGroupMembers = chk('#cfg-feat-allowgroupmembers', c.privateAllowGroupMembers !== false);
     patch.features = {
       ...(c.features || {}),
+      // 私聊必回（2026-10-31）：默认开，与后端 features.privateMustReply 对应
+      privateMustReply: chk('#cfg-feat-private-must-reply', c.features?.privateMustReply !== false),
+      // 文件接收开关（2026-10-31）
+      fileReceive: chk('#cfg-feat-file-receive', c.features?.fileReceive !== false),
       proactivePrivate: chk('#cfg-feat-proactive-private', c.features?.proactivePrivate !== false)
     };
   }

@@ -1,0 +1,61 @@
+{
+  "id": "file-recv",
+  "name": "文件接收",
+  "version": "1.1.0",
+  "apiVersion": 1,
+  "description": "NapCat 对群文件返回的是本地绝对路径而不是 http 地址，内核的 receive_file 只认 http，所以原来机器人总说\"取不下来，只拿到名字\"。本插件补上这个短板：直接把文件复制到指定目录并返回本地路径。",
+  "author": "白光",
+  "entry": "index.js",
+  "priority": 60,
+  "defaultEnabled": true,
+  "hooks": [],
+  "tools": true,
+  "config": {
+    "enabled": true,
+    "workspaceDir": "",
+    "scopes": {},
+    "extraRoots": "",
+    "allowAll": false
+  },
+  "permissions": [
+    "read-media",
+    "exec"
+  ],
+  "scopes": [
+    "all"
+  ],
+  "category": "能力",
+  "summary": "真正把群文件取到本地",
+  "uiTab": {
+    "id": "file-recv",
+    "label": "文件接收",
+    "inline": true
+  },
+  "ui": "ui.js",
+  "license": "MIT",
+  "contact": {
+    "qq": "3170037984"
+  },
+  "configSchema": {
+    "workspaceDir": {
+      "type": "text",
+      "label": "工作区目录",
+      "hint": "留空用 data/inbox"
+    },
+    "extraRoots": {
+      "type": "list",
+      "label": "额外可读目录",
+      "hint": "一行一个绝对路径。想让她读哪里就加哪里；写 / 会被忽略。"
+    },
+    "allowAll": {
+      "type": "switch",
+      "label": "允许读取任意路径（不推荐）",
+      "hint": "打开后可读整台机器的任何文件，包括 SSH 私钥、其他项目配置。只在完全信任的测试环境开。"
+    },
+    "scopes": {
+      "type": "json",
+      "label": "分聊天覆盖",
+      "hint": "按会话单独开关，一般不用动"
+    }
+  }
+}

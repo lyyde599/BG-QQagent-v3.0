@@ -81,7 +81,24 @@ body {
   background: var(--panel);
   flex-shrink: 0;
 }
-.brand { font-weight: 600; font-size: 15px; }
+.brand {
+  font-weight: 600;
+  font-size: 15px;
+  /* 图标与文字垂直居中（2026-10-31 加品牌图标） */
+  display: flex;
+  align-items: center;
+}
+
+/* 品牌图标：比文字略大一圈，视觉上有分量但不喧宾夺主。
+   尺寸 22px（正文字号 15px 的 1.45 倍）。
+   原图本身就是正方形圆底，**不要加 border-radius** ——
+   加了会再裁一次，把圆形切成半圆（实测踩过）。 */
+.brand-mark {
+  width: 22px;
+  height: 22px;
+  margin-right: 7px;
+  flex: 0 0 auto;
+}
 .brand-sub { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 8px; }
 .top-status { display: flex; align-items: center; gap: 10px; font-size: 12px; }
 .muted { color: var(--muted); }
@@ -1371,3 +1388,16 @@ html.has-user-bg select {
   }
   .plugin-modal .pm-body { padding: 12px 12px 18px; }
 }
+
+/* ── 缓存命中率着色（2026-10-31）─────────────────────────
+ *
+ * 用户反馈"每轮缓存差异很大" —— 汇总一个数字看不出来。
+ * 顶部现在同时显示「今日 / 上轮」，并用明度区分好坏：
+ *   ≥80%  正常（用主色，不抢眼）
+ *   50~80 偏低（警告色）
+ *   <50   异常（错误色）
+ * 全部走令牌，不硬编码颜色（铁律 0.8）。
+ */
+#usage-label .cache-good { color: var(--fg); }
+#usage-label .cache-mid  { color: var(--warn); }
+#usage-label .cache-bad  { color: var(--err); font-weight: 600; }

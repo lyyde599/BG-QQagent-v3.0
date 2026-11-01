@@ -16,6 +16,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
+
+// 🔴 测试一律用临时数据目录（2026-10-31）
+//
+// test-prompt.mjs 曾因没隔离，把 100 条假消息写进线上 data/messages/，
+// 机器人对着不存在的 group:123 定时发言（OneBot retcode 110）。
+// 这里统一加保护：即便某个 lint 以后开始实例化 store，也不会碰线上数据。
+{
+  const tmpData = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-test-'));
+  process.env.WB_DATA_DIR = tmpData;
+  process.env.QQ_AGENT_DATA_DIR = tmpData;
+  process.on('exit', () => {
+    try { fs.rmSync(tmpData, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  });
+}
+
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
