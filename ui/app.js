@@ -2875,7 +2875,15 @@ function dispatchTabLoad(name) {
  * 未登录只给提示，不给表单（避免提交后被后端拒，白填）。
  */
 async function renderFeedbackSection() {
-  const pane = $('#settings-form');
+  // 🔴 容器是 #fb-shell，不是 #settings-form（2026-11-01 修）
+  //
+  // 事故：BUG 反馈页永远停在「加载中…」。
+  // 原因是这里取的 #settings-form 是**外层容器**，
+  // 写进去的「加载中」把整个设置面板覆盖了；而真正的壳 #fb-shell
+  // 一直是 renderSettingsSection 生成的那句「加载中…」，没人去填。
+  //
+  // 同源问题也影响了「关于」页（另外一个 if 分支），一并修。
+  const pane = $('#fb-shell') || $('#settings-form');
   if (!pane) return;
   pane.innerHTML = '<div class="muted" style="padding:16px">加载中…</div>';
 
@@ -2886,6 +2894,13 @@ async function renderFeedbackSection() {
     pane.innerHTML = `<div class="card"><div class="error">加载失败：${esc(e.message)}</div></div>`;
     return;
   }
+
+  // 🔴 后续渲染整段加保护（2026-11-01）
+  //
+  // 之前只有 api 调用在 try 里，后面模板拼接一旦抛错就静默消失 ——
+  // 用户看到的是永远停在「加载中…」，既没报错也没内容，根本无从排查。
+  // 现在把错误显示出来。
+  try {
 
   // 未登录：只给引导
   if (!st?.logged) {
@@ -2964,6 +2979,14 @@ async function renderFeedbackSection() {
 
   bindFeedbackEvents();
   loadFeedbackList();
+  } catch (e) {
+    // 渲染出错也要让用户看见，不能停在「加载中」
+    pane.innerHTML = '<div class="card"><div class="error">'
+      + 'BUG 反馈页渲染失败：' + esc(String(e?.message || e))
+      + '<br><span class="muted" style="font-size:12px">请把这个错误发到群里，或按 F12 看 Console。</span>'
+      + '</div></div>';
+    console.error('[feedback] 渲染失败:', e);
+  }
 }
 
 /** 反馈页事件 */
@@ -3390,9 +3413,14 @@ function renderSettings() {
   // 是异步的，所以先渲染空壳再补内容 —— 不阻塞其它设置项。
   if ((state.settingsSection || 'api') === 'about') {
     api('/api/about').then((d) => {
+      // 🔴 不再整体重建面板（2026-11-01 修）
+      //
+      // 原写法 pane.innerHTML = renderAboutSection(d) 会把 bindSettingsEvents
+      // 刚绑好的监听全冲掉 —— 「检查更新」点了没反应就是这个原因。
+      // 现在只补数据，DOM 结构由同步渲染那一次决定。
       const pane = $('#settings-form');
       if (!pane || (state.settingsSection || 'api') !== 'about') return;
-      pane.innerHTML = renderAboutSection(d);
+      const av = $('#about-ver'); if (av && d?.version) av.textContent = d.version;
       $('#about-copy')?.addEventListener('click', async () => {
         const qq = String(d?.community?.number || '');
         if (!qq) return;
@@ -4822,8 +4850,6 @@ function bindSettingsEvents(c) {
 
   // 图片输入开关联动（视觉扫描结果）
   function syncVisionSwitch(pid, model) {
-    const maxImg = Number(val('#cfg-maximagemb', c.api.maxImageMB ?? 2));
-    if (Number.isFinite(maxImg) && maxImg > 0) patch.api.maxImageMB = Math.min(20, Math.max(0.5, maxImg));
     const box = $('#cfg-vision');
     const hint = $('#vision-switch-hint');
     if (!box) return;
@@ -5384,10 +5410,18 @@ async function saveConfig({ quiet = false, allowEmptyApiKey = false } = {}) {
     //    baseUrl 之前还是 readonly，连改都改不了。
     const baseUrlInput = val('#cfg-baseurl', c.api.baseUrl).trim();
     const apiKeyInput = val('#cfg-apikey', c.api.apiKey);
+    // 图片大小上限（2026-11-01）：必须在这个作用域读，val() 才可用。
+    // 🔴 上一版误插到 syncVisionSwitch 里，那里既没有 val 也没有 patch，
+    //    抛 ReferenceError 让整个 bindSettingsEvents 中断 ——
+    //    表现为「检查更新点了没反应」「BUG 反馈一直加载中」。
+    const maxImgMB = Number(val('#cfg-maximagemb', c.api.maxImageMB ?? 2));
     patch.api = {
       vision: chk('#cfg-vision', c.api.vision !== false),
       temperature: Number(val('#cfg-temperature', c.api.temperature)) || 0.8,
-      maxRounds: Number(val('#cfg-maxrounds', c.api.maxRounds)) || 12
+      maxRounds: Number(val('#cfg-maxrounds', c.api.maxRounds)) || 12,
+      maxImageMB: (Number.isFinite(maxImgMB) && maxImgMB > 0)
+        ? Math.min(20, Math.max(0.5, maxImgMB))
+        : 2
     };
     // 只在用户真的改了才覆盖（避免空值误把已有配置清掉）
     //

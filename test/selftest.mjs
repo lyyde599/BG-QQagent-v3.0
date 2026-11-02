@@ -372,16 +372,17 @@ refs:
       }
     } catch { /* 没有 plugins 目录就跳过（纯净内核版） */ }
 
+    // 🔴 自动禁用，不再报错退出（2026-11-02）
+    //
+    // 用户反馈：「每装一个第三方插件，内核更新（test/ 被整目录替换）之后
+    //   npm test 就会红，必须手工改测试文件。对普通用户来说基本等于测试废了。」
+    //
+    // 现在是：未声明的插件**强制 enabled:false**，只让测试显式声明的生效。
+    // 第三方插件不再影响内核自测，也不需要改测试文件。
     if (missing.length) {
-      console.error('');
-      console.error('❌ 测试配置漏声明了会自动启用的插件：');
-      for (const n of missing) console.error(`     · ${n}（manifest 里 defaultEnabled: true）`);
-      console.error('');
-      console.error('   请在 test/selftest.mjs 的 cfg.plugins 里显式声明它们（一般写 { enabled: false }），');
-      console.error('   否则它们会在测试期间静默生效，干扰消息链 / 定时任务 / mock LLM 脚本索引，');
-      console.error('   导致完全不相干的断言失败。');
-      console.error('');
-      process.exit(1);
+      cfg.plugins ||= {};
+      for (const n of missing) cfg.plugins[n] = { enabled: false };
+      console.log(`  · 已自动禁用 ${missing.length} 个未声明插件：${missing.join(', ')}`);
     }
   }
 

@@ -62,7 +62,38 @@ import { sendMail, mailReady, mailStatus, saveMailConfig, clearMailConfig } from
 import crypto from 'node:crypto';
 
 // 验证码暂存（中心端，内存即可 —— 重启失效是特性不是缺陷）
-const authCodes = new Map();     // email -> { code, at }
+// 验证码缓存（2026-11-02 加持久化）
+//
+// 用户反馈："填完验证码点完成注册，显示「请先获取验证码」，已经三次了"
+//
+// 根因：这原本是纯内存 Map，**服务重启就丢**。
+// 用户收码到填码之间只要重启过一次（更新、崩溃、手动重启），
+// 码就没了，但界面上还显示着"已发送"。
+//
+// 现在：内存 + 落盘双写，重启后还能读回来。
+const authCodes = new Map();     // email -> { code, at, purpose }
+const AUTH_CODES_FILE = () => path.join(DATA_DIR, 'auth-codes.json');
+
+function loadAuthCodes() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(AUTH_CODES_FILE(), 'utf8'));
+    const now = Date.now();
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (!v || now - Number(v.at || 0) > 24 * 3600 * 1000) continue;   // 超一天的丢掉
+      authCodes.set(k, v);
+    }
+  } catch { /* 没有或坏了就当空 */ }
+}
+
+function saveAuthCodes() {
+  try {
+    const obj = {};
+    for (const [k, v] of authCodes) obj[k] = v;
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(AUTH_CODES_FILE(), JSON.stringify(obj));
+  } catch { /* 落盘失败不影响内存使用 */ }
+}
+loadAuthCodes();
 
 // ── 中心端用户档案（2026-10-25）──
 //
@@ -1389,11 +1420,19 @@ export function createApp({ log = console.log } = {}) {
         try {
           const body = await readBody(req).catch(() => ({}));
           const { buildDeployPack } = await import('./export-pack.js');
-          const plugins = Array.isArray(body?.plugins) && body.plugins.length
+          // 🔴 空数组要能表达"纯核心包"（2026-11-02 修）
+          //
+          // 用户："最新核心包+BG创造营请打包给我"
+          //
+          // 原来写 `body.plugins.length ? ... : ['plugin-market']` ——
+          // 传 [] 也会落进默认值，永远打不出不带插件的核心包。
+          //
+          // 现在：传了数组就按数组（含空数组），只有没传才是默认。
+          const plugins = Array.isArray(body?.plugins)
             ? body.plugins.map((x) => String(x))
             : ['plugin-market'];
           const r = buildDeployPack({ plugins });
-          log(`[导出] 部署包 ${r.file}（${Math.round(r.size / 1024)}K，插件 ${r.plugins.join(',')}）`);
+          log(`[导出] ${plugins.length ? '部署包' : '核心包'} ${r.file}（${Math.round(r.size / 1024)}K，插件 ${r.plugins.join(',') || '无'}）`);
           return json(res, 200, r);
         } catch (e) {
           return json(res, 500, { ok: false, error: String(e?.message ?? e).slice(0, 300) });
@@ -2366,9 +2405,18 @@ export function createApp({ log = console.log } = {}) {
       if (pathname === '/api/persona-templates' && method === 'GET') {
         const { PERSONAS, PERSONA_GROUPS } = await import('./personas.js');
         // group 字段供面板下拉分组展示（傻妞系/傲娇系/…）；legacy 模板无 group
-        const builtins = Object.entries(PERSONAS).map(([id, p]) => ({
-          id, name: p.name, text: p.text, builtin: true, group: p.group || ''
-        }));
+        // 是否返回内置人设模板（2026-11-02）
+        //
+        // 用户反馈："我们通过补丁隐藏内置人设模板（只返回自定义人设），
+        //   但 selftest 断言「原版小鲸鱼模板在内」会失败；而且每次内核更新都要重打。"
+        //
+        // 现在做成正式配置 ui.showBuiltinPersonas，默认 true。
+        const showBuiltin = getConfig().ui?.showBuiltinPersonas !== false;
+        const builtins = showBuiltin
+          ? Object.entries(PERSONAS).map(([id, p]) => ({
+              id, name: p.name, text: p.text, builtin: true, group: p.group || ''
+            }))
+          : [];
         const customs = (getConfig().customPersonas || []).map((p, i) => ({
           id: `custom_${i}`,
           name: p.name,
@@ -2688,7 +2736,16 @@ export function createApp({ log = console.log } = {}) {
 
       if (pathname === '/api/config' && method === 'GET') {
         // 兼容层：插件配置同时以旧顶层键暴露（前端无需改动）。见 core/config-compat.js
-        return json(res, 200, projectLegacyConfig(cfgNow));
+        // 带上 community（2026-11-02）
+        //
+        // 用户："自从你优化了本地打包后就没了推广了"
+        //
+        // 查明：`COMMUNITY`（群名/群号/加群链接）只在 /api/about 里返回，
+        // 但「关于」页的渲染函数 `renderAboutSection(c)` 吃的是**配置对象**。
+        // 配置里没有 community 字段 → k = {} → 整块推广内容不渲染。
+        //
+        // 现在把 community 挂进配置响应，和 /api/about 保持一致。
+        return json(res, 200, { ...projectLegacyConfig(cfgNow), community: COMMUNITY });
       }
 
       if (pathname === '/api/config' && method === 'POST') {
@@ -2782,6 +2839,7 @@ export function createApp({ log = console.log } = {}) {
 
         // 把用途一起存下来，验证时校验（防止拿注册码去换投稿凭证）
         authCodes.set(email, { code, at: now, purpose });
+        saveAuthCodes();
         const r = await sendMail(email, tpl.subject, tpl.body(code));
         if (!r.ok) {
           authCodes.delete(email);
@@ -2895,7 +2953,15 @@ export function createApp({ log = console.log } = {}) {
         const email = String(body?.email || '').trim().toLowerCase();
         const input = String(body?.code || '').trim();
         const rec = authCodes.get(email);
-        if (!rec) return json(res, 400, { ok: false, error: '请先获取验证码' });
+        // 提示要能指导用户（2026-11-02）
+        // 原来只说"请先获取验证码"，但用户明明获取过 —— 是服务重启丢了。
+        if (!rec) {
+          return json(res, 400, {
+            ok: false,
+            error: '没找到这个邮箱的验证码。可能是服务重启过（验证码会失效），请重新获取一次。',
+            needResend: true
+          });
+        }
         if (Date.now() - rec.at > 10 * 60 * 1000) {
           authCodes.delete(email);
           return json(res, 400, { ok: false, error: '验证码已过期，请重新获取' });
@@ -2904,6 +2970,7 @@ export function createApp({ log = console.log } = {}) {
           return json(res, 400, { ok: false, error: '验证码不对' });
         }
         authCodes.delete(email);
+        saveAuthCodes();
 
         // 记录用户档案 —— 注册走我们的服务，数据就该落在我们这里
         const ip = String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress || '');

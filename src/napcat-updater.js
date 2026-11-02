@@ -923,14 +923,43 @@ export async function checkAllWithSnowluma() {
 // 所以"切通道"= 改这两个值 + 启停两边的服务。
 
 /** 两个通道的固定参数（端口与 service 名） */
+// 端口可覆盖（2026-11-02）
+//
+// 用户反馈："3000 被别的服务占用，只能用 3010，所以每次更新都要打源码补丁。
+//   3.5.12 给 napcat 块加了 container 字段，补丁还失配了一次。"
+//
+// 优先级：环境变量 > config.snowluma 里的显式配置 > 默认值
+//   WB_NAPCAT_HTTP_PORT / WB_NAPCAT_WS_PORT
+//   WB_SNOWLUMA_HTTP_PORT / WB_SNOWLUMA_WS_PORT
+//   config.snowluma.httpUrl / wsUrl（显式写了整条 URL 就用它）
+function portOf(envKey, fallback) {
+  const v = process.env[envKey];
+  if (!v) return fallback;
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 && n < 65536 ? n : fallback;
+}
+
+/** 从 config.snowluma 取完整 URL（比端口更直接的覆盖方式） */
+function cfgUrl(field) {
+  try {
+    const c = globalThis.__wbConfig || null;
+    const v = c?.snowluma?.[field];
+    return typeof v === 'string' && v.trim() ? v.trim() : '';
+  } catch { return ''; }
+}
+
 export const BACKENDS = {
   napcat: {
     label: 'NapCat',
     service: 'napcat-qq',
     // Docker 部署时容器名（2026-10-31）—— systemd 查不到就查它
     container: 'napcat',
-    wsUrl: 'ws://127.0.0.1:3001',
-    httpUrl: 'http://127.0.0.1:3000',
+    get wsUrl() {
+      return cfgUrl('wsUrl') || `ws://127.0.0.1:${portOf('WB_NAPCAT_WS_PORT', 3001)}`;
+    },
+    get httpUrl() {
+      return cfgUrl('httpUrl') || `http://127.0.0.1:${portOf('WB_NAPCAT_HTTP_PORT', 3000)}`;
+    },
     home: () => napcatRoot(),
     installed: () => isNapcatInstalled(),
   },
@@ -938,8 +967,12 @@ export const BACKENDS = {
     label: 'SnowLuma',
     service: 'snowluma',
     container: 'snowluma',
-    wsUrl: 'ws://127.0.0.1:3011',
-    httpUrl: 'http://127.0.0.1:3010',
+    get wsUrl() {
+      return cfgUrl('wsUrl') || `ws://127.0.0.1:${portOf('WB_SNOWLUMA_WS_PORT', 3011)}`;
+    },
+    get httpUrl() {
+      return cfgUrl('httpUrl') || `http://127.0.0.1:${portOf('WB_SNOWLUMA_HTTP_PORT', 3010)}`;
+    },
     home: () => snowlumaHome(),
     installed: () => isSnowlumaInstalled(),
   },

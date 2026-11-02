@@ -22,6 +22,8 @@ const CODE_ITEMS = [
   'package.json', 'package-lock.json',
   'README.md', 'PLUGIN-ARCH.md', 'VOICE-RESEARCH.md',
   '插件与Skill制作及使用规范.md', '内核发布说明.md', '安装说明.md',
+  // 每次发版必带（2026-11-02）：用户要求"部署包请内置更新说明"
+  '更新说明.md',
   '.gitignore', 'LICENSE'
 ];
 
