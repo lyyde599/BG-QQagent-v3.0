@@ -3854,6 +3854,18 @@ function renderApiSection(c) {
       <div class="field"><label>温度</label><input type="number" id="cfg-temperature" step="0.1" min="0" max="2" value="${esc(c.api.temperature)}" /></div>
       <div class="field"><label>单次运行最大工具轮数</label><input type="number" id="cfg-maxrounds" min="1" max="40" value="${esc(c.api.maxRounds)}" /></div>
     </div>
+    <div class="field"><label>思考强度</label>
+      <select id="cfg-reasoning">
+        <option value="" ${!c.api.reasoningEffort ? 'selected' : ''}>默认（不指定，由模型自己决定）</option>
+        <option value="low" ${c.api.reasoningEffort === 'low' ? 'selected' : ''}>低 —— 快，适合闲聊/简单指令</option>
+        <option value="medium" ${c.api.reasoningEffort === 'medium' ? 'selected' : ''}>中 —— 平衡</option>
+        <option value="high" ${c.api.reasoningEffort === 'high' ? 'selected' : ''}>高 —— 深想，慢但更准（更贵）</option>
+      </select>
+      <div class="muted" style="font-size:12px;margin-top:4px">
+        思考型模型（deepseek-v4 / o 系列 / Claude）支持。选「默认」则完全沿用上游行为；
+        选了之后会自动按端点翻译成对应字段（Anthropic 用 thinking，其余用 reasoning_effort）。
+      </div>
+    </div>
     <div class="checkbox-row"><input type="checkbox" id="cfg-vision" ${c.api.vision !== false ? 'checked' : ''} />
       <label for="cfg-vision">图片输入（关闭则移除看图工具，模型只会看到 [图片] 占位符）</label>
       <span id="vision-switch-hint" class="muted" style="font-size:12px;align-self:center"></span></div>
@@ -5184,12 +5196,36 @@ function openModelPicker() {
           const curProvider = String(state.config?.api?.provider || '');
           const sameProvider = curProvider && curProvider === pid;
           const boxKey = String(document.querySelector('#cfg-apikey')?.value || '').trim();
+          // 🔴 切换厂商时不能把 Key 清空（2026-11-04 修）
+          //
+          // 用户："切号提供商之后，key 不会切换"
+          //
+          // 原来 `: (p.apiKey || '')` —— 新厂商若没存过 Key，就写空串，
+          // 把原来的 Key 直接冲掉了；而且它只存全局 api.apiKey，
+          // **从不写回 providers[]**，所以下次切回来还是旧值/空。
+          //
+          // 现在的取法：
+          //   同一家 → 输入框优先（用户可能刚改过）
+          //   换一家 → 用那一家自己的 Key；它也没有就保留原全局 Key（不清空），
+          //           并提示用户去填
           const nextKey = sameProvider
-            ? (boxKey || p.apiKey || '')   // 同一个：用户手填优先
-            : (p.apiKey || '');            // 换了厂商：一律用新厂商的 Key
+            ? (boxKey || p.apiKey || '')
+            : (p.apiKey || boxKey || '');
+          if (!sameProvider && !p.apiKey && !boxKey) {
+            $('#provider-hint').textContent =
+              `已切到 ${p.displayName || pid}，但它还没有保存过 Key —— 请在上面填一个，再点「保存设置」。`;
+          }
+          // Key 同时落到 providers[] 对应项，切回来才不会丢
+          const provList = Array.isArray(state.config?.providers) ? state.config.providers.slice() : [];
+          const pIdx = provList.findIndex((x) => String(x.id) === pid);
+          const patchBody = { api: { provider: pid, model, baseUrl: p.baseURL, apiKey: nextKey } };
+          if (pIdx >= 0 && nextKey) {
+            provList[pIdx] = { ...provList[pIdx], apiKey: nextKey, apiKeyFrom: 'manual' };
+            patchBody.providers = provList;
+          }
           await api('/api/config', {
             method: 'POST',
-            body: JSON.stringify({ api: { provider: pid, model, baseUrl: p.baseURL, apiKey: nextKey } })
+            body: JSON.stringify(patchBody)
           });
           closeModelModal(overlay);
           loadSettings();
@@ -5419,6 +5455,7 @@ async function saveConfig({ quiet = false, allowEmptyApiKey = false } = {}) {
       vision: chk('#cfg-vision', c.api.vision !== false),
       temperature: Number(val('#cfg-temperature', c.api.temperature)) || 0.8,
       maxRounds: Number(val('#cfg-maxrounds', c.api.maxRounds)) || 12,
+      reasoningEffort: String(val('#cfg-reasoning', c.api.reasoningEffort || '')),
       maxImageMB: (Number.isFinite(maxImgMB) && maxImgMB > 0)
         ? Math.min(20, Math.max(0.5, maxImgMB))
         : 2
@@ -5432,6 +5469,38 @@ async function saveConfig({ quiet = false, allowEmptyApiKey = false } = {}) {
     }
     if (allowEmptyApiKey || (apiKeyInput && apiKeyInput !== String(c.api.apiKey || ''))) {
       patch.api.apiKey = apiKeyInput;
+    }
+
+    // 🔴 切换提供商时，Key 必须跟着存到**那一家**头上（2026-11-04 修）
+    //
+    // 用户："设置里保存 key，好像切号提供商之后，key 不会切换？"
+    //
+    // 根因：saveConfig 只写 `patch.api.apiKey`（**全局主 Key**），
+    // 从来不碰 `providers[]` 里对应那一项的 apiKey。
+    //
+    // 于是：
+    //   · 切到 A，填 Key → 存进全局 api.apiKey
+    //   · 切到 B，填 Key → 覆盖同一个全局 api.apiKey
+    //   · 切回 A → applyProviderPick 读的是 providers[] 里的旧值（或空），
+    //     Key 自然"没跟着切"
+    //
+    // 现在：如果当前选的是某个 provider（不是手动模式），
+    // 就把输入框里的 Key 单独存进那一家。
+    const pickedPid = String(val('#cfg-provider', c.api.provider || '')).trim();
+    const pickedModel = String(val('#cfg-model', c.api.model || '')).trim();
+    if (pickedPid) {
+      patch.api.provider = pickedPid;
+      if (pickedModel) patch.api.model = pickedModel;
+      // 把 Key 落到 providers[] 对应项上（saveConfig 之后由服务端合并）
+      if (apiKeyInput) {
+        const list = Array.isArray(c.providers) ? c.providers : [];
+        const idx = list.findIndex((x) => String(x.id) === pickedPid);
+        if (idx >= 0) {
+          const next = list.slice();
+          next[idx] = { ...next[idx], apiKey: apiKeyInput, apiKeyFrom: 'manual' };
+          patch.providers = next;
+        }
+      }
     }
     // 🔴 2026-10-29 修：不要再把 anysearchKeys 带进 patch
     //

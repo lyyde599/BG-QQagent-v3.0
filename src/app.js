@@ -782,6 +782,20 @@ export function createApp({ log = console.log } = {}) {
       }
     } catch { /* 解析失败就当没有引用 */ }
 
+    // 🔴 入库时打"是否点名我"的标记（2026-11-05 修，群友反馈「群里被@不回」）
+    //
+    // 原来补发判定靠**正则匹配文本**里的 `@#QQ号` —— 但那依赖 store 把 at 段
+    // 渲染成特定文本格式，一改渲染就失效。而真正的结构信息（segments 里的 type:'at'）
+    // 在这一层是有的，此时不打标记，后面就再也拿不到了。
+    //
+    // 现在：入库时按**结构**判定并落字段，下游一律读字段，不猜文本。
+    const _segs0 = Array.isArray(event.message) ? event.message : [];
+    const _selfId0 = String(onebot.selfId || '');
+    const _mentionedSelf = !!_selfId0 && _segs0.some(
+      (s) => s && s.type === 'at' && String((s.data && s.data.qq) ?? '') === _selfId0
+    );
+    const _quotedSelf = !!_selfId0 && !!replyInfo && String(replyInfo.senderId || '') === _selfId0;
+
     store.appendIncoming(chatKey, {
       mid: event.message_id,
       ts: event.time ? Math.round(Number(event.time) * 1000) : Date.now(),
@@ -789,7 +803,9 @@ export function createApp({ log = console.log } = {}) {
       senderName,
       text: text || '[图片]' ,
       reply: replyInfo,
-      media
+      media,
+      mentionedSelf: _mentionedSelf,
+      quotedSelf: _quotedSelf,
     });
     emit('chat-update', chatKey);
 

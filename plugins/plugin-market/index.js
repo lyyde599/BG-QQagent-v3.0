@@ -168,6 +168,18 @@ export async function activate(ctx) {
   let cache = { at: 0, data: null, source: '', error: null };
   // 下载数缓存（2026-10-26）：展示性数据，5 分钟一次足够
   let dlCache = { at: 0, data: null };
+  // 🔴 启动时读回上次的下载数（2026-11-06）
+  //   否则进程一重启、远端又超时，整列下载数就凭空消失 ——
+  //   作者正是靠这个当"内核更新了"的信号，消失会误导人。
+  try {
+    const f = path.join(ctx.root, 'data', 'market-dl-cache.json');
+    if (fs.existsSync(f)) {
+      const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+      if (Array.isArray(j?.items)) {
+        dlCache = { at: Number(j.at) || 0, data: new Map(j.items) };
+      }
+    }
+  } catch { /* 忽略 */ }
   const CACHE_MS = 5 * 60 * 1000;
 
   /**
@@ -646,8 +658,21 @@ export async function activate(ctx) {
     // 密码（可选）：设了就能以后免验证码登录
     const password = String(body?.password || '');
     let pwSet = false;
+    // 🔴 auth 必须声明在块外（2026-11-03 真 bug）
+    //
+    // 用户："BG创造营注册时，验证码不通过，四次都是这种情况"
+    //      前端报 `auth is not defined`
+    //
+    // 根因：`const auth` 写在 `if (password)` 块内 —— **块级作用域**。
+    // 玩家不填密码时，块外根本不存在 auth，
+    // 下面 `hasPassword: pwSet || (auth && ...)` 直接抛 ReferenceError，
+    // 整个注册失败。
+    //
+    // 而 `(auth && ...)` 这个防御写法本身是对的 ——
+    // 只是它防的是"auth 为 null"，防不了"auth 没声明"。
+    let auth = null;
     if (password) {
-      const auth = await getAuth();
+      auth = await getAuth();
       if (!auth) return NO_AUTH;
       const pr = auth.setPassword(email, password);
       if (!pr.ok) return pr;
@@ -726,20 +751,45 @@ export async function activate(ctx) {
     if (dlCache.data && Date.now() - dlCache.at < DL_TTL) {
       downloads = dlCache.data;                       // 命中缓存，0 网络开销
     } else {
+      // 🔴 下载数要"尽量显示"，不能动不动就消失（2026-11-06 作者反馈）
+      //
+      // 原话："更着更着功能就变了，下载次数好像也没了…每次在 BG 创造营
+      //   看不到下载次数后，就知道应该是内核版本更新了"
+      //
+      // 根因：① 超时只有 3 秒，中转/弱网时经常超时；
+      //       ② 失败后如果内存缓存也空（进程刚重启），整列直接消失；
+      //       ③ 界面条件是 `downloads > 0` 才渲染 —— 拿不到就整行不显示。
+      //
+      // 现在：超时放宽到 8 秒 + 失败重试一次 + 落盘缓存（重启也在）。
       try {
-        const dr = await fetch('https://market.baiguang211.top/api/stats/downloads', {
-          headers: { 'User-Agent': UA },
-          signal: AbortSignal.timeout(3000),         // 3 秒封顶，别拖死首屏
-        });
-        const dd = await dr.json().catch(() => ({}));
-        if (dd?.ok && Array.isArray(dd.items)) {
-          const m = new Map();
-          for (const it of dd.items) m.set(it.id, it.total || 0);
+        const fetchDl = async (ms) => {
+          const dr = await fetch('https://market.baiguang211.top/api/stats/downloads', {
+            headers: { 'User-Agent': UA },
+            signal: AbortSignal.timeout(ms),
+          });
+          const dd = await dr.json().catch(() => ({}));
+          if (dd?.ok && Array.isArray(dd.items)) {
+            const m = new Map();
+            for (const it of dd.items) m.set(it.id, it.total || 0);
+            return m;
+          }
+          return null;
+        };
+        let m = null;
+        try { m = await fetchDl(8000); } catch { /* 第一次失败，重试 */ }
+        if (!m) { try { m = await fetchDl(8000); } catch { /* 还失败就回落 */ } }
+        if (m) {
           downloads = m;
           dlCache = { at: Date.now(), data: m };
+          // 落盘：进程重启后 5 分钟内也能显示上一次的数字
+          try {
+            fs.writeFileSync(path.join(ctx.root, 'data', 'market-dl-cache.json'),
+              JSON.stringify({ at: Date.now(), items: [...m.entries()] }), 'utf8');
+          } catch { /* 忽略 */ }
+        } else if (dlCache.data) {
+          downloads = dlCache.data;
         }
       } catch {
-        // 拿不到就用上次的（可能为空），不影响列表本身
         if (dlCache.data) downloads = dlCache.data;
       }
     }
@@ -804,6 +854,16 @@ export async function activate(ctx) {
         updatable: installed.has(p.id) && cmpVer(p.version, installed.get(p.id)) > 0,
         // 下载人次（0 也返回，界面自己决定显不显示）
         downloads: downloads.get(p.id) || 0,
+        // 🔴 最后更新时间（2026-11-06 用户要求）
+        //   远端清单里有 at / publishedAt / updatedAt 任一就用；
+        //   都没有就退回本地 manifest 的 mtime —— 总比一片空白强。
+        updatedAt: p.updatedAt || p.at || p.publishedAt || (() => {
+          try {
+            const mf = path.join(ctx.root, 'plugins', p.id, 'manifest.json');
+            if (fs.existsSync(mf)) return fs.statSync(mf).mtime.toISOString();
+          } catch { /* ignore */ }
+          return null;
+        })(),
       })),
     };
   }, { absolute: true });
@@ -2314,7 +2374,13 @@ export async function activate(ctx) {
             id,
             action,
             note: body?.note || '',
-            inIndex: body?.inIndex === true
+            inIndex: body?.inIndex === true,
+            // 🔴 把作者写的更新说明一并带到远端（2026-11-06 修）
+            //
+            // 作者反馈："未审核的时候明明还有的，一审核完就没了"。
+            // 投稿时的 notes（这次改了什么）必须在**通过**那一刻写进 market 记录，
+            // 否则详情页的「vX.X 更新」永远是空的。
+            changelog: String(body?.changelog || body?.notes || '').slice(0, 2000)
           }),
           signal: AbortSignal.timeout(60000),
         });

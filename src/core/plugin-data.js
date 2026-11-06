@@ -51,8 +51,18 @@ export function clearDirContents(dir) {
  * 盘点插件数据：给面板显示"这个插件到底存了哪些东西、多大"。
  * 用户点「清除数据」前必须看得见清的是什么。
  */
-export function inspectData(id) {
-  const dir = pluginDataDir(id);
+/**
+ * 盘点插件数据
+ *
+ * @param {string} id 插件 id
+ * @param {{dir?:string}} opts 可选：指定真实数据目录
+ *
+ * 🔴 为什么加 opts.dir（2026-11-06 P0-4）
+ *   用户清单："面板统计的是 data/plugins/memory，真实数据在 data/memory，显示 0 B"
+ *   有些插件的数据归内核管（如轻量记忆），必须能指向真实路径。
+ */
+export function inspectData(id, opts = {}) {
+  const dir = String(opts?.dir || '') || pluginDataDir(id);
   const out = { dir, exists: false, files: [], totalBytes: 0 };
   if (!fs.existsSync(dir)) return out;
   out.exists = true;

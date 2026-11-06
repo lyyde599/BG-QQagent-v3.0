@@ -752,7 +752,16 @@ export class Orchestrator {
       sender: this.sender,
       session,
       emit: (type, payload) => this.emit(type, payload),
-      isMaster
+      isMaster,
+      // 🔴 触发批必须显式挂上（2026-11-05 修，群友反馈「群里被@不回」）
+      //
+      // 原来补发判定读 `ctx.triggerEntries` —— 但 ctx 里**根本没这个字段**，
+      // 恒 undefined → 判定恒 false → 「被点名必回」的兜底从未生效。
+      // 文档原话：「从结构上杜绝 ctx 少放一个字段 ⇒ 恒 undefined」。
+      triggerEntries: Array.isArray(triggerEntries) ? triggerEntries : [],
+      groupAddressed: kind === 'group' && (Array.isArray(triggerEntries) ? triggerEntries : []).some(
+        (m) => m && (m.mentionedSelf === true || m.quotedSelf === true)
+      ),
     };
 
     const maxRounds = Math.max(1, Number(cfg.api.maxRounds) || 12);
@@ -776,7 +785,33 @@ export class Orchestrator {
         await this.rescueUnsent(session, ctx.chatKey, '中止抢救');
         return;
       }
-      const response = await chatCompletion({ messages, tools: openAiTools });
+      // 🔴 工具表两端收窄（2026-11-05，群友反馈「群里被@不回」的核心修复）
+      //
+      // 实测（同一端点同一模型）：
+      //   只挂发送工具        → 模型调 send_message 5/5 命中
+      //   发送工具 + 1 只读工具 → 0/5（全去调只读工具了）
+      //   发送工具 + 3 只读工具 → 0/5
+      //
+      // 所以"强制模型说话"不能靠提示词、也不能靠 tool_choice（端点会静默忽略），
+      // **唯一可靠手段是把工具表裁到只剩发送工具**。
+      //
+      //   第 0 轮        第 1…N-2 轮          第 N-1、N 轮
+      //   只挂发送   →   全量工具（可查资料）  →  只挂发送
+      //   「我查查」      随便查                  「结论在这」
+      //
+      // 首轮收窄 ⇒ 结构性地保证"先应一声"；末轮收窄 ⇒ 保证"回结论"。
+      // 只在**群聊被点名**时启用，其它场景保持原行为，避免影响闲聊。
+      const narrowForReply = ctx.groupAddressed === true && openAiTools.length > 1;
+      const isFirstRound = round === 0;
+      const isLastRounds = round >= maxRounds - 2;
+      const sendOnly = openAiTools.filter((d) => String(d?.function?.name || '') === 'send_message');
+      const roundTools = (narrowForReply && (isFirstRound || isLastRounds) && sendOnly.length)
+        ? sendOnly
+        : openAiTools;
+      if (narrowForReply && roundTools !== openAiTools) {
+        this.emit('log', { text: `[工具收窄] 第 ${round + 1} 轮只挂发送工具（共 ${sendOnly.length} 个）—— 保证这一轮必说一句` });
+      }
+      const response = await chatCompletion({ messages, tools: roundTools });
       session.model = response.model || session.model;
       addUsage(session.usage, response.usage);
       session.usage.calls += 1;
@@ -859,7 +894,21 @@ export class Orchestrator {
             }
           }
         }
-        // 没有工具调用 = 模型结束思考
+        // 🔴 截断 ≠ 沉默（2026-11-05 修，群友反馈「群里被@不回」）
+        //
+        // 推理型模型在上下文变长（抓回整页 HTML）后，会把输出预算全花在
+        // reasoning 上，端点返回 finish_reason='length' + 正文为空 + 无工具调用。
+        //
+        // 旧逻辑：「没工具调用 = 模型结束思考」直接 break ——
+        // 于是这一轮什么都没发出去，群里静悄悄。
+        // **这不是沉默，是它没说完。**
+        //
+        // 现在：标记截断，让下面的补发判定把它当成"该说没说"处理。
+        const _fr = String(msg?.finish_reason ?? msg?.finishReason ?? '').toLowerCase();
+        if (_fr === 'length') {
+          session.truncated = true;
+          this.emit('log', { text: '[截断] finish_reason=length，本轮输出被截断（按"没说完"处理，不算沉默）' });
+        }
         // 没有工具调用 = 模型结束思考（文本不会发给 QQ）
         break;
       }
@@ -995,13 +1044,20 @@ export class Orchestrator {
       try {
         const selfId = String(this.onebot?.selfId || '');
         const trg = Array.isArray(ctx.triggerEntries) ? ctx.triggerEntries : [];
+        // 🔴 优先读**结构字段**，正则只作兼容兜底（2026-11-05）
+        //
+        // 原来只靠正则匹配 `@#QQ号` —— 一旦 store 改了 at 段的渲染格式，
+        // 判定就悄悄失效（而且日志永远打印「被点名=false」没人察觉）。
+        // 现在 app.js 入库时已经按 segments 落了 mentionedSelf / quotedSelf，
+        // 这里直接读字段，文本正则只对老数据兜底。
         groupAddressed = trg.some((m) => {
+          if (!m) return false;
+          if (m.self) return false;                       // 自己发的不算
+          if (m.mentionedSelf === true) return true;      // 结构字段（首选）
+          if (m.quotedSelf === true) return true;         // 引用我
           const txt = String(m?.text || '');
-          // 文本里的 @我 / 引用我（store 把 at 段渲染成 [at]/[reply] 文本）
           if (selfId && new RegExp(`@[^#\\s]*#${selfId}\\b`).test(txt)) return true;
           if (selfId && new RegExp(`\\[引用[^\\]]*#${selfId}\\b`).test(txt)) return true;
-          // 主动机会 / 主人发言也算"该有反应"
-          if (m?.self) return false;
           return false;
         });
       } catch { /* 判定失败就当没点名，不补发 */ }
@@ -1013,7 +1069,10 @@ export class Orchestrator {
     // 关掉之后私聊和群聊一个待遇：模型不说话就不发。
     // 适用场景：有人用私聊做纯工具调用 / 不想被"必回"打扰 / 省 token。
     const privateMustReply = getConfig().features?.privateMustReply !== false;
-    const shouldRetry = !session.error && status === 'noreply'
+    // 🔴 截断也算"该说没说"（2026-11-05）
+    //   旧逻辑只有 noreply 才补发，而截断的会话状态可能仍是 ok。
+    const truncated = session.truncated === true;
+    const shouldRetry = !session.error && (status === 'noreply' || truncated)
       && ((isPrivate && privateMustReply) || groupAddressed);
     if (status === 'noreply') {
       const why = isPrivate

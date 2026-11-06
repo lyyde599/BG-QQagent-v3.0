@@ -36,6 +36,34 @@ async function chatOnce(ep, { messages, tools = null, toolChoice = 'auto', tempe
   const mt = Number(cfg.maxTokens);
   if (Number.isFinite(mt) && mt > 0) body.max_tokens = mt;
 
+  // ── 思考强度（2026-11-05）──────────────────────────────
+  //
+  // 用户："鲸界的配置目前无法设置思考强度，加入此配置选择"
+  //
+  // 各家字段不统一，按端点域名/模型名自动翻译：
+  //   OpenAI o 系列 / deepseek  → reasoning_effort: 'low'|'medium'|'high'
+  //   Anthropic 官方兼容层       → thinking: { type:'enabled', budget_tokens:N }
+  //   其它                        → reasoning_effort（多数中转站透传）
+  //
+  // 不配时不发，完全保持上游默认行为。
+  const re = String(cfg.reasoningEffort || '').toLowerCase();
+  if (re && ['low', 'medium', 'high'].includes(re)) {
+    const model = String(ep.model || cfg.model || '').toLowerCase();
+    const base = String(ep.baseUrl || cfg.baseUrl || '').toLowerCase();
+    const isAnthropic = cfg.reasoningAuto !== false
+      && (/anthropic|claude/.test(base) || /claude/.test(model));
+    if (isAnthropic) {
+      // Anthropic：budget_tokens 必须 < max_tokens
+      const budget = re === 'high' ? 16000 : re === 'medium' ? 8000 : 3000;
+      const cap = Number.isFinite(mt) && mt > 0 ? mt : 32000;
+      body.thinking = { type: 'enabled', budget_tokens: Math.min(budget, Math.max(1024, cap - 1024)) };
+      // 开了 thinking 必须删 temperature（Anthropic 要求）
+      delete body.temperature;
+    } else {
+      body.reasoning_effort = re;
+    }
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error('请求超时')), Math.max(5000, Number(cfg.timeoutMs) || 180000));
   if (signal) {

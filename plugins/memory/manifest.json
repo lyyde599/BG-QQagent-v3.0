@@ -1,0 +1,37 @@
+{
+  "id": "memory",
+  "name": "轻量记忆",
+  "version": "1.1.0",
+  "apiVersion": 1,
+  "description": "用 memory_append 记下值得长期保留的内容：进行中的话题、想说还没说的话、对某人的印象、关于某人的具体事实。数据在内核 MemoryStore（data/memory/），因为记忆会出现在每轮提示词的【记忆】段，属于内核也要读的共享数据。群聊只允许写本群话题；查询/删除/修改仅私聊或主人可用。",
+  "author": "白光",
+  "entry": "index.js",
+  "priority": 110,
+  "defaultEnabled": false,
+  "hooks": [],
+  "tools": true,
+  "config": {
+    "enabled": true,
+    "scopes": {},
+    "masterOnly": true
+  },
+  "permissions": [
+    "read-memory",
+    "write-memory"
+  ],
+  "scopes": [
+    "all"
+  ],
+  "category": "能力",
+  "summary": "每个会话独立记忆（话题/想法/印象/具体事实）",
+  "uiTab": {
+    "id": "memory",
+    "label": "记忆",
+    "inline": true
+  },
+  "ui": "ui.js",
+  "license": "MIT",
+  "contact": {
+    "qq": "3170037984"
+  }
+}

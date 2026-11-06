@@ -708,7 +708,19 @@ export class PluginHost {
           const t = setInterval(() => {
             try { fn(); } catch (error) { pluginLog('定时回调出错:', error?.message ?? error); }
           }, Math.max(1000, Number(ms) || 60000));
-          if (typeof t.unref === 'function') t.unref();
+          // 🔴 不能 unref（2026-11-05 修）
+          //
+          // 事故：圣杯战争第 2 夜超时 45 分钟没结算，玩家问"凌晨了没结算吗"。
+          //
+          // 根因：这里原来 `t.unref()` —— unref 的语义是"这个定时器不阻止
+          // 进程退出"，副作用是**当没有其它活跃句柄时，事件循环会直接结束**，
+          // 定时器一次都不触发。
+          //
+          // 最小复现：unref 一个 1 秒的 setInterval，跑 3.5 秒后
+          // 计数仍是 0 —— 一次都没跑。
+          //
+          // 插件定时器是"业务在跑"的唯一凭据（夜间结算、序章投递、
+          // 战场 tick 全靠它），unref 掉等于把心跳拔了。
           sub.timers.push(t);
           return () => clearInterval(t);
         }

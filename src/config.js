@@ -54,7 +54,12 @@ export const DEFAULT_CONFIG = {
     model: '',                              // UI 里选择/填写
     // 输出 token 上限（2026-10-27 整合）：思考型模型给太小会只剩空正文，
     // 不设则完全交给上游默认，不可控。0 或 null 表示不显式传。
-    maxTokens: 2000,
+    // 🔴 2000 → 8000（2026-11-05，群友反馈「群里被@不回」）
+    //
+    // 推理型模型在上下文变长后会先把预算花在 reasoning 上，
+    // 2000 不够用 → finish_reason=length + 正文为空 → 看起来像"沉默"。
+    // 8000 能让它既有推理空间又能说出话。
+    maxTokens: 8000,
     // 计费方式（2026-10-27 整合）：'token' 按 token 折算金额；'credit' 按积分，
     // credit 模式下 estimateCost 恒返回 0，面板不再显示误导性金额。
     billing: 'token',
@@ -65,6 +70,21 @@ export const DEFAULT_CONFIG = {
     //   实测 12MB 的图让整轮命中率从 90% 掉到 24%。默认 2MB 够看清表情包/截图。
     maxImageMB: 2,
     temperature: 0.8,
+    // ── 思考强度（2026-11-05）──────────────────────────────
+    //
+    // 用户："鲸界的配置目前无法设置思考强度，加入此配置选择"
+    //
+    // 思考型模型（deepseek-v4 / o 系列 / Claude thinking）支持
+    // `reasoning_effort` 或 `thinking` 参数控制推理深度。
+    // 不同厂商字段名不同，所以这里存"语义值"，由 llm.js 按端点翻译。
+    //
+    //   ''        不发送（默认，保持上游行为）
+    //   'low'     快，浅想 —— 适合闲聊、简单指令
+    //   'medium'  平衡
+    //   'high'    深想 —— 适合复杂推理，但慢且贵
+    reasoningEffort: '',
+    // 是否按端点自动适配字段名（关掉则原样发 reasoning_effort）
+    reasoningAuto: true,
     maxRounds: 12,                          // 单次运行的最多工具轮数
     timeoutMs: 180000,
     // 展示用单价（元 / 百万 token），不参与任何请求

@@ -114,8 +114,18 @@ export function currentProviders() {
 
 /** 给指定提供商设置 API Key（存进配置）。 */
 export function setProviderKey(providerId, apiKey) {
+  // 🔴 拒绝把 URL 当 Key（2026-11-04 修）
+  //
+  // 真实事故：配置里存着
+  //   custom_mvwogdi3icvc (mh.597457.xyz) → apiKey = "https://mh.597457.xyz/v1"
+  // 前端切换厂商时把"端点"填进了"Key"框，服务端照单全收。
+  // 之后调用必然 401，而错误信息看不出是 Key 填错了。
+  const raw = String(apiKey || '').trim();
+  if (/^https?:\/\//i.test(raw)) {
+    throw new Error('这看起来是接口地址，不是 API Key。Key 通常以 sk- 开头。');
+  }
   const providers = currentProviders().map((p) =>
-    p.id === providerId ? { ...p, apiKey: String(apiKey || '').trim(), apiKeyFrom: 'manual' } : p);
+    p.id === providerId ? { ...p, apiKey: raw, apiKeyFrom: 'manual' } : p);
   updateConfig({ providers });
   return providers.find((p) => p.id === providerId) || null;
 }

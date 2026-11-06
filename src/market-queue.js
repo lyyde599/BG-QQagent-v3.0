@@ -131,11 +131,20 @@ export function reviewSubmission(id, action, note = '') {
   if (sub.status !== 'pending') return { ok: false, error: `已经处理过了（当前 ${sub.status}）` };
 
   const status = action === 'approve' ? 'approved' : 'rejected';
+  // 🔴 审核通过 = 正式发布（2026-11-06 修：作者反馈"更新说明审核完就没了"）
+  //
+  // 投稿时作者写的「这次改了什么」存在 `notes` 里，
+  // 但审核通过后**从来没被当成 changelog 带出去** ——
+  // 市场详情页读的是 changelog，于是永远空白。
+  //
+  // 玩家原话："未审核的时候明明还有的，一审核完就没了"。
   const next = {
     ...sub,
     status,
     reviewedAt: new Date().toISOString(),
-    reviewNote: String(note || '').slice(0, 500)
+    reviewNote: String(note || '').slice(0, 500),
+    // 通过时把作者写的说明提升为正式更新说明
+    changelog: status === 'approved' ? String(sub.notes || '').slice(0, 2000) : '',
   };
   delete next.dir;
   delete next.packagePath;

@@ -95,7 +95,12 @@ export async function mountPanel(box, ctx) {
           <div class="cy-summary">${esc(p.summary || '')}</div>
           <div class="cy-meta">
             作者：${esc(p.author || '未知')}
-            ${p.downloads > 0 ? `<span class="cy-dl-count">· 下载 ${p.downloads} 次</span>` : ''}
+            ${Number(p.downloads) > 0
+              ? `<span class="cy-dl-count">· 下载 ${Number(p.downloads)} 次</span>`
+              : '<span class="cy-dl-count" style="opacity:.5">· 下载 —</span>'}
+            ${(p.updatedAt || p.at || p.publishedAt)
+              ? `<span class="cy-dl-count" title="最后更新">· ${fmtTime(p.updatedAt || p.at || p.publishedAt)}</span>`
+              : ''}
           </div>
         </div>
         <div class="cy-card-side">
@@ -2796,7 +2801,7 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
                 <span style="color:${color};font-size:11.5px">${statusText}</span>
                 <span class="cy-spacer"></span>
                 ${s.status === 'pending' ? `
-                  <button class="btn tiny primary" data-sub-ok="${esc(s.id)}" data-in-index="${s.inIndex === true ? '1' : ''}">通过</button>
+                  <button class="btn tiny primary" data-sub-ok="${esc(s.id)}" data-sub-notes="${esc(s.notes || '')}" data-in-index="${s.inIndex === true ? '1' : ''}">通过</button>
                   <button class="btn tiny" data-sub-no="${esc(s.id)}" data-in-index="${s.inIndex === true ? '1' : ''}" style="color:#c00">驳回</button>
                 ` : ''}
               </div>
@@ -2825,7 +2830,12 @@ ${esc(JSON.stringify(r.market, null, 2))}</div>
             try {
               const r = await api('/api/market/submissions/review', {
                 method: 'POST',
-                body: { id, action: 'approve', inIndex: b.dataset.inIndex === '1' },
+                // 🔴 把作者写的「这次改了什么」带上去（2026-11-06 修）
+                //    作者反馈："未审核时明明还有，一审核完就没了"
+                body: {
+                  id, action: 'approve', inIndex: b.dataset.inIndex === '1',
+                  changelog: b.dataset.subNotes || b.dataset.subNotes === '' ? (b.dataset.subNotes || '') : '',
+                },
               });
               ctx.toast?.(r?.ok ? '已通过，已上架' : (r?.error || '操作失败'));
               loadSubs();
