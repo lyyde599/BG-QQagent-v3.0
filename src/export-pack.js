@@ -114,7 +114,20 @@ function runTar(args, cwd) {
  * 打包「部署包」= 代码 + 指定插件
  * @param {{plugins?:string[]}} opts
  */
-export function buildDeployPack({ plugins = ['plugin-market'] } = {}) {
+// 🔴 内置插件名单必须和 scripts/install-local.sh 对齐（2026-11-06）
+//
+// 安装脚本第 155 行写死了：
+//   case "$pname" in
+//     plugin-market|file-recv) 强制覆盖 ;;   ← 这两个是"内置"
+//     *) 保留用户自己的 ;;
+//
+// 而这里的默认值只有 plugin-market —— 于是 file-recv 连续两个版本没进包。
+// 用户装完发现"收文件的功能没了"，而实际上它压根没被打进包。
+//
+// 现在两边用同一份名单。改这里时**必须同步改 install-local.sh**。
+export const BUILTIN_PLUGINS = ['plugin-market', 'file-recv'];
+
+export function buildDeployPack({ plugins = BUILTIN_PLUGINS } = {}) {
   ensureDir(EXPORT_DIR);
   const ver = kernelVersion();
   const name = `部署包-鲸界Bridge-${ver}-${stamp()}.tar.gz`;
@@ -135,6 +148,19 @@ export function buildDeployPack({ plugins = ['plugin-market'] } = {}) {
   }
 
   // 插件：只带用户选的
+  //
+  // 🔴 但**内置插件必须在内**（2026-11-06）
+  //   调用方手写列表时漏掉 file-recv → 连续两版没进包，用户装完"收文件功能没了"。
+  //   这里硬性拦截：缺一个就报错，不生成残包。
+  const missingBuiltin = BUILTIN_PLUGINS.filter((x) => !plugins.includes(x));
+  if (missingBuiltin.length) {
+    return {
+      ok: false,
+      error: `内置插件没被打进包：${missingBuiltin.join(', ')}。`
+        + `必须包含 ${BUILTIN_PLUGINS.join(' / ')}（和 scripts/install-local.sh 对齐）。`,
+      missing: missingBuiltin,
+    };
+  }
   const plugDir = path.join(stage, 'plugins');
   ensureDir(plugDir);
   const bundled = [];
